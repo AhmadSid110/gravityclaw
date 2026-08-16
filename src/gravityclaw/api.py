@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from .channel_store import ChannelStore
 from .channel_runtime import ChannelRuntime
 from .capabilities import CapabilityManager
+from .config import RELEASE_VERSION, RuntimeLayout, load_config, read_secret_file
 from .context import ContextBuilder, RunContextCompiler
 from .event_bus import EventBus
 from .execution import (
@@ -36,6 +37,9 @@ from .telegram import TelegramAdapter
 @dataclass(frozen=True, slots=True)
 class Settings:
     home: Path
+    identity_home: Path | None = None
+    capability_home: Path | None = None
+    memory_home: Path | None = None
     mode: str = "agy"
     worker_image: str | None = None
     poll_interval: float = 0.2
@@ -46,38 +50,77 @@ class Settings:
     scheduler_poll_interval: float = 1.0
     secret_dir: Path | None = field(default=None, repr=False)
     control_token: str | None = field(default=None, repr=False)
+    cookie_secure: bool = False
 
     @property
     def database(self) -> Path:
         return self.home / "gravityclaw.db"
 
+    @property
+    def identity_root(self) -> Path:
+        return self.identity_home or self.home
+
+    @property
+    def capability_root(self) -> Path:
+        return self.capability_home or self.home
+
+    @property
+    def memory_root(self) -> Path:
+        return self.memory_home or self.home
+
     @classmethod
     def from_environment(cls) -> "Settings":
+        config_path = os.environ.get("GRAVITYCLAW_CONFIG")
+        if config_path is None and "GRAVITYCLAW_HOME" not in os.environ:
+            candidate = RuntimeLayout.for_user().config_file
+            if candidate.exists():
+                config_path = str(candidate)
+        config: dict[str, Any] = {}
+        layout: RuntimeLayout | None = None
+        if config_path:
+            config = load_config(Path(config_path))
+            layout = RuntimeLayout.for_user()
+            data_path = Path(config.get("database", {}).get("path", layout.database)).expanduser()
+            home = data_path.parent.resolve()
+            identity_home = layout.identity_dir
+            capability_home = layout.capability_dir
+            memory_home = home
+            secret_dir = layout.secret_dir
+        else:
+            home = Path(os.environ.get("GRAVITYCLAW_HOME", str(Path.home() / ".gravityclaw"))).resolve()
+            identity_home = capability_home = memory_home = secret_dir = None
+        execution = config.get("execution", {})
+        server = config.get("server", {})
+        control = config.get("control", {})
+        telegram = config.get("telegram", {})
+        scheduler = config.get("scheduler", {})
+        control_file = control.get("token_file") if isinstance(control, dict) else None
+        telegram_file = telegram.get("token_file") if isinstance(telegram, dict) else None
+        control_token = _read_config_secret(control_file, required=False)
+        telegram_token = _read_config_secret(telegram_file, required=bool(telegram.get("enabled")))
         return cls(
-            home=Path(
-                os.environ.get(
-                    "GRAVITYCLAW_HOME", str(Path.home() / ".gravityclaw")
-                )
-            ).resolve(),
-            mode=os.environ.get("GRAVITYCLAW_MODE", "agy"),
-            worker_image=os.environ.get("GRAVITYCLAW_WORKER_IMAGE"),
+            home=home,
+            identity_home=identity_home,
+            capability_home=capability_home,
+            memory_home=memory_home,
+            mode=os.environ.get("GRAVITYCLAW_MODE", execution.get("mode", "agy")),
+            worker_image=os.environ.get("GRAVITYCLAW_WORKER_IMAGE", execution.get("worker_image")),
             poll_interval=float(os.environ.get("GRAVITYCLAW_POLL_INTERVAL", "0.2")),
-            telegram_token=_telegram_token_from_environment(),
-            telegram_user_id=os.environ.get("GRAVITYCLAW_TELEGRAM_USER_ID"),
+            telegram_token=_telegram_token_from_environment() or telegram_token,
+            telegram_user_id=os.environ.get("GRAVITYCLAW_TELEGRAM_USER_ID") or telegram.get("allowed_user_id") or None,
             telegram_default_workspace=os.environ.get(
-                "GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE"
+                "GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE", telegram.get("default_workspace") or None
             ),
             telegram_api_root=os.environ.get(
                 "GRAVITYCLAW_TELEGRAM_API_ROOT", "https://api.telegram.org"
             ),
             scheduler_poll_interval=float(
-                os.environ.get("GRAVITYCLAW_SCHEDULER_POLL_INTERVAL", "1.0")
+                os.environ.get("GRAVITYCLAW_SCHEDULER_POLL_INTERVAL", str(scheduler.get("poll_interval", 1.0)))
             ),
-            secret_dir=(
-                Path(os.environ["GRAVITYCLAW_SECRET_DIR"]).resolve()
-                if os.environ.get("GRAVITYCLAW_SECRET_DIR") else None
-            ),
-            control_token=_control_token_from_environment(),
+            secret_dir=(Path(os.environ["GRAVITYCLAW_SECRET_DIR"]).resolve()
+                        if os.environ.get("GRAVITYCLAW_SECRET_DIR") else secret_dir),
+            control_token=_control_token_from_environment() or control_token,
+            cookie_secure=os.environ.get("GRAVITYCLAW_COOKIE_SECURE", str(bool(control.get("cookie_secure", False)))).lower() in {"1", "true", "yes"},
         )
 
 
@@ -214,15 +257,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     configured.home.mkdir(mode=0o700, parents=True, exist_ok=True)
     configured.home.chmod(0o700)
     store = Store(configured.database)
-    identity = IdentityStore(configured.home)
+    identity = IdentityStore(configured.identity_root, runtime_home=configured.home)
     identity.bootstrap()
     # initialize before constructing services used by dispatch/retrieval
     store.initialize()
     identity_lock = threading.Lock()
-    memory = MemoryService(configured.home, store)
+    memory = MemoryService(configured.memory_root, store)
     channel_store = ChannelStore(store)
     capabilities = CapabilityManager(
-        configured.home, store, secret_dir=configured.secret_dir
+        configured.capability_root, store, secret_dir=configured.secret_dir
     )
     context_compiler = RunContextCompiler(
         store, identity, memory, ContextBuilder()
@@ -285,7 +328,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await scheduler.close()
             await manager.close()
 
-    app = FastAPI(title="GravityClaw Control Plane", version="0.8.0", lifespan=lifespan)
+    app = FastAPI(title="GravityClaw Control Plane", version=RELEASE_VERSION, lifespan=lifespan)
     app.state.settings = configured
     app.state.store = store
     app.state.event_bus = bus
@@ -336,7 +379,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.set_cookie(
             "gravityclaw_session", _session_cookie(configured.control_token),
             max_age=12 * 60 * 60, httponly=True,
-            secure=os.environ.get("GRAVITYCLAW_COOKIE_SECURE", "0") == "1",
+            secure=configured.cookie_secure,
             samesite="lax", path="/",
         )
         return {"authenticated": True, "expires_in": 12 * 60 * 60}
@@ -1182,6 +1225,19 @@ def _telegram_token_from_environment() -> str | None:
     if not token:
         raise ValueError("Telegram token file is empty")
     return token
+
+
+def _read_config_secret(filename: Any, *, required: bool) -> str | None:
+    if not filename:
+        if required:
+            raise ValueError("configured secret file path is empty")
+        return None
+    try:
+        return read_secret_file(Path(str(filename)))
+    except ValueError:
+        if required:
+            raise
+        return None
 
 
 def _bearer_token(header: str | None) -> str | None:

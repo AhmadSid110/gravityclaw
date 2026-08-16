@@ -16,7 +16,7 @@
 - M8B.7 — UI polish and accessibility: verified
 - M8B.8 — Full browser/reconnect/performance gate: verified
 - M9 — Security and operational hardening: verified
-- M10 — Packaging and deployment: planned
+- M10 — Packaging and deployment: packaging foundation and automated clean-machine gate passed; final real AGY/Telegram clean-machine gate pending
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,
 and crash-safety gates passed. M6 can now add proactive execution without

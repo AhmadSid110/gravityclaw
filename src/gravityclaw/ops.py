@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .config import RuntimeLayout
+
 
 class OperationsError(ValueError):
     """Raised when an operational action would be unsafe or invalid."""
@@ -100,6 +102,49 @@ def backup_home(home: Path, destination: Path) -> Path:
     return destination
 
 
+def backup_layout(layout: RuntimeLayout, destination: Path) -> Path:
+    """Back up canonical data plus identity/capability configuration."""
+    destination = destination.resolve()
+    if destination.exists():
+        raise OperationsError(f"backup already exists: {destination}")
+    if not layout.data_dir.is_dir() or not layout.database.is_file():
+        raise OperationsError(f"GravityClaw data directory is incomplete: {layout.data_dir}")
+    for source in (layout.data_dir, layout.config_dir):
+        if source.exists():
+            _reject_links_and_special_files(source)
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gravityclaw-layout-backup-", dir=destination.parent) as temporary:
+        staging = Path(temporary)
+        data = staging / "data"
+        config = staging / "config"
+        data.mkdir(mode=0o700)
+        config.mkdir(mode=0o700)
+        _sqlite_backup(layout.database, data / "gravityclaw.db")
+        for child in layout.data_dir.iterdir():
+            if child.name in {"gravityclaw.db", "gravityclaw.db-wal", "gravityclaw.db-shm", "backups"}:
+                continue
+            target = data / child.name
+            if child.is_dir():
+                shutil.copytree(child, target, symlinks=False)
+            else:
+                shutil.copy2(child, target)
+        if layout.config_dir.is_dir():
+            for child in layout.config_dir.iterdir():
+                if child.name == "gravityclaw.toml":
+                    target = config / child.name
+                    shutil.copy2(child, target)
+                elif child.is_dir():
+                    shutil.copytree(child, config / child.name, symlinks=False)
+        (staging / "backup.json").write_text(
+            json.dumps({"format": 2, "created_at": datetime.now(timezone.utc).isoformat(), "layout": "xdg", "source": {"config": str(layout.config_dir), "data": str(layout.data_dir), "runtime": str(layout.runtime_dir)}}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with tarfile.open(destination, "x:gz") as archive:
+            archive.add(staging, arcname=".", recursive=True)
+    verify_backup(destination)
+    return destination
+
+
 def verify_backup(archive_path: Path) -> dict[str, Any]:
     """Validate archive paths and the SQLite snapshot without extracting live data."""
     archive_path = archive_path.resolve()
@@ -109,10 +154,7 @@ def verify_backup(archive_path: Path) -> dict[str, Any]:
         members = archive.getmembers()
         for member in members:
             _validate_member(member)
-        database_member = next(
-            (member for member in members if _member_relative_name(member.name) == "gravityclaw.db"),
-            None,
-        )
+        database_member = next((member for member in members if _member_relative_name(member.name) in {"gravityclaw.db", "data/gravityclaw.db"}), None)
         if database_member is None:
             raise OperationsError("backup has no gravityclaw.db")
         with tempfile.TemporaryDirectory(prefix="gravityclaw-verify-") as temporary:
@@ -151,6 +193,51 @@ def restore_backup(archive_path: Path, target_home: Path) -> Path:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
     return target_home
+
+
+def restore_layout(archive_path: Path, target_root: Path) -> Path:
+    """Restore a canonical layout into a new isolated root."""
+    archive_path = archive_path.resolve()
+    target_root = target_root.resolve()
+    if target_root.exists():
+        raise OperationsError("restore target already exists; choose a new root")
+    verify_backup(archive_path)
+    target_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix="gravityclaw-layout-restore-", dir=target_root.parent))
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers():
+                _validate_member(member)
+            archive.extractall(temporary)
+        if not (temporary / "data" / "gravityclaw.db").is_file():
+            raise OperationsError("canonical backup has no data/gravityclaw.db")
+        target_root.mkdir(mode=0o700)
+        layout = RuntimeLayout.for_user(target_root)
+        for name in ("data", "config"):
+            source = temporary / name
+            if source.exists():
+                shutil.copytree(source, getattr(layout, "data_dir" if name == "data" else "config_dir"), symlinks=False)
+        layout.create()
+        config_file = layout.config_file
+        if config_file.is_file():
+            metadata_path = temporary / "backup.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+            source = metadata.get("source", {})
+            content = config_file.read_text(encoding="utf-8")
+            for key, replacement in (("config", layout.config_dir), ("data", layout.data_dir), ("runtime", layout.runtime_dir)):
+                original = source.get(key)
+                if original:
+                    content = content.replace(str(original), str(replacement))
+            config_file.write_text(content, encoding="utf-8")
+            config_file.chmod(0o600)
+        database_health(layout.database)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if target_root.exists():
+            shutil.rmtree(target_root, ignore_errors=True)
+        raise
+    shutil.rmtree(temporary, ignore_errors=True)
+    return target_root
 
 
 def _sqlite_backup(source_path: Path, destination: Path) -> None:

@@ -222,6 +222,10 @@ class Store:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.chmod(0o700)
+        except OSError:
+            pass
         with self._connect() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -242,6 +246,10 @@ class Store:
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+                try:
+                    self.path.chmod(0o600)
+                except OSError:
+                    pass
                 return
             version = int(row["value"])
             if version > SCHEMA_VERSION:
@@ -305,6 +313,10 @@ class Store:
             connection.executescript(_CONTROL_SCHEMA)
             connection.executescript(_IDENTITY_SCHEMA)
             self._ensure_message_index(connection)
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
 
     @staticmethod
     def _set_schema_version(connection: sqlite3.Connection, version: int) -> None:

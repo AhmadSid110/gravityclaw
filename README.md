@@ -52,6 +52,10 @@ M8B.8 completes the browser torture, reconnect, crash-recovery, redaction, and
 remain navigable without flooding the DOM. See [the M8B.8 report](docs/milestone-8b8.md).
 M9 hardens worker boundaries, secret lifecycles, authenticated operational
 surfaces, and backup/restore. See [the M9 report](docs/milestone-9.md).
+M10 adds the canonical XDG installation layout, secure TOML configuration,
+`gravityclaw setup`/`doctor`, user-service scaffolding, release provenance,
+atomic release switching, and layout-aware backup/restore. See [the M10
+deployment guide](docs/milestone-10.md).
 
 ## Core server
 
@@ -67,6 +71,18 @@ GRAVITYCLAW_HOME="$PWD/.runtime" \
 The server binds `127.0.0.1:8787` by default. Do not expose it publicly; channel
 authentication belongs to the channel layer, and the control plane should also
 be configured with `GRAVITYCLAW_CONTROL_TOKEN_FILE` before remote access.
+
+For the canonical user installation, use the reviewed artifact installer:
+
+```bash
+packaging/install.sh
+gravityclaw doctor
+```
+
+This creates XDG-owned config/data/state/runtime directories and a systemd user
+unit. AGY authentication remains an explicit official CLI step; GravityClaw
+never copies or exports those credentials. `GRAVITYCLAW_HOME` remains supported
+for development and backwards compatibility.
 
 ## Local protocol probe
 

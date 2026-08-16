@@ -33,15 +33,20 @@ class IdentityDocument:
 
 
 class IdentityStore:
-    def __init__(self, home: Path, max_document_bytes: int = 256_000) -> None:
+    def __init__(
+        self, home: Path, max_document_bytes: int = 256_000,
+        *, runtime_home: Path | None = None,
+    ) -> None:
         self.home = home
+        self.runtime_home = runtime_home
         self.max_document_bytes = max_document_bytes
 
     def bootstrap(self) -> list[Path]:
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.home.chmod(0o700)
-        (self.home / "memory").mkdir(mode=0o700, exist_ok=True)
-        (self.home / "workspaces").mkdir(mode=0o700, exist_ok=True)
+        runtime_home = self.runtime_home or self.home
+        (runtime_home / "memory").mkdir(mode=0o700, parents=True, exist_ok=True)
+        (runtime_home / "workspaces").mkdir(mode=0o700, parents=True, exist_ok=True)
         created: list[Path] = []
         for name, content in DEFAULT_DOCUMENTS.items():
             path = self.home / name
