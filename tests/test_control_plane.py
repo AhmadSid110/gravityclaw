@@ -131,6 +131,28 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret:github", body)
         self.assertIn("<redacted>", body)
 
+    async def test_inspector_events_redact_secret_shaped_values(self) -> None:
+        from gravityclaw.events import AgentEvent
+
+        workspace = self.app.state.store.create_workspace("redaction", self.home / "redaction")
+        conversation = self.app.state.store.create_conversation(workspace.id)
+        run = self.app.state.store.submit_run(conversation.id, {"prompt": "inspect event"})
+        self.app.state.store.append_event(
+            run.id,
+            AgentEvent(
+                "agent.step", run.id,
+                data={"token": "raw-token", "nested": {"password": "raw-password"}},
+                raw={"event": "step_update", "api_key": "raw-key"},
+            ),
+        )
+        response = await self.client.get(f"/api/v1/runs/{run.id}/timeline", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        body = response.text
+        self.assertNotIn("raw-token", body)
+        self.assertNotIn("raw-password", body)
+        self.assertNotIn("raw-key", body)
+        self.assertIn("<redacted>", body)
+
 
 if __name__ == "__main__":
     unittest.main()

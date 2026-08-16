@@ -35,6 +35,9 @@ See [the M8B foundation report](docs/milestone-8b-foundation.md).
 M8B.3 adds the durable Conversation Workspace with Web/Telegram convergence,
 queued follow-ups, live activity reduction, and Focus/Inspect modes. See
 [the M8B.3 report](docs/milestone-8b3.md).
+M8B.4 adds the shared live/historical Run Inspector with tool cards, subagent
+activity, lazy artifacts, immutable manifests, and redacted raw events. See
+[the M8B.4 report](docs/milestone-8b4.md).
 
 ## Core server
 

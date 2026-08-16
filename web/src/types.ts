@@ -51,8 +51,11 @@ export interface ConversationDetail {
 export interface ToolActivity {
   id: string;
   name: string;
-  state: "running" | "finished" | "failed";
+  state: "queued" | "running" | "finished" | "failed" | "cancelled" | "soft-denied";
   detail: string;
+  sequence?: number;
+  durationMs?: number;
+  output?: string;
 }
 
 export interface PresentationState {
@@ -62,6 +65,42 @@ export interface PresentationState {
   currentTool: ToolActivity | null;
   completedTools: ToolActivity[];
   subagents: string[];
+}
+
+export interface Artifact {
+  id: string;
+  run_id: string;
+  conversation_id: string;
+  kind: string;
+  content: string | null;
+  excerpt: string;
+  summary: string;
+  sha256: string;
+  characters: number;
+  relevance: number;
+  created_at: string;
+}
+
+export interface SubagentNode {
+  id: string;
+  label: string;
+  state: "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown";
+  parentId: string | null;
+  conversationId: string | null;
+  tools: number;
+  tokens: number | null;
+  latest: string;
+  sequence: number;
+}
+
+export interface RunInspection {
+  run: RunRecord;
+  events: PersistedEvent[];
+  tools: ToolActivity[];
+  subagents: SubagentNode[];
+  artifacts: Artifact[];
+  context: Record<string, unknown> | null;
+  capabilities: Record<string, unknown> | null;
 }
 
 export interface PersistedEvent {

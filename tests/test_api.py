@@ -65,6 +65,14 @@ class MilestoneThreeApiTests(unittest.IsolatedAsyncioTestCase):
             json={"kind": "log", "content": "failure details", "summary": "failure"},
         )
         self.assertEqual(artifact.status_code, 201)
+        artifact_list = await self.client.get(f"/api/v1/runs/{run.id}/artifacts")
+        self.assertEqual(artifact_list.status_code, 200)
+        self.assertIsNone(artifact_list.json()[0]["content"])
+        artifact_detail = await self.client.get(
+            f"/api/v1/artifacts/{artifact.json()['id']}"
+        )
+        self.assertEqual(artifact_detail.status_code, 200)
+        self.assertEqual(artifact_detail.json()["content"], "failure details")
         summaries = await self.client.get(f"/conversations/{conversation.id}/summaries")
         self.assertEqual(summaries.status_code, 200)
         self.assertEqual(summaries.json(), [])

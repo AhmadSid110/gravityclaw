@@ -9,7 +9,8 @@
 - M7 — Skills and MCP management: verified
 - M8A — Authenticated control plane and durable read models: verified
 - M8B foundation — Responsive shell and replay/session foundation: verified
-- M8B.3 — Conversation Workspace: in progress
+- M8B.3 — Conversation Workspace: verified
+- M8B.4 — Rich Run and Subagent Inspector: in progress
 - M9 — Hardening and packaging: planned
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,

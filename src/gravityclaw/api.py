@@ -744,6 +744,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _event_json(item) for item in store.list_events(run_id, after_sequence=after)
         ]}
 
+    @app.get("/api/v1/runs/{run_id}/artifacts")
+    async def control_run_artifacts(run_id: str) -> list[dict[str, Any]]:
+        try:
+            return [
+                {**asdict(item), "content": None}
+                for item in store.list_artifacts(run_id)
+            ]
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/v1/artifacts/{artifact_id}")
+    async def control_artifact(artifact_id: str) -> dict[str, Any]:
+        try:
+            return asdict(store.get_artifact(artifact_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/v1/audit")
     async def control_audit(after: int = Query(default=0, ge=0), limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
         return [asdict(item) for item in store.list_audit(after_id=after, limit=limit)]
@@ -818,7 +835,19 @@ def _run_json(run: RunRecord) -> dict[str, Any]:
 
 
 def _event_json(event: PersistedEvent) -> dict[str, Any]:
-    return asdict(event)
+    return _redact_control(asdict(event))
+
+
+def _redact_control(value: Any, *, key: str = "") -> Any:
+    """Keep inspector payloads useful without exposing secret-shaped values."""
+    lowered = key.casefold()
+    if any(marker in lowered for marker in ("token", "secret", "password", "credential", "api_key")):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {str(k): _redact_control(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_control(item, key=key) for item in value]
+    return value
 
 
 def _skill_json(skill: Any) -> dict[str, Any]:

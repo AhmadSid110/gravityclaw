@@ -1831,6 +1831,36 @@ class Store:
         ranked.sort(key=lambda item: (-item.relevance, item.created_at, item.id))
         return ranked[:limit]
 
+    def list_artifacts(self, run_id: str) -> list[Artifact]:
+        """Return artifact metadata for a run without requiring content reads."""
+        self.get_run(run_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM artifacts WHERE run_id=? ORDER BY created_at, id",
+                (run_id,),
+            ).fetchall()
+        return [
+            Artifact(
+                row["id"], row["run_id"], row["conversation_id"], row["kind"],
+                "", row["excerpt"], row["summary"], row["sha256"],
+                int(row["characters"]), 0, row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def get_artifact(self, artifact_id: str) -> Artifact:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"artifact not found: {artifact_id}")
+        return Artifact(
+            row["id"], row["run_id"], row["conversation_id"], row["kind"],
+            row["content"], row["excerpt"], row["summary"], row["sha256"],
+            int(row["characters"]), 0, row["created_at"],
+        )
+
 
 def _conversation(row: sqlite3.Row) -> Conversation:
     return Conversation(

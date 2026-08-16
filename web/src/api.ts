@@ -1,4 +1,4 @@
-import type { Conversation, ConversationDetail, ControlSnapshot, PersistedEvent, RunRecord } from "./types";
+import type { Artifact, Conversation, ConversationDetail, ControlSnapshot, PersistedEvent, RunRecord } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -73,6 +73,22 @@ export async function cancelRun(run: RunRecord): Promise<RunRecord> {
 
 export async function getTimeline(runId: string): Promise<{ run: RunRecord; events: PersistedEvent[] }> {
   return request(`/api/v1/runs/${encodeURIComponent(runId)}/timeline`);
+}
+
+export async function getRunArtifacts(runId: string): Promise<Artifact[]> {
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}/artifacts`);
+}
+
+export async function getArtifact(artifactId: string): Promise<Artifact> {
+  return request(`/api/v1/artifacts/${encodeURIComponent(artifactId)}`);
+}
+
+export async function getRunContext(runId: string): Promise<Record<string, unknown>> {
+  return request(`/runs/${encodeURIComponent(runId)}/context`);
+}
+
+export async function getRunCapabilities(runId: string): Promise<Record<string, unknown>> {
+  return request(`/runs/${encodeURIComponent(runId)}/capabilities`);
 }
 
 export function controlSocketUrl(cursor: number): string {
