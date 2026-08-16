@@ -22,7 +22,7 @@ export function MemoryStudio() {
   }, []);
   return <div className="page fade-in memory-studio">
     <div className="page-heading"><div><div className="eyebrow">PERSISTENT AGENT</div><h1>Memory Studio</h1><p className="muted">What GravityClaw remembers across runs.</p></div><span className="studio-health"><span className="status-dot green" /> SQLite FTS · atomic state</span></div>
-    {error && <div className="inline-error studio-error">{error}</div>}
+    {error && <div className="inline-error studio-error" role="alert">{error}</div>}
     <div className="studio-tabs" role="tablist">{(["Memory", "Daily Journal", "Identity", "Search"] as StudioTab[]).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
     {tab === "Memory" && <MemoryHome memories={memories} selected={selectedMemory} onOpen={(record) => void getMemory(record.id).then(setSelectedMemory).catch((reason) => setError(messageOf(reason, "Unable to inspect memory")))} />}
     {tab === "Daily Journal" && <JournalView journals={journals} onError={setError} />}

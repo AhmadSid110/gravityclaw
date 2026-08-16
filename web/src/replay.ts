@@ -34,7 +34,7 @@ export function presentationForRun(run: RunRecord, events: PersistedEvent[]): Pr
     runId: run.id, status: run.status, assistantText: "", currentTool: null,
     completedTools: [], subagents: [],
   };
-  for (const event of events.sort((left, right) => left.sequence - right.sequence)) {
+  for (const event of events.slice().sort((left, right) => left.sequence - right.sequence)) {
     const payload = event.payload;
     if (event.event_type === "message.delta") {
       presentation.assistantText += typeof payload.text_delta === "string" ? payload.text_delta : "";

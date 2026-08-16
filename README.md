@@ -44,6 +44,9 @@ context simulation. See [the M8B.5 report](docs/milestone-8b5.md).
 M8B.6 adds durable Automations and workspace-scoped Capabilities studios with
 idempotent run-now triggers, occurrence history, health, isolation, and immutable
 run snapshots. See [the M8B.6 report](docs/milestone-8b6.md).
+M8B.7 freezes features and polishes the existing console with shared status and
+error states, responsive behavior, keyboard focus, reduced-motion support, and
+streaming-oriented render safeguards. See [the M8B.7 report](docs/milestone-8b7.md).
 
 ## Core server
 

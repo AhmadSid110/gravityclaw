@@ -132,3 +132,43 @@ button { border: 0; cursor: pointer; }
 @media (max-width: 900px) { .automation-layout, .capability-grid, .capability-lower { grid-template-columns: 1fr; }.automation-facts { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 760px) { .automation-new { width: 100%; }.automation-form-grid { grid-template-columns: 1fr; padding: 16px; }.form-wide { grid-column: auto; }.automation-detail-head, .capability-hero { align-items: flex-start; flex-direction: column; padding: 17px; }.automation-facts { padding: 14px 17px 2px; }.automation-actions { padding: 13px 17px 16px; flex-wrap: wrap; }.occurrence-row { padding-left: 17px; padding-right: 17px; }.occurrence-row small { display: none; }.workspace-select { width: 100%; }.capability-row { padding-left: 14px; padding-right: 14px; }.capability-toggle { padding-left: 6px; padding-right: 6px; }.snapshot-row { padding-left: 14px; padding-right: 14px; } }
 .memory-detail { margin-top: 13px; overflow: hidden; }.memory-detail .editor-head { padding: 17px 19px; }.memory-detail-content { margin: 18px 20px; color: var(--text); font-size: 11px; line-height: 1.65; }.memory-detail > .section-label { padding: 0 20px 8px; }.memory-usage { display: flex; justify-content: space-between; gap: 10px; padding: 10px 20px; border-top: 1px solid var(--border); font-family: 'DM Mono', monospace; font-size: 9px; }.memory-usage span { color: var(--muted); }.memory-no-usage { display: block; padding: 0 20px 18px; font-size: 10px; }
+
+/* M8B.7 polish, accessibility, and responsive hardening */
+:where(button, a, input, textarea, select):focus-visible { outline: 2px solid #9bb2ff; outline-offset: 2px; }
+:where(button, input, textarea, select) { font: inherit; }
+button:disabled { cursor: not-allowed; }
+.status-badge { min-height: 18px; }
+.status-symbol { display: inline-grid; place-items: center; width: 12px; color: currentColor; font-size: 10px; line-height: 1; }
+.status-badge .status-dot { flex: 0 0 6px; }
+.history-count { color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 7px 10px; font-family: 'DM Mono', monospace; font-size: 9px; }
+.connection-banner { margin: 0; padding: 9px 24px; color: #e6c27c; border-bottom: 1px solid #6b5423; background: #4d3c1726; font-size: 11px; }
+.workspace-loading { display: grid; min-height: 270px; place-items: center; color: var(--muted); font-size: 11px; }
+.inspector-trigger { display: none; margin: 0; padding: 7px 9px; font-size: 9px; }
+.live-run-block { animation: surface-enter .18s ease-out; }
+.activity-chip { transition: background-color .14s ease, color .14s ease; }
+.activity-chip:hover { border-radius: 6px; background: var(--surface-2); }
+.tool-card-head, .inspector-link, .event-view-toggle button { min-height: 40px; }
+.tool-card-head { text-align: left; }
+.tool-card-detail pre, .artifact-preview, .manifest-panel pre, .event-detail pre { max-width: 100%; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
+.conversation-header-actions { flex-wrap: wrap; justify-content: flex-end; }
+.composer textarea { min-height: 25px; }
+.activity-row, .run-timeline-row, .tool-card, .subagent-node { overflow-wrap: anywhere; }
+@keyframes surface-enter { from { opacity: .5; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+@media (pointer: coarse) { button, a, select, input[type="button"], input[type="submit"] { min-height: 44px; } .icon-button, .mobile-menu { min-width: 44px; } }
+@media (max-width: 1200px) { .inspector-trigger { display: inline-flex; } }
+@media (max-width: 760px) {
+  .connection-banner { padding: 9px 15px; font-size: 10px; }
+  .page-heading { gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .conversation-header { align-items: flex-start; }
+  .conversation-header-actions { max-width: 100%; }
+  .conversation-header-actions .inspector-trigger { display: inline-flex; }
+  .message-content p, .streaming-text { overflow-wrap: anywhere; }
+  .composer-wrap { position: sticky; bottom: 0; z-index: 3; }
+  .composer-footer { align-items: flex-end; }
+  .composer-context { flex: 1; }
+  .table-row, .run-row, .automation-row { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+  .streaming-cursor { animation: none; }
+}
