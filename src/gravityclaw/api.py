@@ -83,6 +83,7 @@ class RunCreate(BaseModel):
     forbidden_path: str | None = None
     print_timeout: str = "15m"
     allow_all: bool = False
+    context_profile: str = Field(default="chat", pattern="^(chat|coding|heartbeat|scheduled)$")
 
 
 class MemoryCreate(BaseModel):
@@ -90,6 +91,12 @@ class MemoryCreate(BaseModel):
     source: str = Field(min_length=1, max_length=500)
     conversation_id: str | None = None
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class ArtifactCreate(BaseModel):
+    kind: str = Field(min_length=1, max_length=100)
+    content: str = Field(min_length=1, max_length=5_000_000)
+    summary: str = Field(default="", max_length=10_000)
 
 
 class WorkspaceAliasCreate(BaseModel):
@@ -161,7 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await channel_runtime.close()
             await manager.close()
 
-    app = FastAPI(title="GravityClaw Core", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="GravityClaw Core", version="0.5.0", lifespan=lifespan)
     app.state.settings = configured
     app.state.store = store
     app.state.event_bus = bus
@@ -252,6 +259,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _event_json(event)
             for event in store.list_events(run_id, after_sequence=after, limit=limit)
         ]
+
+    @app.get("/runs/{run_id}/context")
+    async def inspect_run_context(run_id: str) -> dict[str, Any]:
+        try:
+            return store.get_context_manifest(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/conversations/{conversation_id}/context-watermark")
+    async def inspect_context_watermark(conversation_id: str) -> dict[str, Any]:
+        try:
+            store.get_conversation(conversation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        watermark = store.get_context_watermark(conversation_id)
+        return asdict(watermark) if watermark is not None else {}
+
+    @app.get("/conversations/{conversation_id}/summaries")
+    async def list_context_summaries(conversation_id: str) -> list[dict[str, Any]]:
+        try:
+            store.get_conversation(conversation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return store.list_conversation_summaries(conversation_id)
+
+    @app.post("/runs/{run_id}/artifacts", status_code=201)
+    async def create_artifact(run_id: str, body: ArtifactCreate) -> dict[str, str]:
+        try:
+            artifact_id = store.add_artifact(
+                run_id, kind=body.kind, content=body.content, summary=body.summary
+            )
+            return {"id": artifact_id}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/runs/{run_id}/cancel")
     async def cancel_run(run_id: str) -> dict[str, Any]:

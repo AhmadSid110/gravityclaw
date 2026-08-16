@@ -7,6 +7,7 @@ transitions and their corresponding events commit in the same transaction.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -20,7 +21,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 RUN_STATUSES = (
     "queued",
     "running",
@@ -72,6 +73,32 @@ class Message:
     content: str
     created_at: str
     source_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Artifact:
+    id: str
+    run_id: str
+    conversation_id: str
+    kind: str
+    content: str
+    excerpt: str
+    summary: str
+    sha256: str
+    characters: int
+    relevance: int
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextWatermark:
+    conversation_id: str
+    backend_conversation_id: str | None
+    last_run_id: str
+    last_message_id: str | None
+    identity_hashes: dict[str, str]
+    context_fingerprint: str
+    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +161,7 @@ class Store:
             if row is None:
                 connection.executescript(_SCHEMA)
                 connection.executescript(_CHANNEL_SCHEMA)
+                connection.executescript(_CONTEXT_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -166,8 +194,13 @@ class Store:
             if version == 3:
                 connection.executescript(_CHANNEL_SCHEMA)
                 self._set_schema_version(connection, 4)
+                version = 4
+            if version == 4:
+                connection.executescript(_CONTEXT_SCHEMA)
+                self._set_schema_version(connection, 5)
             connection.executescript(_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
+            connection.executescript(_CONTEXT_SCHEMA)
             self._ensure_message_index(connection)
 
     @staticmethod
@@ -289,6 +322,11 @@ class Store:
                     "refusing to replace an existing AGY conversation binding "
                     f"({current['agy_conversation_id']} != {backend_id})"
                 )
+            connection.execute(
+                "UPDATE context_watermarks SET backend_conversation_id=?, updated_at=? "
+                "WHERE conversation_id=?",
+                (backend_id, now, conversation_id),
+            )
 
     def append_message(
         self,
@@ -350,6 +388,47 @@ class Store:
                        SELECT * FROM messages WHERE conversation_id=? {exclusion}
                        ORDER BY created_at DESC, rowid DESC LIMIT ?
                    ) ORDER BY created_at ASC, rowid ASC""",
+                parameters,
+            ).fetchall()
+        return [_message(row) for row in rows]
+
+    def get_run_message_id(self, run_id: str, role: str = "user") -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM messages WHERE source_run_id=? AND role=?",
+                (run_id, role),
+            ).fetchone()
+        return str(row["id"]) if row is not None else None
+
+    def messages_after(
+        self,
+        conversation_id: str,
+        *,
+        after_message_id: str | None = None,
+        exclude_run_id: str | None = None,
+        limit: int = 10_000,
+    ) -> list[Message]:
+        parameters: list[Any] = [conversation_id]
+        boundary = ""
+        if after_message_id is not None:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT rowid FROM messages WHERE id=? AND conversation_id=?",
+                    (after_message_id, conversation_id),
+                ).fetchone()
+            if row is None:
+                raise ValueError("summary boundary message no longer exists")
+            boundary = "AND rowid>?"
+            parameters.append(int(row["rowid"]))
+        exclusion = ""
+        if exclude_run_id is not None:
+            exclusion = "AND (source_run_id IS NULL OR source_run_id<>?)"
+            parameters.append(exclude_run_id)
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM messages WHERE conversation_id=? {boundary} {exclusion}
+                    ORDER BY rowid LIMIT ?""",
                 parameters,
             ).fetchall()
         return [_message(row) for row in rows]
@@ -483,10 +562,53 @@ class Store:
                 return _run(row)
             request["execution_prompt"] = execution_prompt
             request["context_manifest"] = dict(manifest)
+            prompt_sha256 = hashlib.sha256(execution_prompt.encode("utf-8")).hexdigest()
+            declared_sha256 = manifest.get("prompt_sha256")
+            if declared_sha256 is not None and declared_sha256 != prompt_sha256:
+                raise ValueError("context manifest prompt hash does not match snapshot")
+            now = utc_now()
             connection.execute(
                 "UPDATE runs SET request_json=?, version=version+1 WHERE id=?",
                 (json.dumps(request, ensure_ascii=False, separators=(",", ":")), run_id),
             )
+            connection.execute(
+                """INSERT INTO context_manifests(
+                    run_id, profile, lifecycle, budget_tokens, used_tokens,
+                    prompt_sha256, identity_fingerprint, context_fingerprint,
+                    manifest_json, created_at, updated_at
+                ) VALUES(?, ?, 'COMPILED', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    str(manifest.get("profile", "chat")),
+                    int(manifest.get("budget_tokens", 0)),
+                    int(manifest.get("estimated_tokens", 0)),
+                    prompt_sha256,
+                    str(manifest.get("identity_fingerprint", "")),
+                    str(manifest.get("context_fingerprint", "")),
+                    json.dumps(dict(manifest), ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    now,
+                ),
+            )
+            summary = manifest.get("summary_proposal")
+            if isinstance(summary, Mapping):
+                connection.execute(
+                    """INSERT OR IGNORE INTO conversation_summaries(
+                        id, conversation_id, version, first_message_id,
+                        last_message_id, message_count, content, sha256, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        str(summary["conversation_id"]),
+                        int(summary["version"]),
+                        str(summary["first_message_id"]),
+                        str(summary["last_message_id"]),
+                        int(summary["message_count"]),
+                        str(summary["content"]),
+                        str(summary["sha256"]),
+                        now,
+                    ),
+                )
             self._append_event_tx(
                 connection,
                 run_id,
@@ -527,7 +649,7 @@ class Store:
         now = utc_now()
         metadata_json = json.dumps(dict(metadata or {}), separators=(",", ":"))
         with self._connect() as connection:
-            run = connection.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            run = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if run is None:
                 raise KeyError(f"run not found: {run_id}")
             if run["status"] != "running":
@@ -568,6 +690,51 @@ class Store:
                 None,
                 None,
             )
+            manifest_row = connection.execute(
+                "SELECT manifest_json FROM context_manifests WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if manifest_row is not None:
+                manifest = json.loads(manifest_row["manifest_json"])
+                identity_hashes = {
+                    str(item["label"]): str(item["sha256"])
+                    for item in manifest.get("sources", [])
+                    if isinstance(item, dict)
+                    and item.get("category") == "identity"
+                    and item.get("included")
+                    and item.get("sha256")
+                }
+                backend_row = connection.execute(
+                    "SELECT agy_conversation_id FROM conversations WHERE id=?",
+                    (run["conversation_id"],),
+                ).fetchone()
+                connection.execute(
+                    "UPDATE context_manifests SET lifecycle='DISPATCHED', "
+                    "dispatched_at=?, updated_at=? WHERE run_id=? AND lifecycle='COMPILED'",
+                    (now, now, run_id),
+                )
+                connection.execute(
+                    """INSERT INTO context_watermarks(
+                        conversation_id, backend_conversation_id, last_run_id,
+                        last_message_id, identity_hashes_json,
+                        context_fingerprint, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id) DO UPDATE SET
+                        backend_conversation_id=excluded.backend_conversation_id,
+                        last_run_id=excluded.last_run_id,
+                        last_message_id=excluded.last_message_id,
+                        identity_hashes_json=excluded.identity_hashes_json,
+                        context_fingerprint=excluded.context_fingerprint,
+                        updated_at=excluded.updated_at""",
+                    (
+                        run["conversation_id"],
+                        backend_row["agy_conversation_id"] if backend_row else None,
+                        run_id,
+                        manifest.get("last_message_id"),
+                        json.dumps(identity_hashes, separators=(",", ":"), sort_keys=True),
+                        str(manifest.get("context_fingerprint", "")),
+                        now,
+                    ),
+                )
 
     def record_worker(
         self,
@@ -688,6 +855,12 @@ class Store:
                         now,
                         run_id,
                     ),
+                )
+            if status in TERMINAL_RUN_STATUSES:
+                connection.execute(
+                    "UPDATE context_manifests SET lifecycle='ARCHIVED', archived_at=?, "
+                    "updated_at=? WHERE run_id=? AND lifecycle IN ('COMPILED','DISPATCHED')",
+                    (now, now, run_id),
                 )
         return True
 
@@ -889,6 +1062,117 @@ class Store:
                 (fts_query, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_context_manifest(self, run_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM context_manifests WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            run = self.get_run(run_id)
+            historical = run.request.get("context_manifest")
+            if not isinstance(historical, dict):
+                raise KeyError(f"context manifest not found: {run_id}")
+            return {**historical, "lifecycle": "HISTORICAL"}
+        manifest = json.loads(row["manifest_json"])
+        manifest.update({
+            "lifecycle": row["lifecycle"],
+            "compiled_at": row["created_at"],
+            "dispatched_at": row["dispatched_at"],
+            "archived_at": row["archived_at"],
+        })
+        return manifest
+
+    def get_context_watermark(self, conversation_id: str) -> ContextWatermark | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM context_watermarks WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ContextWatermark(
+            row["conversation_id"], row["backend_conversation_id"],
+            row["last_run_id"], row["last_message_id"],
+            json.loads(row["identity_hashes_json"]), row["context_fingerprint"],
+            row["updated_at"],
+        )
+
+    def latest_summary_version(self, conversation_id: str) -> int:
+        with self._connect() as connection:
+            return int(connection.execute(
+                "SELECT COALESCE(MAX(version),0) FROM conversation_summaries "
+                "WHERE conversation_id=?", (conversation_id,),
+            ).fetchone()[0])
+
+    def latest_context_summary(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_summaries WHERE conversation_id=? "
+                "ORDER BY version DESC LIMIT 1", (conversation_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_conversation_summaries(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM conversation_summaries WHERE conversation_id=? "
+                "ORDER BY version", (conversation_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_artifact(
+        self,
+        run_id: str,
+        *,
+        kind: str,
+        content: str,
+        summary: str = "",
+        excerpt_characters: int = 1200,
+    ) -> str:
+        if not kind.strip() or not content:
+            raise ValueError("artifact kind and content are required")
+        run = self.get_run(run_id)
+        artifact_id = str(uuid.uuid4())
+        excerpt = content[:excerpt_characters]
+        now = utc_now()
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO artifacts(
+                    id, run_id, conversation_id, kind, content, excerpt, summary,
+                    sha256, characters, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (artifact_id, run_id, run.conversation_id, kind.strip(), content,
+                 excerpt, summary.strip(), digest, len(content), now),
+            )
+        return artifact_id
+
+    def relevant_artifacts(
+        self, conversation_id: str, query: str, *, limit: int = 8
+    ) -> list[Artifact]:
+        terms = sorted(set(re.findall(r"[^\W_]+", query.casefold(), flags=re.UNICODE)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, run_id, conversation_id, kind, excerpt, summary,
+                          sha256, characters, created_at
+                   FROM artifacts WHERE conversation_id=?
+                   ORDER BY created_at DESC, id""",
+                (conversation_id,),
+            ).fetchall()
+        ranked: list[Artifact] = []
+        for row in rows:
+            searchable = f"{row['kind']} {row['summary']} {row['excerpt']}".casefold()
+            relevance = sum(1 for term in terms if term in searchable)
+            if terms and relevance == 0:
+                continue
+            ranked.append(Artifact(
+                row["id"], row["run_id"], row["conversation_id"], row["kind"],
+                "", row["excerpt"], row["summary"], row["sha256"],
+                int(row["characters"]), relevance, row["created_at"],
+            ))
+        ranked.sort(key=lambda item: (-item.relevance, item.created_at, item.id))
+        return ranked[:limit]
 
 
 def _conversation(row: sqlite3.Row) -> Conversation:
@@ -1208,4 +1492,61 @@ CREATE INDEX IF NOT EXISTS channel_outbox_delivery
     ON channel_outbox(status, available_at);
 CREATE UNIQUE INDEX IF NOT EXISTS channel_outbox_run
     ON channel_outbox(channel, run_id) WHERE run_id IS NOT NULL;
+"""
+
+_CONTEXT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS context_manifests (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    profile TEXT NOT NULL,
+    lifecycle TEXT NOT NULL CHECK(lifecycle IN ('COMPILED','DISPATCHED','ARCHIVED')),
+    budget_tokens INTEGER NOT NULL,
+    used_tokens INTEGER NOT NULL,
+    prompt_sha256 TEXT NOT NULL,
+    identity_fingerprint TEXT NOT NULL,
+    context_fingerprint TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    dispatched_at TEXT,
+    archived_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS context_watermarks (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    backend_conversation_id TEXT,
+    last_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    last_message_id TEXT,
+    identity_hashes_json TEXT NOT NULL,
+    context_fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    first_message_id TEXT NOT NULL,
+    last_message_id TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(conversation_id, version),
+    UNIQUE(conversation_id, first_message_id, last_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    excerpt TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    characters INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS artifacts_conversation_time
+    ON artifacts(conversation_id, created_at);
 """

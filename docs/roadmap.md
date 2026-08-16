@@ -4,11 +4,11 @@
 - M2 — Reliable execution core: verified
 - M3 — Identity, memory, and basic context: verified
 - M4 — Durable channel layer and Telegram: verified
-- M5 — Context Management Protocol: next
-- M6 — Heartbeat and scheduling
+- M5 — Context Management Protocol: verified
+- M6 — Heartbeat and scheduling: next
 - M7 — Skills and MCP management
 - M8 — Full dashboard and control plane
 
-The live M4 Telegram gate passed. Heartbeat and scheduling remain blocked on
-M5's deterministic context selection, budgeting, provenance, compaction, and
-invalidation protocol.
+M5's deterministic selection, budgeting, provenance, compaction, invalidation,
+and crash-safety gates passed. M6 can now add proactive execution without
+changing the context or execution ownership boundaries.

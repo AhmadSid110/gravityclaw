@@ -14,9 +14,11 @@ SQLite FTS retrieval, bounded context compilation, and durable channel history.
 See the [spike report](spikes/001-authenticated-agy/README.md),
 [Milestone 2 report](docs/milestone-2.md), and
 [Milestone 3 report](docs/milestone-3.md). Milestone 4 adds the durable channel
-layer and Telegram adapter; its deterministic forced-crash gate passes, with a
-live Telegram-account check still required. See the
-[Milestone 4 report](docs/milestone-4.md).
+layer and Telegram adapter; both deterministic and live Telegram gates pass.
+Milestone 5 adds the Context Management Protocol, profiles, manifests,
+watermarks, summaries, artifact references, and hash invalidation. See the
+[Milestone 4 report](docs/milestone-4.md) and
+[Milestone 5 report](docs/milestone-5.md).
 
 ## Core server
 
@@ -80,8 +82,9 @@ scheduler milestone, and `MEMORY.md` is always labeled as data.
 Episodic memory writes are explicit through `POST /memories`; model execution
 cannot overwrite identity or curated memory files. Retrieval uses SQLite FTS5.
 Context is compiled immediately before dispatch, persisted with a provenance
-manifest, and bounded by deterministic character budgets. A resumed AGY
-conversation does not receive duplicated channel history.
+manifest, and bounded by deterministic token estimates plus a hard character
+ceiling. A resumed AGY conversation does not receive duplicated channel
+history. Inspect a run with `GET /runs/{id}/context`.
 
 ## Telegram channel
 

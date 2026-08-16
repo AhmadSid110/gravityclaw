@@ -15,6 +15,7 @@ class MilestoneThreeApiTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="gravityclaw-api-m3-")
         self.home = Path(self.temporary.name)
         app = create_app(Settings(home=self.home, mode="fake"))
+        self.app = app
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         )
@@ -44,6 +45,29 @@ class MilestoneThreeApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(results.status_code, 200)
         self.assertEqual(results.json()[0]["id"], created.json()["id"])
+
+    async def test_context_manifest_and_artifact_inspection_endpoints(self) -> None:
+        store = self.app.state.store
+        workspace = store.create_workspace("api", self.home / "workspace")
+        conversation = store.create_conversation(workspace.id)
+        run = store.submit_run(conversation.id, {"prompt": "inspect"})
+        self.assertIsNotNone(store.claim_run(run.id))
+        store.prepare_run_context(
+            run.id, "sealed prompt",
+            {"version": 2, "profile": "chat", "estimated_tokens": 4,
+             "budget_tokens": 100, "sources": []},
+        )
+        inspected = await self.client.get(f"/runs/{run.id}/context")
+        self.assertEqual(inspected.status_code, 200)
+        self.assertEqual(inspected.json()["lifecycle"], "COMPILED")
+        artifact = await self.client.post(
+            f"/runs/{run.id}/artifacts",
+            json={"kind": "log", "content": "failure details", "summary": "failure"},
+        )
+        self.assertEqual(artifact.status_code, 201)
+        summaries = await self.client.get(f"/conversations/{conversation.id}/summaries")
+        self.assertEqual(summaries.status_code, 200)
+        self.assertEqual(summaries.json(), [])
 
 
 class TelegramSettingsTests(unittest.TestCase):
