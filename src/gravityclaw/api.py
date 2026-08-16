@@ -23,6 +23,7 @@ from .execution import (
 from .identity import IdentityStore
 from .manager import RunManager
 from .memory import MemoryService
+from .scheduler import Scheduler
 from .store import PersistedEvent, RunRecord, Store, TERMINAL_RUN_STATUSES
 from .telegram import TelegramAdapter
 
@@ -37,6 +38,7 @@ class Settings:
     telegram_user_id: str | None = None
     telegram_default_workspace: str | None = None
     telegram_api_root: str = "https://api.telegram.org"
+    scheduler_poll_interval: float = 1.0
 
     @property
     def database(self) -> Path:
@@ -60,6 +62,9 @@ class Settings:
             ),
             telegram_api_root=os.environ.get(
                 "GRAVITYCLAW_TELEGRAM_API_ROOT", "https://api.telegram.org"
+            ),
+            scheduler_poll_interval=float(
+                os.environ.get("GRAVITYCLAW_SCHEDULER_POLL_INTERVAL", "1.0")
             ),
         )
 
@@ -104,6 +109,27 @@ class WorkspaceAliasCreate(BaseModel):
     workspace_id: str
 
 
+class ScheduleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    trigger_type: str = Field(pattern="^(one_shot|interval|cron|heartbeat)$")
+    expression: str = Field(min_length=1, max_length=200)
+    timezone: str = "UTC"
+    start_at: str | None = None
+    prompt: str = Field(min_length=1, max_length=12_000)
+    context_profile: str | None = None
+    workspace_id: str
+    conversation_policy: str = Field(default="new", pattern="^(new|resume)$")
+    concurrency_policy: str = Field(default="QUEUE", pattern="^(SKIP|QUEUE|REPLACE)$")
+    misfire_policy: str = Field(
+        default="MISFIRE_RUN_ONCE",
+        pattern="^(MISFIRE_SKIP|MISFIRE_RUN_ONCE|MISFIRE_CATCH_UP)$",
+    )
+    misfire_grace_seconds: int = Field(default=3600, ge=0)
+    notification_policy: str = Field(default="silent", pattern="^(silent|actionable)$")
+    notification_channel: str | None = None
+    notification_chat_id: str | None = None
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings.from_environment()
     configured.home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -138,6 +164,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         poll_interval=configured.poll_interval,
         context_compiler=context_compiler,
     )
+    scheduler = Scheduler(
+        store, manager, channel_store,
+        poll_interval=configured.scheduler_poll_interval,
+    )
     if bool(configured.telegram_token) != bool(configured.telegram_user_id):
         raise ValueError(
             "Telegram requires both GRAVITYCLAW_TELEGRAM_BOT_TOKEN and "
@@ -159,6 +189,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         report = await manager.start()
         app.state.reconciliation = asdict(report)
+        scheduler_report = await scheduler.start()
+        app.state.scheduler_reconciliation = asdict(scheduler_report)
         if channel_runtime is not None:
             await channel_runtime.start()
         try:
@@ -166,9 +198,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if channel_runtime is not None:
                 await channel_runtime.close()
+            await scheduler.close()
             await manager.close()
 
-    app = FastAPI(title="GravityClaw Core", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="GravityClaw Core", version="0.6.0", lifespan=lifespan)
     app.state.settings = configured
     app.state.store = store
     app.state.event_bus = bus
@@ -177,6 +210,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.memory = memory
     app.state.channel_store = channel_store
     app.state.channel_runtime = channel_runtime
+    app.state.scheduler = scheduler
+    app.state.scheduler_reconciliation = {}
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -185,7 +220,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "mode": configured.mode,
             "telegram": {"enabled": channel_runtime is not None},
             "reconciliation": app.state.reconciliation,
+            "scheduler": app.state.scheduler_reconciliation,
         }
+
+    @app.post("/schedules", status_code=201)
+    async def create_schedule(body: ScheduleCreate) -> dict[str, Any]:
+        values = body.model_dump()
+        if values.get("context_profile") is None:
+            values["context_profile"] = (
+                "heartbeat" if body.trigger_type == "heartbeat" else "scheduled"
+            )
+        try:
+            return asdict(scheduler.create_schedule(**values))
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/schedules")
+    async def list_schedules(include_deleted: bool = False) -> list[dict[str, Any]]:
+        return [asdict(item) for item in store.list_schedules(include_deleted=include_deleted)]
+
+    @app.get("/schedules/{schedule_id}/triggers")
+    async def list_schedule_triggers(schedule_id: str) -> list[dict[str, Any]]:
+        try:
+            store.get_schedule(schedule_id, include_deleted=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return [asdict(item) for item in store.list_triggers(schedule_id=schedule_id)]
+
+    @app.post("/schedules/{schedule_id}/enable")
+    async def enable_schedule(schedule_id: str) -> dict[str, Any]:
+        try:
+            return asdict(store.set_schedule_enabled(schedule_id, True))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/schedules/{schedule_id}/disable")
+    async def disable_schedule(schedule_id: str) -> dict[str, Any]:
+        try:
+            return asdict(store.set_schedule_enabled(schedule_id, False))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/schedules/{schedule_id}")
+    async def delete_schedule(schedule_id: str) -> dict[str, Any]:
+        try:
+            return asdict(store.delete_schedule(schedule_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/workspaces", status_code=201)
     async def create_workspace(body: WorkspaceCreate) -> dict[str, Any]:

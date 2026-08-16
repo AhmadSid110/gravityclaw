@@ -18,7 +18,10 @@ layer and Telegram adapter; both deterministic and live Telegram gates pass.
 Milestone 5 adds the Context Management Protocol, profiles, manifests,
 watermarks, summaries, artifact references, and hash invalidation. See the
 [Milestone 4 report](docs/milestone-4.md) and
-[Milestone 5 report](docs/milestone-5.md).
+[Milestone 5 report](docs/milestone-5.md). Milestone 6 adds durable one-shot,
+interval, cron, and heartbeat scheduling with leases, misfire policies,
+timezone-aware recurrence, and crash-safe trigger/run linking. See the
+[Milestone 6 report](docs/milestone-6.md).
 
 ## Core server
 
@@ -108,6 +111,15 @@ GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE=gravityclaw
 preferred. Commands are `/new`, `/status`, `/stop`, and `/workspace <alias>`.
 The polling cursor, inbox dedupe, cancellation requests, presentation state,
 provider message IDs, retries, and delivery acknowledgements are all durable.
+
+## Scheduling
+
+Schedules enter the same `RunManager` path as channel messages. The API accepts
+`one_shot`, `interval`, `cron`, and `heartbeat` schedules and stores timestamps
+as UTC while evaluating cron expressions in an explicit IANA timezone. Use
+`/schedules/{id}/triggers` to inspect occurrence decisions. Heartbeats default
+to a single bounded evaluation, skip stale backlog, and remain silent unless an
+actionable notification policy and channel target are configured.
 
 ## Security status
 

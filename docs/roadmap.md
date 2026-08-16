@@ -5,7 +5,7 @@
 - M3 — Identity, memory, and basic context: verified
 - M4 — Durable channel layer and Telegram: verified
 - M5 — Context Management Protocol: verified
-- M6 — Heartbeat and scheduling: next
+- M6 — Heartbeat and scheduling: verified
 - M7 — Skills and MCP management
 - M8 — Full dashboard and control plane
 

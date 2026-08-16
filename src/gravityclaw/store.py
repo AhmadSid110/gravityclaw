@@ -14,14 +14,14 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 RUN_STATUSES = (
     "queued",
     "running",
@@ -39,6 +39,13 @@ TERMINAL_RUN_STATUSES = (
     "orphaned",
 )
 WORKER_STATES = ("running", "exited", "missing", "orphaned", "terminated")
+SCHEDULE_TYPES = ("one_shot", "interval", "cron", "heartbeat")
+SCHEDULE_CONCURRENCY = ("SKIP", "QUEUE", "REPLACE")
+MISFIRE_POLICIES = ("MISFIRE_SKIP", "MISFIRE_RUN_ONCE", "MISFIRE_CATCH_UP")
+TRIGGER_STATES = (
+    "PENDING", "CLAIMED", "DISPATCHED", "RUNNING", "COMPLETED", "SKIPPED",
+    "MISSED", "FAILED", "CANCELLED",
+)
 
 
 def utc_now() -> str:
@@ -143,6 +150,52 @@ class WorkerRecord:
     last_seen_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduleRecord:
+    id: str
+    name: str
+    enabled: bool
+    trigger_type: str
+    expression: str
+    timezone: str
+    prompt: str
+    context_profile: str
+    workspace_id: str
+    conversation_policy: str
+    concurrency_policy: str
+    misfire_policy: str
+    misfire_grace_seconds: int
+    notification_policy: str
+    notification_channel: str | None
+    notification_chat_id: str | None
+    generation: int
+    next_run_at: str | None
+    last_run_at: str | None
+    created_at: str
+    updated_at: str
+    deleted_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerRecord:
+    id: str
+    execution_key: str
+    schedule_id: str
+    generation: int
+    scheduled_for: str
+    state: str
+    claim_owner: str | None
+    lease_until: str | None
+    run_id: str | None
+    decision_reason: str | None
+    attempt_count: int
+    created_at: str
+    claimed_at: str | None
+    dispatched_at: str | None
+    finished_at: str | None
+    updated_at: str
+
+
 class Store:
     """Small synchronous repository with one connection per transaction."""
 
@@ -162,6 +215,7 @@ class Store:
                 connection.executescript(_SCHEMA)
                 connection.executescript(_CHANNEL_SCHEMA)
                 connection.executescript(_CONTEXT_SCHEMA)
+                connection.executescript(_SCHEDULER_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -198,9 +252,14 @@ class Store:
             if version == 4:
                 connection.executescript(_CONTEXT_SCHEMA)
                 self._set_schema_version(connection, 5)
+                version = 5
+            if version == 5:
+                connection.executescript(_SCHEDULER_SCHEMA)
+                self._set_schema_version(connection, 6)
             connection.executescript(_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
             connection.executescript(_CONTEXT_SCHEMA)
+            connection.executescript(_SCHEDULER_SCHEMA)
             self._ensure_message_index(connection)
 
     @staticmethod
@@ -299,6 +358,16 @@ class Store:
         if row is None:
             raise KeyError(f"conversation not found: {conversation_id}")
         return _conversation(row)
+
+    def get_conversation_by_channel_key(
+        self, channel: str, channel_key: str
+    ) -> Conversation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE channel=? AND channel_key=?",
+                (channel, channel_key),
+            ).fetchone()
+        return _conversation(row) if row is not None else None
 
     def bind_backend_conversation(self, conversation_id: str, backend_id: str) -> None:
         if not backend_id:
@@ -912,6 +981,398 @@ class Store:
             ).fetchall()
         return [_run(row) for row in rows]
 
+    # ------------------------------------------------------------------
+    # Durable scheduling state. The scheduler never edits runs directly
+    # except through submit_scheduled_run(), which atomically links a claimed
+    # occurrence to the ordinary queued-run lifecycle.
+
+    def create_schedule(
+        self,
+        *,
+        name: str,
+        trigger_type: str,
+        expression: str,
+        timezone: str,
+        prompt: str,
+        context_profile: str,
+        workspace_id: str,
+        next_run_at: str | None,
+        conversation_policy: str = "new",
+        concurrency_policy: str = "QUEUE",
+        misfire_policy: str = "MISFIRE_RUN_ONCE",
+        misfire_grace_seconds: int = 3600,
+        notification_policy: str = "silent",
+        notification_channel: str | None = None,
+        notification_chat_id: str | None = None,
+        schedule_id: str | None = None,
+    ) -> ScheduleRecord:
+        if trigger_type not in SCHEDULE_TYPES:
+            raise ValueError(f"invalid schedule type: {trigger_type}")
+        if concurrency_policy not in SCHEDULE_CONCURRENCY:
+            raise ValueError(f"invalid concurrency policy: {concurrency_policy}")
+        if misfire_policy not in MISFIRE_POLICIES:
+            raise ValueError(f"invalid misfire policy: {misfire_policy}")
+        if conversation_policy not in {"new", "resume"}:
+            raise ValueError(f"invalid conversation policy: {conversation_policy}")
+        if notification_policy not in {"silent", "actionable"}:
+            raise ValueError(f"invalid notification policy: {notification_policy}")
+        if not name.strip() or not prompt.strip() or not expression.strip():
+            raise ValueError("schedule name, expression, and prompt are required")
+        if misfire_grace_seconds < 0:
+            raise ValueError("misfire grace must not be negative")
+        now = utc_now()
+        record = ScheduleRecord(
+            schedule_id or str(uuid.uuid4()), name.strip(), True, trigger_type,
+            expression.strip(), timezone, prompt.strip(), context_profile,
+            workspace_id, conversation_policy, concurrency_policy, misfire_policy,
+            int(misfire_grace_seconds), notification_policy, notification_channel,
+            notification_chat_id, 1, next_run_at, None, now, now, None,
+        )
+        with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM workspaces WHERE id=?", (workspace_id,)
+            ).fetchone() is None:
+                raise KeyError(f"workspace not found: {workspace_id}")
+            connection.execute(
+                """INSERT INTO schedules(
+                    id, name, enabled, trigger_type, expression, timezone, prompt,
+                    context_profile, workspace_id, conversation_policy,
+                    concurrency_policy, misfire_policy, misfire_grace_seconds,
+                    notification_policy, notification_channel, notification_chat_id,
+                    generation, next_run_at, created_at, updated_at
+                ) VALUES(?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record.id, record.name, record.trigger_type, record.expression,
+                 record.timezone, record.prompt, record.context_profile,
+                 record.workspace_id, record.conversation_policy,
+                 record.concurrency_policy, record.misfire_policy,
+                 record.misfire_grace_seconds, record.notification_policy,
+                 record.notification_channel, record.notification_chat_id,
+                 record.generation,
+                 record.next_run_at, record.created_at, record.updated_at),
+            )
+        return record
+
+    def get_schedule(self, schedule_id: str, *, include_deleted: bool = False) -> ScheduleRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM schedules WHERE id=?" +
+                ("" if include_deleted else " AND deleted_at IS NULL"),
+                (schedule_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"schedule not found: {schedule_id}")
+        return _schedule(row)
+
+    def list_schedules(self, *, include_deleted: bool = False) -> list[ScheduleRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM schedules" +
+                ("" if include_deleted else " WHERE deleted_at IS NULL") +
+                " ORDER BY created_at"
+            ).fetchall()
+        return [_schedule(row) for row in rows]
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> ScheduleRecord:
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE schedules SET enabled=?, updated_at=? "
+                "WHERE id=? AND deleted_at IS NULL",
+                (1 if enabled else 0, now, schedule_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"schedule not found: {schedule_id}")
+        return self.get_schedule(schedule_id)
+
+    def delete_schedule(self, schedule_id: str) -> ScheduleRecord:
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE schedules SET enabled=0, deleted_at=?, updated_at=? "
+                "WHERE id=? AND deleted_at IS NULL",
+                (now, now, schedule_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"schedule not found: {schedule_id}")
+            connection.execute(
+                "UPDATE trigger_occurrences SET state='SKIPPED', decision_reason=? "
+                "WHERE schedule_id=? AND state IN ('PENDING','CLAIMED')",
+                ("schedule deleted", schedule_id),
+            )
+        return self.get_schedule(schedule_id, include_deleted=True)
+
+    def update_schedule_generation(
+        self, schedule_id: str, *, next_run_at: str | None = None,
+        enabled: bool | None = None,
+    ) -> ScheduleRecord:
+        """Create a new recurrence generation; old trigger identities stay auditable."""
+        now = utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM schedules WHERE id=? AND deleted_at IS NULL",
+                (schedule_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"schedule not found: {schedule_id}")
+            connection.execute(
+                "UPDATE trigger_occurrences SET state='SKIPPED', decision_reason=?, "
+                "finished_at=?, updated_at=? WHERE schedule_id=? "
+                "AND state IN ('PENDING','CLAIMED')",
+                ("superseded by schedule generation", now, now, schedule_id),
+            )
+            connection.execute(
+                """UPDATE schedules SET generation=generation+1,
+                   next_run_at=COALESCE(?, next_run_at),
+                   enabled=COALESCE(?, enabled), updated_at=? WHERE id=?""",
+                (next_run_at, None if enabled is None else int(enabled), now, schedule_id),
+            )
+        return self.get_schedule(schedule_id)
+
+    def materialize_triggers(
+        self,
+        schedule_id: str,
+        generation: int,
+        occurrences: Sequence[tuple[str, str, str | None]],
+        *,
+        next_run_at: str | None,
+        last_run_at: str | None,
+    ) -> list[TriggerRecord]:
+        """Insert occurrence decisions and advance the schedule in one transaction."""
+        now = utc_now()
+        inserted: list[str] = []
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT generation FROM schedules WHERE id=? AND deleted_at IS NULL",
+                (schedule_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"schedule not found: {schedule_id}")
+            if int(row["generation"]) != generation:
+                return []
+            for scheduled_for, state, reason in occurrences:
+                if state not in TRIGGER_STATES:
+                    raise ValueError(f"invalid trigger state: {state}")
+                execution_key = f"{schedule_id}:{generation}:{scheduled_for}"
+                trigger_id = str(uuid.uuid5(uuid.NAMESPACE_URL, execution_key))
+                connection.execute(
+                    """INSERT OR IGNORE INTO trigger_occurrences(
+                       id, execution_key, schedule_id, generation, scheduled_for,
+                       state, decision_reason, attempt_count, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                    (trigger_id, execution_key, schedule_id, generation,
+                     scheduled_for, state, reason, now, now),
+                )
+                if connection.execute(
+                    "SELECT changes()"
+                ).fetchone()[0]:
+                    inserted.append(trigger_id)
+            connection.execute(
+                """UPDATE schedules SET next_run_at=?, last_run_at=?, updated_at=?
+                   WHERE id=? AND generation=?""",
+                (next_run_at, last_run_at, now, schedule_id, generation),
+            )
+        return [self.get_trigger(item) for item in inserted]
+
+    def get_trigger(self, trigger_id: str) -> TriggerRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM trigger_occurrences WHERE id=?", (trigger_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"trigger not found: {trigger_id}")
+        return _trigger(row)
+
+    def list_triggers(
+        self, *, schedule_id: str | None = None,
+        states: Sequence[str] | None = None, limit: int = 1000,
+    ) -> list[TriggerRecord]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if schedule_id is not None:
+            clauses.append("schedule_id=?")
+            parameters.append(schedule_id)
+        if states:
+            clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
+            parameters.extend(states)
+        parameters.append(limit)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trigger_occurrences" + where +
+                " ORDER BY scheduled_for, id LIMIT ?", parameters
+            ).fetchall()
+        return [_trigger(row) for row in rows]
+
+    def claim_trigger(
+        self, trigger_id: str, owner: str, *, lease_seconds: int = 60,
+        now: str | None = None,
+    ) -> TriggerRecord | None:
+        claimed_at = now or utc_now()
+        expiry = _add_seconds(claimed_at, lease_seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM trigger_occurrences WHERE id=?", (trigger_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"trigger not found: {trigger_id}")
+            available = row["state"] == "PENDING" or (
+                row["state"] == "CLAIMED" and row["lease_until"] is not None
+                and row["lease_until"] <= claimed_at
+            )
+            if not available:
+                return None
+            connection.execute(
+                """UPDATE trigger_occurrences SET state='CLAIMED', claim_owner=?,
+                   lease_until=?, claimed_at=COALESCE(claimed_at, ?),
+                   attempt_count=attempt_count+1, updated_at=? WHERE id=?""",
+                (owner, expiry, claimed_at, claimed_at, trigger_id),
+            )
+        return self.get_trigger(trigger_id)
+
+    def recover_trigger_leases(self) -> int:
+        """Return pre-dispatch claims to PENDING after a gateway crash."""
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE trigger_occurrences SET state='PENDING', claim_owner=NULL,
+                   lease_until=NULL, updated_at=?
+                   WHERE state='CLAIMED' AND run_id IS NULL
+                     AND lease_until IS NOT NULL AND lease_until<=?""",
+                (now, now),
+            )
+            connection.execute(
+                "UPDATE trigger_occurrences SET notification_state='PENDING', updated_at=? "
+                "WHERE notification_state='PROCESSING' AND notification_decided_at IS NULL",
+                (now,),
+            )
+        return cursor.rowcount
+
+    def decide_trigger(
+        self, trigger_id: str, state: str, reason: str, *,
+        expected: Sequence[str] = ("PENDING",),
+    ) -> bool:
+        if state not in {"SKIPPED", "MISSED", "CANCELLED"}:
+            raise ValueError("decision state must be SKIPPED, MISSED, or CANCELLED")
+        placeholders = ",".join("?" for _ in expected)
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""UPDATE trigger_occurrences SET state=?, decision_reason=?,
+                    finished_at=?, updated_at=? WHERE id=? AND state IN ({placeholders})""",
+                (state, reason, now, now, trigger_id, *expected),
+            )
+        return cursor.rowcount == 1
+
+    def submit_scheduled_run(
+        self, trigger_id: str, owner: str, conversation_id: str,
+        request: Mapping[str, Any], *, backend: str = "agy-container",
+    ) -> RunRecord:
+        """Atomically turn a claimed occurrence into an ordinary queued run."""
+        prompt = str(request.get("prompt", "")).strip()
+        if not prompt:
+            raise ValueError("scheduled prompt must not be empty")
+        now = utc_now()
+        run_id = str(uuid.uuid4())
+        request_data = dict(request)
+        trigger = self.get_trigger(trigger_id)
+        request_data.update({
+            "scheduled_trigger_id": trigger.id,
+            "execution_key": trigger.execution_key,
+        })
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM trigger_occurrences WHERE id=?", (trigger_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"trigger not found: {trigger_id}")
+            if row["state"] != "CLAIMED" or row["claim_owner"] != owner:
+                raise ValueError("trigger is not claimed by this scheduler")
+            existing = connection.execute(
+                "SELECT * FROM runs WHERE id IN (SELECT run_id FROM trigger_occurrences WHERE id=?)",
+                (trigger_id,),
+            ).fetchone()
+            if existing is not None:
+                return _run(existing)
+            message_id = str(uuid.uuid4())
+            connection.execute(
+                """INSERT INTO runs(
+                    id, conversation_id, status, backend, request_json, created_at, version
+                ) VALUES(?, ?, 'queued', ?, ?, ?, 1)""",
+                (run_id, conversation_id, backend,
+                 json.dumps(request_data, ensure_ascii=False, separators=(",", ":")), now),
+            )
+            connection.execute(
+                """INSERT INTO messages(
+                    id, conversation_id, role, content, created_at, source_run_id
+                ) VALUES(?, ?, 'user', ?, ?, ?)""",
+                (message_id, conversation_id, prompt, now, run_id),
+            )
+            connection.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?",
+                (now, conversation_id),
+            )
+            self._append_event_tx(
+                connection, run_id, "run.queued", None,
+                {"status": "queued", "scheduled_trigger_id": trigger_id}, None, None,
+            )
+            connection.execute(
+                """UPDATE trigger_occurrences SET state='DISPATCHED', run_id=?,
+                   dispatched_at=?, lease_until=NULL, updated_at=? WHERE id=?""",
+                (run_id, now, now, trigger_id),
+            )
+        return self.get_run(run_id)
+
+    def sync_trigger_states(self) -> int:
+        changed = 0
+        now = utc_now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT t.id, t.state, r.status FROM trigger_occurrences t
+                   JOIN runs r ON r.id=t.run_id
+                   WHERE t.state IN ('DISPATCHED','RUNNING')"""
+            ).fetchall()
+            for row in rows:
+                mapping = {
+                    "running": "RUNNING", "completed": "COMPLETED",
+                    "failed": "FAILED", "cancelled": "CANCELLED",
+                    "interrupted": "FAILED", "orphaned": "FAILED",
+                }
+                state = mapping.get(str(row["status"]))
+                if state and state != row["state"]:
+                    connection.execute(
+                        "UPDATE trigger_occurrences SET state=?, finished_at=?, updated_at=? "
+                        "WHERE id=? AND state IN ('DISPATCHED','RUNNING')",
+                        (state, now if state in {"COMPLETED", "FAILED", "CANCELLED"} else None,
+                         now, row["id"]),
+                    )
+                    changed += 1
+        return changed
+
+    def count_active_triggers(self, schedule_id: str) -> int:
+        with self._connect() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM trigger_occurrences WHERE schedule_id=? "
+                "AND state IN ('CLAIMED','DISPATCHED','RUNNING')", (schedule_id,)
+            ).fetchone()[0])
+
+    def claim_trigger_notification(self, trigger_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE trigger_occurrences SET notification_state='PROCESSING', "
+                "updated_at=? WHERE id=? AND notification_state='PENDING'",
+                (utc_now(), trigger_id),
+            )
+        return cursor.rowcount == 1
+
+    def finish_trigger_notification(self, trigger_id: str, outbox_id: str | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE trigger_occurrences SET notification_state='DONE', "
+                "notification_outbox_id=?, notification_decided_at=?, updated_at=? WHERE id=?",
+                (outbox_id, utc_now(), utc_now(), trigger_id),
+            )
+
     def recover_interrupted_runs(self) -> int:
         """Legacy safe recovery when no execution backend can reconcile workers."""
         recovered = 0
@@ -1245,6 +1706,43 @@ def _worker(row: sqlite3.Row) -> WorkerRecord:
     )
 
 
+def _schedule(row: sqlite3.Row) -> ScheduleRecord:
+    return ScheduleRecord(
+        id=row["id"], name=row["name"], enabled=bool(row["enabled"]),
+        trigger_type=row["trigger_type"], expression=row["expression"],
+        timezone=row["timezone"], prompt=row["prompt"],
+        context_profile=row["context_profile"], workspace_id=row["workspace_id"],
+        conversation_policy=row["conversation_policy"],
+        concurrency_policy=row["concurrency_policy"],
+        misfire_policy=row["misfire_policy"],
+        misfire_grace_seconds=int(row["misfire_grace_seconds"]),
+        notification_policy=row["notification_policy"],
+        notification_channel=row["notification_channel"],
+        notification_chat_id=row["notification_chat_id"],
+        generation=int(row["generation"]), next_run_at=row["next_run_at"],
+        last_run_at=row["last_run_at"], created_at=row["created_at"],
+        updated_at=row["updated_at"], deleted_at=row["deleted_at"],
+    )
+
+
+def _trigger(row: sqlite3.Row) -> TriggerRecord:
+    return TriggerRecord(
+        id=row["id"], execution_key=row["execution_key"],
+        schedule_id=row["schedule_id"], generation=int(row["generation"]),
+        scheduled_for=row["scheduled_for"], state=row["state"],
+        claim_owner=row["claim_owner"], lease_until=row["lease_until"],
+        run_id=row["run_id"], decision_reason=row["decision_reason"],
+        attempt_count=int(row["attempt_count"]), created_at=row["created_at"],
+        claimed_at=row["claimed_at"], dispatched_at=row["dispatched_at"],
+        finished_at=row["finished_at"], updated_at=row["updated_at"],
+    )
+
+
+def _add_seconds(value: str, seconds: int) -> str:
+    return (datetime.fromisoformat(value).astimezone(UTC) +
+            timedelta(seconds=seconds)).isoformat()
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
@@ -1549,4 +2047,60 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS artifacts_conversation_time
     ON artifacts(conversation_id, created_at);
+"""
+
+_SCHEDULER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    trigger_type TEXT NOT NULL CHECK(trigger_type IN ('one_shot','interval','cron','heartbeat')),
+    expression TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    context_profile TEXT NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    conversation_policy TEXT NOT NULL CHECK(conversation_policy IN ('new','resume')),
+    concurrency_policy TEXT NOT NULL CHECK(concurrency_policy IN ('SKIP','QUEUE','REPLACE')),
+    misfire_policy TEXT NOT NULL CHECK(misfire_policy IN ('MISFIRE_SKIP','MISFIRE_RUN_ONCE','MISFIRE_CATCH_UP')),
+    misfire_grace_seconds INTEGER NOT NULL CHECK(misfire_grace_seconds >= 0),
+    notification_policy TEXT NOT NULL DEFAULT 'silent' CHECK(notification_policy IN ('silent','actionable')),
+    notification_channel TEXT,
+    notification_chat_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 1,
+    next_run_at TEXT,
+    last_run_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS schedules_due ON schedules(enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS trigger_occurrences (
+    id TEXT PRIMARY KEY,
+    execution_key TEXT NOT NULL UNIQUE,
+    schedule_id TEXT NOT NULL REFERENCES schedules(id),
+    generation INTEGER NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN (
+        'PENDING','CLAIMED','DISPATCHED','RUNNING','COMPLETED','SKIPPED',
+        'MISSED','FAILED','CANCELLED'
+    )),
+    claim_owner TEXT,
+    lease_until TEXT,
+    run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE SET NULL,
+    decision_reason TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    claimed_at TEXT,
+    dispatched_at TEXT,
+    finished_at TEXT,
+    notification_state TEXT NOT NULL DEFAULT 'PENDING' CHECK(notification_state IN ('PENDING','PROCESSING','DONE')),
+    notification_decided_at TEXT,
+    notification_outbox_id TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(schedule_id, generation, scheduled_for)
+);
+CREATE INDEX IF NOT EXISTS trigger_due ON trigger_occurrences(state, scheduled_for);
+CREATE INDEX IF NOT EXISTS trigger_schedule ON trigger_occurrences(schedule_id, scheduled_for);
 """

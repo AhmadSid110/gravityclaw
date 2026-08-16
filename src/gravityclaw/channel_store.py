@@ -89,6 +89,31 @@ class ChannelStore:
                 (normalized, workspace_id, now, now),
             )
 
+    def enqueue_scheduled_notification(
+        self, *, channel: str, chat_id: str, text: str, logical_key: str,
+        thread_key: str = "",
+    ) -> str:
+        """Create a normal durable MESSAGE outbox row for proactive output."""
+        if not text.strip():
+            raise ValueError("scheduled notification text must not be empty")
+        now = utc_now()
+        outbox_id = str(uuid.uuid4())
+        with self.store._connect() as connection:
+            connection.execute(
+                """INSERT INTO channel_outbox(
+                    id, channel, logical_key, kind, chat_id, thread_key,
+                    desired_text, status, available_at, created_at, updated_at
+                ) VALUES(?, ?, ?, 'MESSAGE', ?, ?, ?, 'PENDING', ?, ?, ?)
+                ON CONFLICT(channel, logical_key) DO NOTHING""",
+                (outbox_id, channel, logical_key, chat_id, thread_key,
+                 text.strip(), now, now, now),
+            )
+            row = connection.execute(
+                "SELECT id FROM channel_outbox WHERE channel=? AND logical_key=?",
+                (channel, logical_key),
+            ).fetchone()
+        return str(row["id"])
+
     def list_workspace_aliases(self) -> list[dict[str, str]]:
         with self.store._connect() as connection:
             rows = connection.execute(

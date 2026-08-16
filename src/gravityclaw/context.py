@@ -201,6 +201,7 @@ class ContextBuilder:
         summary_version: int = 0,
         task_message_id: str | None = None,
         prior_summary: Mapping[str, object] | None = None,
+        heartbeat_instructions: IdentityDocument | None = None,
     ) -> CompiledContext:
         if profile not in self.profiles:
             raise ValueError(f"unknown context profile: {profile}")
@@ -246,6 +247,16 @@ class ContextBuilder:
                  "content": curated_memory.content.strip()},
                 curated_memory.sha256, str(curated_memory.path),
                 section="Curated long-term memory (DATA)", sort_key=(0,),
+            ))
+
+        if profile == "heartbeat" and heartbeat_instructions is not None:
+            candidates.append(_Candidate(
+                "HEARTBEAT.md", "operational", TRUSTED, 4, 900,
+                {"name": heartbeat_instructions.name,
+                 "sha256": heartbeat_instructions.sha256,
+                 "content": heartbeat_instructions.content.strip()},
+                heartbeat_instructions.sha256, str(heartbeat_instructions.path),
+                section="Heartbeat policy",
             ))
 
         for memory in memories:
@@ -422,6 +433,10 @@ class RunContextCompiler:
             summary_version=summary_version,
             task_message_id=self.store.get_run_message_id(run.id),
             prior_summary=prior_summary,
+            heartbeat_instructions=(
+                self.identity.load(("HEARTBEAT.md",))[0]
+                if profile == "heartbeat" else None
+            ),
         )
 
 
