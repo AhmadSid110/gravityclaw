@@ -20,7 +20,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RUN_STATUSES = (
     "queued",
     "running",
@@ -133,6 +133,7 @@ class Store:
             ).fetchone()
             if row is None:
                 connection.executescript(_SCHEMA)
+                connection.executescript(_CHANNEL_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -161,7 +162,12 @@ class Store:
                         "REFERENCES runs(id) ON DELETE SET NULL"
                     )
                 self._set_schema_version(connection, 3)
+                version = 3
+            if version == 3:
+                connection.executescript(_CHANNEL_SCHEMA)
+                self._set_schema_version(connection, 4)
             connection.executescript(_SCHEMA)
+            connection.executescript(_CHANNEL_SCHEMA)
             self._ensure_message_index(connection)
 
     @staticmethod
@@ -1110,4 +1116,96 @@ CREATE TRIGGER IF NOT EXISTS memories_after_update AFTER UPDATE ON memories BEGI
     INSERT INTO memories_fts(rowid, content, source)
     VALUES (new.rowid, new.content, new.source);
 END;
+"""
+
+_CHANNEL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS channel_cursors (
+    channel TEXT PRIMARY KEY,
+    last_update_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_aliases (
+    alias TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+DROP INDEX IF EXISTS workspace_alias_workspace;
+
+CREATE TABLE IF NOT EXISTS channel_bindings (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_key TEXT NOT NULL DEFAULT '',
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(channel, sender_id, chat_id, thread_key)
+);
+
+CREATE TABLE IF NOT EXISTS channel_inbox (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    provider_update_id INTEGER NOT NULL,
+    sender_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_key TEXT NOT NULL DEFAULT '',
+    provider_message_id TEXT,
+    text TEXT NOT NULL,
+    command TEXT,
+    conversation_id TEXT REFERENCES conversations(id),
+    run_id TEXT REFERENCES runs(id),
+    outbox_id TEXT,
+    result_kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(channel, provider_update_id)
+);
+
+CREATE TABLE IF NOT EXISTS cancellation_requests (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'
+    )),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cancellation_status
+    ON cancellation_requests(status, created_at);
+
+CREATE TABLE IF NOT EXISTS channel_outbox (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    logical_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('MESSAGE', 'PRESENTATION')),
+    run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+    chat_id TEXT NOT NULL,
+    thread_key TEXT NOT NULL DEFAULT '',
+    provider_message_id TEXT,
+    desired_text TEXT NOT NULL,
+    delivered_text TEXT,
+    status TEXT NOT NULL CHECK(status IN (
+        'PENDING', 'SENDING', 'RETRY_WAIT', 'DELIVERED', 'UNCERTAIN', 'FAILED'
+    )),
+    event_sequence INTEGER NOT NULL DEFAULT 0,
+    delivery_version INTEGER NOT NULL DEFAULT 1,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    available_at TEXT NOT NULL,
+    lease_until TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(channel, logical_key)
+);
+CREATE INDEX IF NOT EXISTS channel_outbox_delivery
+    ON channel_outbox(status, available_at);
+CREATE UNIQUE INDEX IF NOT EXISTS channel_outbox_run
+    ON channel_outbox(channel, run_id) WHERE run_id IS NOT NULL;
 """

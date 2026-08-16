@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from .channel_store import ChannelStore
+from .channel_runtime import ChannelRuntime
 from .context import ContextBuilder, RunContextCompiler
 from .event_bus import EventBus
 from .execution import (
@@ -22,6 +24,7 @@ from .identity import IdentityStore
 from .manager import RunManager
 from .memory import MemoryService
 from .store import PersistedEvent, RunRecord, Store, TERMINAL_RUN_STATUSES
+from .telegram import TelegramAdapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +33,10 @@ class Settings:
     mode: str = "agy"
     worker_image: str | None = None
     poll_interval: float = 0.2
+    telegram_token: str | None = field(default=None, repr=False)
+    telegram_user_id: str | None = None
+    telegram_default_workspace: str | None = None
+    telegram_api_root: str = "https://api.telegram.org"
 
     @property
     def database(self) -> Path:
@@ -46,6 +53,14 @@ class Settings:
             mode=os.environ.get("GRAVITYCLAW_MODE", "agy"),
             worker_image=os.environ.get("GRAVITYCLAW_WORKER_IMAGE"),
             poll_interval=float(os.environ.get("GRAVITYCLAW_POLL_INTERVAL", "0.2")),
+            telegram_token=_telegram_token_from_environment(),
+            telegram_user_id=os.environ.get("GRAVITYCLAW_TELEGRAM_USER_ID"),
+            telegram_default_workspace=os.environ.get(
+                "GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE"
+            ),
+            telegram_api_root=os.environ.get(
+                "GRAVITYCLAW_TELEGRAM_API_ROOT", "https://api.telegram.org"
+            ),
         )
 
 
@@ -77,6 +92,11 @@ class MemoryCreate(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
+class WorkspaceAliasCreate(BaseModel):
+    alias: str = Field(min_length=1, max_length=64)
+    workspace_id: str
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings.from_environment()
     configured.home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -87,6 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # initialize before constructing services used by dispatch/retrieval
     store.initialize()
     memory = MemoryService(configured.home, store)
+    channel_store = ChannelStore(store)
     context_compiler = RunContextCompiler(
         store, identity, memory, ContextBuilder()
     )
@@ -110,29 +131,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         poll_interval=configured.poll_interval,
         context_compiler=context_compiler,
     )
+    if bool(configured.telegram_token) != bool(configured.telegram_user_id):
+        raise ValueError(
+            "Telegram requires both GRAVITYCLAW_TELEGRAM_BOT_TOKEN and "
+            "GRAVITYCLAW_TELEGRAM_USER_ID"
+        )
+    channel_runtime: ChannelRuntime | None = None
+    if configured.telegram_token and configured.telegram_user_id:
+        channel_runtime = ChannelRuntime(
+            manager,
+            channel_store,
+            TelegramAdapter(
+                configured.telegram_token, api_root=configured.telegram_api_root
+            ),
+            authorized_sender_id=configured.telegram_user_id,
+            default_workspace_alias=configured.telegram_default_workspace,
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         report = await manager.start()
         app.state.reconciliation = asdict(report)
+        if channel_runtime is not None:
+            await channel_runtime.start()
         try:
             yield
         finally:
+            if channel_runtime is not None:
+                await channel_runtime.close()
             await manager.close()
 
-    app = FastAPI(title="GravityClaw Core", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="GravityClaw Core", version="0.4.0", lifespan=lifespan)
     app.state.settings = configured
     app.state.store = store
     app.state.event_bus = bus
     app.state.manager = manager
     app.state.identity = identity
     app.state.memory = memory
+    app.state.channel_store = channel_store
+    app.state.channel_runtime = channel_runtime
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {
             "status": "ok",
             "mode": configured.mode,
+            "telegram": {"enabled": channel_runtime is not None},
             "reconciliation": app.state.reconciliation,
         }
 
@@ -157,6 +201,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/workspace-aliases", status_code=201)
+    async def set_workspace_alias(body: WorkspaceAliasCreate) -> dict[str, str]:
+        try:
+            channel_store.set_workspace_alias(body.alias, body.workspace_id)
+            return {"alias": body.alias.lower(), "workspace_id": body.workspace_id}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/workspace-aliases")
+    async def list_workspace_aliases() -> list[dict[str, str]]:
+        return channel_store.list_workspace_aliases()
 
     @app.post("/conversations/{conversation_id}/runs", status_code=202)
     async def submit_run(conversation_id: str, body: RunCreate) -> dict[str, Any]:
@@ -277,3 +333,22 @@ def _run_json(run: RunRecord) -> dict[str, Any]:
 
 def _event_json(event: PersistedEvent) -> dict[str, Any]:
     return asdict(event)
+
+
+def _telegram_token_from_environment() -> str | None:
+    direct = os.environ.get("GRAVITYCLAW_TELEGRAM_BOT_TOKEN")
+    secret_file = os.environ.get("GRAVITYCLAW_TELEGRAM_BOT_TOKEN_FILE")
+    if direct and secret_file:
+        raise ValueError(
+            "set only one of GRAVITYCLAW_TELEGRAM_BOT_TOKEN or "
+            "GRAVITYCLAW_TELEGRAM_BOT_TOKEN_FILE"
+        )
+    if not secret_file:
+        return direct
+    data = Path(secret_file).read_bytes()
+    if len(data) > 4096:
+        raise ValueError("Telegram token file is unexpectedly large")
+    token = data.decode("utf-8").strip()
+    if not token:
+        raise ValueError("Telegram token file is empty")
+    return token

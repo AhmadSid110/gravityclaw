@@ -13,7 +13,10 @@ gate. Milestone 3 adds GravityClaw-owned identity, explicit episodic memory,
 SQLite FTS retrieval, bounded context compilation, and durable channel history.
 See the [spike report](spikes/001-authenticated-agy/README.md),
 [Milestone 2 report](docs/milestone-2.md), and
-[Milestone 3 report](docs/milestone-3.md).
+[Milestone 3 report](docs/milestone-3.md). Milestone 4 adds the durable channel
+layer and Telegram adapter; its deterministic forced-crash gate passes, with a
+live Telegram-account check still required. See the
+[Milestone 4 report](docs/milestone-4.md).
 
 ## Core server
 
@@ -59,6 +62,13 @@ does not enable allow-all or invoke tools:
 .venv/bin/python acceptance/m3_live_context.py
 ```
 
+The deterministic Milestone 4 Telegram crash gate uses a local Bot API
+simulator and does not require a real bot token:
+
+```bash
+.venv/bin/python acceptance/m4_channel_crash.py --skip-build
+```
+
 ## Identity and memory
 
 On first start GravityClaw creates human-editable files under
@@ -72,6 +82,29 @@ cannot overwrite identity or curated memory files. Retrieval uses SQLite FTS5.
 Context is compiled immediately before dispatch, persisted with a provenance
 manifest, and bounded by deterministic character budgets. A resumed AGY
 conversation does not receive duplicated channel history.
+
+## Telegram channel
+
+Approve workspaces through server-side aliases; Telegram never accepts paths:
+
+```bash
+curl -X POST http://127.0.0.1:8787/workspace-aliases \
+  -H 'content-type: application/json' \
+  -d '{"alias":"gravityclaw","workspace_id":"<workspace-id>"}'
+```
+
+Configure the single-user adapter:
+
+```text
+GRAVITYCLAW_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/gravityclaw-telegram-token
+GRAVITYCLAW_TELEGRAM_USER_ID=<numeric-user-id>
+GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE=gravityclaw
+```
+
+`GRAVITYCLAW_TELEGRAM_BOT_TOKEN` is also supported, but the secret-file form is
+preferred. Commands are `/new`, `/status`, `/stop`, and `/workspace <alias>`.
+The polling cursor, inbox dedupe, cancellation requests, presentation state,
+provider message IDs, retries, and delivery acknowledgements are all durable.
 
 ## Security status
 

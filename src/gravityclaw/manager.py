@@ -84,6 +84,14 @@ class RunManager:
         self._schedule_dispatch(conversation_id)
         return self.store.get_run(run.id)
 
+    async def activate(self, run_id: str) -> RunRecord:
+        """Wake a run atomically ingested by another durable frontend."""
+        run = self.store.get_run(run_id)
+        await self.event_bus.notify(run.id)
+        if run.status == "queued":
+            self._schedule_dispatch(run.conversation_id)
+        return run
+
     async def cancel(self, run_id: str) -> RunRecord:
         run = self.store.get_run(run_id)
         if run.status == "queued":

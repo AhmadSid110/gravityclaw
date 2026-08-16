@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -43,6 +44,41 @@ class MilestoneThreeApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(results.status_code, 200)
         self.assertEqual(results.json()[0]["id"], created.json()["id"])
+
+
+class TelegramSettingsTests(unittest.TestCase):
+    def test_token_file_is_loaded_without_appearing_in_settings_repr(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gravityclaw-token-") as temporary:
+            token_file = Path(temporary) / "telegram-token"
+            token_file.write_text("123456789:test-secret\n", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {
+                    "GRAVITYCLAW_HOME": temporary,
+                    "GRAVITYCLAW_TELEGRAM_BOT_TOKEN_FILE": str(token_file),
+                    "GRAVITYCLAW_TELEGRAM_USER_ID": "42",
+                },
+                clear=True,
+            ):
+                settings = Settings.from_environment()
+
+        self.assertEqual(settings.telegram_token, "123456789:test-secret")
+        self.assertNotIn("test-secret", repr(settings))
+
+    def test_direct_token_and_token_file_are_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="gravityclaw-token-") as temporary:
+            token_file = Path(temporary) / "telegram-token"
+            token_file.write_text("file-token", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {
+                    "GRAVITYCLAW_TELEGRAM_BOT_TOKEN": "direct-token",
+                    "GRAVITYCLAW_TELEGRAM_BOT_TOKEN_FILE": str(token_file),
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "set only one"):
+                    Settings.from_environment()
 
 
 if __name__ == "__main__":
