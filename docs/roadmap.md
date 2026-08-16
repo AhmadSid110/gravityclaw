@@ -15,7 +15,8 @@
 - M8B.6 — Automations and Capabilities: checkpointed
 - M8B.7 — UI polish and accessibility: verified
 - M8B.8 — Full browser/reconnect/performance gate: verified
-- M9 — Hardening and packaging: planned
+- M9 — Security and operational hardening: verified
+- M10 — Packaging and deployment: planned
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,
 and crash-safety gates passed. M6 can now add proactive execution without

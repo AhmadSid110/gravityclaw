@@ -28,6 +28,8 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_control_plane_requires_bearer_token_but_health_is_public(self) -> None:
         self.assertEqual((await self.client.get("/health")).status_code, 200)
+        self.assertEqual((await self.client.get("/docs")).status_code, 401)
+        self.assertEqual((await self.client.get("/docs", headers=self.headers)).status_code, 200)
         denied = await self.client.get("/api/v1/control/home")
         self.assertEqual(denied.status_code, 401)
         self.assertEqual(

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -90,6 +92,12 @@ class PodmanExecutionBackend:
             "--read-only",
             "--cap-drop=all",
             "--security-opt=no-new-privileges",
+            "--ipc=private",
+            "--uts=private",
+            "--log-opt",
+            "max-size=10mb",
+            "--log-opt",
+            "max-file=3",
             "--pids-limit",
             str(spec.pids_limit),
             "--memory",
@@ -114,11 +122,32 @@ class PodmanExecutionBackend:
             )
         for source, target, mode in spec.mounts:
             command.extend(["--volume", f"{source.resolve()}:{target}:{mode},rprivate"])
-        for key, value in sorted(spec.environment.items()):
-            command.extend(["--env", f"{key}={value}"])
+        environment_file: Path | None = None
+        if spec.environment:
+            descriptor, filename = tempfile.mkstemp(prefix="gravityclaw-env-")
+            environment_file = Path(filename)
+            os.chmod(environment_file, 0o600)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    for key, value in sorted(spec.environment.items()):
+                        if not key or any(char in key for char in "=\x00\r\n"):
+                            raise ValueError("invalid container environment key")
+                        if any(char in value for char in "\x00\r\n"):
+                            raise ValueError("container environment values may not contain newlines")
+                        handle.write(f"{key}={value}\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                command.extend(["--env-file", str(environment_file)])
+            except Exception:
+                environment_file.unlink(missing_ok=True)
+                raise
         command.append(spec.image)
         command.extend(spec.command)
-        output = await self._run(command)
+        try:
+            output = await self._run(command)
+        finally:
+            if environment_file is not None:
+                environment_file.unlink(missing_ok=True)
         external_id = output.strip()
         snapshot = await self.inspect(external_id)
         if snapshot is None:
@@ -138,7 +167,15 @@ class PodmanExecutionBackend:
         return _snapshot(values[0])
 
     async def logs(self, external_id: str) -> list[WorkerEnvelope]:
-        output = await self._run([self.binary, "logs", external_id])
+        try:
+            output = await self._run([self.binary, "logs", external_id])
+        except RuntimeError as exc:
+            # The worker can disappear between monitor inspection and log
+            # ingestion. Let the monitor's following inspect call classify it
+            # as interrupted instead of turning a normal race into a stuck run.
+            if "no container with name or ID" in str(exc):
+                return []
+            raise
         envelopes: list[WorkerEnvelope] = []
         for raw_line in output.splitlines():
             try:

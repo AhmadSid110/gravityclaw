@@ -302,9 +302,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def control_auth(request: Request, call_next: Any) -> Any:
-        public = request.url.path in {
-            "/health", "/docs", "/openapi.json", "/redoc", "/auth/session"
-        }
+        public = request.url.path in {"/health", "/auth/session"}
         if configured.control_token is not None and not public:
             provided = _bearer_token(request.headers.get("authorization"))
             session = request.cookies.get("gravityclaw_session")
@@ -1177,7 +1175,7 @@ def _telegram_token_from_environment() -> str | None:
         )
     if not secret_file:
         return direct
-    data = Path(secret_file).read_bytes()
+    data = _read_secret_file(secret_file, "Telegram token")
     if len(data) > 4096:
         raise ValueError("Telegram token file is unexpectedly large")
     token = data.decode("utf-8").strip()
@@ -1250,10 +1248,23 @@ def _control_token_from_environment() -> str | None:
         )
     if not secret_file:
         return direct
-    data = Path(secret_file).read_bytes()
+    data = _read_secret_file(secret_file, "control token")
     if len(data) > 4096:
         raise ValueError("control token file is unexpectedly large")
     token = data.decode("utf-8").strip()
     if not token:
         raise ValueError("control token file is empty")
     return token
+
+
+def _read_secret_file(filename: str, label: str) -> bytes:
+    path = Path(filename)
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} file does not exist") from exc
+    if mode & 0o077:
+        raise ValueError(f"{label} file must not be group/world accessible")
+    if not path.is_file():
+        raise ValueError(f"{label} path is not a regular file")
+    return path.read_bytes()

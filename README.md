@@ -50,6 +50,8 @@ streaming-oriented render safeguards. See [the M8B.7 report](docs/milestone-8b7.
 M8B.8 completes the browser torture, reconnect, crash-recovery, redaction, and
 10k-event performance gate. Timeline history is cursor-paginated so large runs
 remain navigable without flooding the DOM. See [the M8B.8 report](docs/milestone-8b8.md).
+M9 hardens worker boundaries, secret lifecycles, authenticated operational
+surfaces, and backup/restore. See [the M9 report](docs/milestone-9.md).
 
 ## Core server
 

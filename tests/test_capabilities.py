@@ -20,7 +20,9 @@ class CapabilityTests(unittest.TestCase):
         self.workspace_b = self.store.create_workspace("b", self.root / "b")
         self.secret_dir = self.root / "secrets"
         self.secret_dir.mkdir(mode=0o700)
-        (self.secret_dir / "github-token").write_text("super-secret-value\n", encoding="utf-8")
+        secret = self.secret_dir / "github-token"
+        secret.write_text("super-secret-value\n", encoding="utf-8")
+        secret.chmod(0o600)
         self.capabilities = CapabilityManager(self.root, self.store, secret_dir=self.secret_dir)
 
     def tearDown(self) -> None:
@@ -64,6 +66,12 @@ class CapabilityTests(unittest.TestCase):
                 server_id="bad", name="bad", transport="stdio", command="echo",
                 env_refs={"TOKEN": "super-secret-value"},
             )
+
+    def test_secret_file_permissions_are_enforced(self) -> None:
+        secret = self.secret_dir / "github-token"
+        secret.chmod(0o644)
+        with self.assertRaises(CapabilityError):
+            self.capabilities.resolve_secret("secret:github-token")
 
     def test_run_manifest_is_immutable_and_worker_gets_only_selected_material(self) -> None:
         skill_path = self._skill(self.workspace_a.path, "python", "# Python skill\n")

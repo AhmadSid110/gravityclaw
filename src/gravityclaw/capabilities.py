@@ -373,6 +373,8 @@ class CapabilityManager:
             if path.parent != self.secret_dir.resolve():
                 raise CapabilityError("secret path escaped secret directory")
             if path.is_file():
+                if path.stat().st_mode & 0o077:
+                    raise CapabilityError("secret file must not be group/world accessible")
                 return path.read_text(encoding="utf-8").strip()
         raise CapabilityError(f"secret is not available: {reference}")
 

@@ -17,6 +17,7 @@ dependencies = [
 [project.scripts]
 gravityclaw-agy-probe = "gravityclaw.probe:main"
 gravityclaw-server = "gravityclaw.server:main"
+gravityclaw-ops = "gravityclaw.ops:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gravityclaw"]

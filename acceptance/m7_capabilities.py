@@ -54,7 +54,9 @@ async def gate(root: Path) -> dict[str, int | bool]:
     workspace_b = store.create_workspace("b", root / "b")
     secret_dir = root / "secrets"
     secret_dir.mkdir(mode=0o700)
-    (secret_dir / "github-token").write_text("m7-secret-must-not-persist\n", encoding="utf-8")
+    secret_file = secret_dir / "github-token"
+    secret_file.write_text("m7-secret-must-not-persist\n", encoding="utf-8")
+    secret_file.chmod(0o600)
     skill = workspace_a.path / ".agents" / "skills" / "coding"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text("# Coding\nUse the approved coding workflow.\n", encoding="utf-8")

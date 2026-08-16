@@ -121,6 +121,7 @@ class TelegramSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="gravityclaw-token-") as temporary:
             token_file = Path(temporary) / "telegram-token"
             token_file.write_text("123456789:test-secret\n", encoding="utf-8")
+            token_file.chmod(0o600)
             with patch.dict(
                 "os.environ",
                 {
@@ -139,6 +140,7 @@ class TelegramSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="gravityclaw-token-") as temporary:
             token_file = Path(temporary) / "telegram-token"
             token_file.write_text("file-token", encoding="utf-8")
+            token_file.chmod(0o600)
             with patch.dict(
                 "os.environ",
                 {
