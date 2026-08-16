@@ -158,6 +158,18 @@ class ScheduleCreate(BaseModel):
     notification_chat_id: str | None = None
 
 
+class ScheduleUpdate(ScheduleCreate):
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class RunNowRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=200)
+
+
+class CapabilityMutation(BaseModel):
+    expected_updated_at: str | None = None
+
+
 class SkillCreate(BaseModel):
     id: str = Field(min_length=1, max_length=200)
     name: str = Field(min_length=1, max_length=200)
@@ -465,7 +477,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/capabilities/mcp", status_code=201)
     async def register_mcp(body: MCPCreate, request: Request) -> dict[str, Any]:
         try:
-            server = capabilities.register_mcp(**body.model_dump())
+            values = body.model_dump()
+            values["server_id"] = values.pop("id")
+            server = capabilities.register_mcp(**values)
             store.record_audit(actor=request.state.actor, action="mcp.register",
                                resource_type="mcp", resource_id=body.id,
                                payload={"name": body.name, "transport": body.transport,
@@ -809,6 +823,168 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/workspaces")
     async def control_workspaces() -> list[dict[str, Any]]:
         return [{**asdict(item), "path": str(item.path)} for item in store.list_workspaces()]
+
+    def automation_json(schedule: Any, *, triggers: list[Any] | None = None) -> dict[str, Any]:
+        value = asdict(schedule)
+        if triggers is not None:
+            value["triggers"] = [asdict(item) for item in triggers]
+        return value
+
+    @app.get("/api/v1/automations")
+    async def control_automations(include_deleted: bool = False) -> list[dict[str, Any]]:
+        return [
+            automation_json(item, triggers=store.list_triggers(schedule_id=item.id, limit=20))
+            for item in store.list_schedules(include_deleted=include_deleted)
+        ]
+
+    @app.get("/api/v1/automations/{schedule_id}")
+    async def control_automation(schedule_id: str) -> dict[str, Any]:
+        try:
+            schedule = store.get_schedule(schedule_id, include_deleted=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return automation_json(schedule, triggers=store.list_triggers(schedule_id=schedule_id, limit=1000))
+
+    @app.post("/api/v1/automations", status_code=201)
+    async def control_create_automation(body: ScheduleCreate, request: Request) -> dict[str, Any]:
+        values = body.model_dump()
+        if values.get("context_profile") is None:
+            values["context_profile"] = "heartbeat" if body.trigger_type == "heartbeat" else "scheduled"
+        try:
+            schedule = scheduler.create_schedule(**values)
+            store.record_audit(
+                actor=request.state.actor, action="automation.create",
+                resource_type="schedule", resource_id=schedule.id,
+                resulting_version=schedule.version,
+                payload={"name": schedule.name, "trigger_type": schedule.trigger_type},
+            )
+            return automation_json(schedule, triggers=[])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.put("/api/v1/automations/{schedule_id}")
+    async def control_update_automation(schedule_id: str, body: ScheduleUpdate, request: Request) -> dict[str, Any]:
+        values = body.model_dump(exclude={"expected_version"})
+        if values.get("context_profile") is None:
+            values["context_profile"] = "heartbeat" if body.trigger_type == "heartbeat" else "scheduled"
+        try:
+            schedule = scheduler.update_schedule(
+                schedule_id, expected_version=body.expected_version, **values
+            )
+            store.record_audit(
+                actor=request.state.actor, action="automation.update",
+                resource_type="schedule", resource_id=schedule.id,
+                expected_version=body.expected_version, resulting_version=schedule.version,
+            )
+            return automation_json(schedule, triggers=store.list_triggers(schedule_id=schedule.id, limit=20))
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/automations/{schedule_id}/enable")
+    async def control_enable_automation(schedule_id: str, request: Request, body: VersionedMutation = VersionedMutation()) -> dict[str, Any]:
+        try:
+            schedule = store.set_schedule_enabled(schedule_id, True, expected_version=body.expected_version)
+            store.record_audit(actor=request.state.actor, action="automation.enable", resource_type="schedule", resource_id=schedule_id, expected_version=body.expected_version, resulting_version=schedule.version)
+            return automation_json(schedule)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/automations/{schedule_id}/disable")
+    async def control_disable_automation(schedule_id: str, request: Request, body: VersionedMutation = VersionedMutation()) -> dict[str, Any]:
+        try:
+            schedule = store.set_schedule_enabled(schedule_id, False, expected_version=body.expected_version)
+            store.record_audit(actor=request.state.actor, action="automation.disable", resource_type="schedule", resource_id=schedule_id, expected_version=body.expected_version, resulting_version=schedule.version)
+            return automation_json(schedule)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/automations/{schedule_id}/run-now", status_code=202)
+    async def control_run_automation_now(schedule_id: str, body: RunNowRequest, request: Request) -> dict[str, Any]:
+        try:
+            trigger, run = await scheduler.run_now(schedule_id, body.request_id)
+            store.record_audit(actor=request.state.actor, action="automation.run_now", resource_type="schedule", resource_id=schedule_id, payload={"request_id": body.request_id, "trigger_id": trigger.id, "run_id": run.id if run else None})
+            return {"trigger": asdict(trigger), "run": _run_json(run) if run else None}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/capabilities")
+    async def control_capabilities(workspace_id: str | None = None, profile: str = "coding") -> dict[str, Any]:
+        workspaces = store.list_workspaces()
+        selected = store.get_workspace(workspace_id) if workspace_id else (workspaces[0] if workspaces else None)
+        if selected is None:
+            return {"workspace": None, "skills": [], "mcp": [], "bindings": [], "snapshots": []}
+        skills = capabilities.list_skills(selected.id)
+        mcps = capabilities.list_mcp(selected.id)
+        return {
+            "workspace": {**asdict(selected), "path": str(selected.path)},
+            "profile": profile,
+            "isolation": {
+                "worker": "container-backed", "workspace_rw": str(selected.path),
+                "host_home": "inaccessible", "other_workspaces": "inaccessible",
+                "network": "restricted by worker policy", "permission_profile": "allow-all inside worker",
+            },
+            "skills": [_skill_json(item) for item in skills],
+            "mcp": [_mcp_json(item) for item in mcps],
+            "bindings": capabilities.list_bindings(selected.id),
+            "snapshots": store.list_capability_manifests(selected.id, limit=50),
+        }
+
+    @app.post("/api/v1/capabilities/skills/{skill_id}/enable")
+    async def control_enable_skill(skill_id: str, request: Request, body: CapabilityMutation = CapabilityMutation()) -> dict[str, Any]:
+        try:
+            item = capabilities.set_skill_enabled(skill_id, True, expected_updated_at=body.expected_updated_at)
+            store.record_audit(actor=request.state.actor, action="skill.enable", resource_type="skill", resource_id=skill_id)
+            return _skill_json(item)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/capabilities/skills/{skill_id}/disable")
+    async def control_disable_skill(skill_id: str, request: Request, body: CapabilityMutation = CapabilityMutation()) -> dict[str, Any]:
+        try:
+            item = capabilities.set_skill_enabled(skill_id, False, expected_updated_at=body.expected_updated_at)
+            store.record_audit(actor=request.state.actor, action="skill.disable", resource_type="skill", resource_id=skill_id)
+            return _skill_json(item)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/capabilities/mcp/{server_id}/enable")
+    async def control_enable_mcp(server_id: str, request: Request, body: CapabilityMutation = CapabilityMutation()) -> dict[str, Any]:
+        try:
+            item = capabilities.set_mcp_enabled(server_id, True, expected_updated_at=body.expected_updated_at)
+            return _mcp_json(item)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/capabilities/mcp/{server_id}/disable")
+    async def control_disable_mcp(server_id: str, request: Request, body: CapabilityMutation = CapabilityMutation()) -> dict[str, Any]:
+        try:
+            item = capabilities.set_mcp_enabled(server_id, False, expected_updated_at=body.expected_updated_at)
+            return _mcp_json(item)
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/capabilities/mcp/{server_id}/health")
+    async def control_health_mcp(server_id: str, request: Request) -> dict[str, Any]:
+        try:
+            item = capabilities.health_check(server_id)
+            store.record_audit(actor=request.state.actor, action="mcp.health_check", resource_type="mcp", resource_id=server_id, payload={"health_state": item.health_state})
+            return _mcp_json(item)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/v1/conversations")
     async def control_conversations(

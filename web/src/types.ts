@@ -199,3 +199,103 @@ export interface ContextPreview {
   preview: boolean;
   prompt_characters: number;
 }
+
+export type TriggerState = "PENDING" | "CLAIMED" | "DISPATCHED" | "RUNNING" | "COMPLETED" | "SKIPPED" | "MISSED" | "FAILED" | "CANCELLED";
+
+export interface TriggerRecord {
+  id: string;
+  execution_key: string;
+  schedule_id: string;
+  generation: number;
+  scheduled_for: string;
+  state: TriggerState;
+  run_id: string | null;
+  decision_reason: string | null;
+  attempt_count: number;
+  created_at: string;
+  claimed_at: string | null;
+  dispatched_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+}
+
+export interface ScheduleRecord {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger_type: "one_shot" | "interval" | "cron" | "heartbeat";
+  expression: string;
+  timezone: string;
+  prompt: string;
+  context_profile: string;
+  workspace_id: string;
+  conversation_policy: "new" | "resume";
+  concurrency_policy: "SKIP" | "QUEUE" | "REPLACE";
+  misfire_policy: "MISFIRE_SKIP" | "MISFIRE_RUN_ONCE" | "MISFIRE_CATCH_UP";
+  misfire_grace_seconds: number;
+  notification_policy: "silent" | "actionable";
+  notification_channel: string | null;
+  notification_chat_id: string | null;
+  generation: number;
+  version: number;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  triggers?: TriggerRecord[];
+}
+
+export interface SkillRecord {
+  id: string;
+  name: string;
+  path: string;
+  scope: "global" | "workspace";
+  workspace_id: string | null;
+  enabled: boolean;
+  profiles: string[];
+  sha256: string;
+  version: string;
+  validation_state: string;
+  validation_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MCPRecord {
+  id: string;
+  name: string;
+  transport: string;
+  command: string | null;
+  url: string | null;
+  args: string[];
+  env_refs: Record<string, string>;
+  enabled: boolean;
+  scope: "global" | "workspace";
+  workspace_id: string | null;
+  config_hash: string;
+  health_state: "UNKNOWN" | "HEALTHY" | "DEGRADED" | "UNAVAILABLE" | "MISCONFIGURED";
+  health_error: string | null;
+  last_checked_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapabilitySnapshotRecord {
+  run_id: string;
+  workspace_id: string;
+  profile: string;
+  manifest: Record<string, unknown>;
+  manifest_hash: string;
+  created_at: string;
+}
+
+export interface CapabilityState {
+  workspace: { id: string; name: string; path: string } | null;
+  profile: string;
+  isolation: Record<string, string>;
+  skills: SkillRecord[];
+  mcp: MCPRecord[];
+  bindings: Array<Record<string, unknown>>;
+  snapshots: CapabilitySnapshotRecord[];
+}

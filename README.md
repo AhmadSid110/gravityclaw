@@ -41,6 +41,9 @@ activity, lazy artifacts, immutable manifests, and redacted raw events. See
 M8B.5 adds Context + Memory Studio with versioned identity editing, journal and
 FTS memory views, run provenance, immutable context inspection, and read-only
 context simulation. See [the M8B.5 report](docs/milestone-8b5.md).
+M8B.6 adds durable Automations and workspace-scoped Capabilities studios with
+idempotent run-now triggers, occurrence history, health, isolation, and immutable
+run snapshots. See [the M8B.6 report](docs/milestone-8b6.md).
 
 ## Core server
 

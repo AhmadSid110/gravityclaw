@@ -1,4 +1,4 @@
-import type { Artifact, ContextPreview, Conversation, ConversationDetail, ControlSnapshot, ContextManifest, IdentityDocument, JournalRecord, MemoryRecord, MemoryUsage, PersistedEvent, RunRecord } from "./types";
+import type { Artifact, CapabilityState, ContextPreview, Conversation, ConversationDetail, ControlSnapshot, ContextManifest, IdentityDocument, JournalRecord, MemoryRecord, MemoryUsage, PersistedEvent, RunRecord, ScheduleRecord } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -141,6 +141,44 @@ export async function previewContext(task: string, profile: string, conversation
 
 export async function getRunContextManifest(runId: string): Promise<ContextManifest> {
   return request(`/api/v1/runs/${encodeURIComponent(runId)}/context`);
+}
+
+export async function getAutomations(): Promise<ScheduleRecord[]> {
+  return request("/api/v1/automations");
+}
+
+export async function getAutomation(id: string): Promise<ScheduleRecord> {
+  return request(`/api/v1/automations/${encodeURIComponent(id)}`);
+}
+
+export async function createAutomation(value: Omit<ScheduleRecord, "id" | "enabled" | "generation" | "version" | "next_run_at" | "last_run_at" | "created_at" | "updated_at" | "deleted_at" | "triggers"> & { start_at?: string | null }): Promise<ScheduleRecord> {
+  return request("/api/v1/automations", { method: "POST", headers: jsonHeaders, body: JSON.stringify(value) });
+}
+
+export async function updateAutomation(value: ScheduleRecord): Promise<ScheduleRecord> {
+  return request(`/api/v1/automations/${encodeURIComponent(value.id)}`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ ...value, expected_version: value.version }) });
+}
+
+export async function setAutomationEnabled(value: ScheduleRecord, enabled: boolean): Promise<ScheduleRecord> {
+  return request(`/api/v1/automations/${encodeURIComponent(value.id)}/${enabled ? "enable" : "disable"}`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ expected_version: value.version }) });
+}
+
+export async function runAutomationNow(id: string, requestId: string): Promise<{ trigger: Record<string, unknown>; run: RunRecord | null }> {
+  return request(`/api/v1/automations/${encodeURIComponent(id)}/run-now`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ request_id: requestId }) });
+}
+
+export async function getCapabilities(workspaceId?: string, profile = "coding"): Promise<CapabilityState> {
+  const query = new URLSearchParams({ profile });
+  if (workspaceId) query.set("workspace_id", workspaceId);
+  return request(`/api/v1/capabilities?${query.toString()}`);
+}
+
+export async function setCapabilityEnabled(type: "skills" | "mcp", id: string, enabled: boolean, expectedUpdatedAt: string): Promise<unknown> {
+  return request(`/api/v1/capabilities/${type}/${encodeURIComponent(id)}/${enabled ? "enable" : "disable"}`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ expected_updated_at: expectedUpdatedAt }) });
+}
+
+export async function checkMcpHealth(id: string): Promise<unknown> {
+  return request(`/api/v1/capabilities/mcp/${encodeURIComponent(id)}/health`, { method: "POST", headers: jsonHeaders, body: "{}" });
 }
 
 export function controlSocketUrl(cursor: number): string {

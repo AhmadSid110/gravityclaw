@@ -13,7 +13,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 from .execution import ContainerSpec
-from .store import Conversation, RunRecord, Store, Workspace, utc_now
+from .store import Conversation, RunRecord, Store, VersionConflict, Workspace, utc_now
 
 
 HEALTH_STATES = ("UNKNOWN", "HEALTHY", "DEGRADED", "UNAVAILABLE", "MISCONFIGURED")
@@ -143,13 +143,19 @@ class CapabilityManager:
         records = [_skill(row) for row in rows]
         return [item for item in records if workspace_id is None or item.workspace_id in {None, workspace_id}]
 
-    def set_skill_enabled(self, skill_id: str, enabled: bool) -> SkillRecord:
+    def set_skill_enabled(self, skill_id: str, enabled: bool, *, expected_updated_at: str | None = None) -> SkillRecord:
         with self.store._connect() as connection:
+            predicate = "id=?"
+            parameters: list[Any] = [int(enabled), utc_now(), skill_id]
+            if expected_updated_at is not None:
+                predicate += " AND updated_at=?"
+                parameters.append(expected_updated_at)
             cursor = connection.execute(
-                "UPDATE skills SET enabled=?, updated_at=? WHERE id=?",
-                (int(enabled), utc_now(), skill_id),
+                f"UPDATE skills SET enabled=?, updated_at=? WHERE {predicate}", parameters,
             )
         if cursor.rowcount != 1:
+            if expected_updated_at is not None:
+                raise VersionConflict(f"skill {skill_id} changed since it was loaded")
             raise KeyError(f"skill not found: {skill_id}")
         return self.get_skill(skill_id)
 
@@ -214,15 +220,30 @@ class CapabilityManager:
         records = [_mcp(row) for row in rows]
         return [item for item in records if workspace_id is None or item.workspace_id in {None, workspace_id}]
 
-    def set_mcp_enabled(self, server_id: str, enabled: bool) -> MCPRecord:
+    def set_mcp_enabled(self, server_id: str, enabled: bool, *, expected_updated_at: str | None = None) -> MCPRecord:
         with self.store._connect() as connection:
+            predicate = "id=?"
+            parameters: list[Any] = [int(enabled), utc_now(), server_id]
+            if expected_updated_at is not None:
+                predicate += " AND updated_at=?"
+                parameters.append(expected_updated_at)
             cursor = connection.execute(
-                "UPDATE mcp_servers SET enabled=?, updated_at=? WHERE id=?",
-                (int(enabled), utc_now(), server_id),
+                f"UPDATE mcp_servers SET enabled=?, updated_at=? WHERE {predicate}", parameters,
             )
         if cursor.rowcount != 1:
+            if expected_updated_at is not None:
+                raise VersionConflict(f"MCP server {server_id} changed since it was loaded")
             raise KeyError(f"MCP server not found: {server_id}")
         return self.get_mcp(server_id)
+
+    def list_bindings(self, workspace_id: str) -> list[dict[str, Any]]:
+        with self.store._connect() as connection:
+            rows = connection.execute(
+                "SELECT workspace_id, capability_type, capability_id, profile, enabled, "
+                "created_at, updated_at FROM capability_bindings WHERE workspace_id=? "
+                "ORDER BY capability_type, capability_id, profile", (workspace_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def bind(self, *, workspace_id: str, capability_type: str,
              capability_id: str, profile: str = "*") -> None:

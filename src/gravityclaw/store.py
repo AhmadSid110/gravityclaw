@@ -790,6 +790,24 @@ class Store:
             return value
         return json.loads(row["manifest_json"])
 
+    def list_capability_manifests(
+        self, workspace_id: str, *, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, workspace_id, profile, manifest_json, manifest_hash, "
+                "snapshot_path, created_at FROM capability_manifests "
+                "WHERE workspace_id=? ORDER BY created_at DESC LIMIT ?",
+                (workspace_id, limit),
+            ).fetchall()
+        return [
+            {"run_id": row["run_id"], "workspace_id": row["workspace_id"],
+             "profile": row["profile"], "manifest": json.loads(row["manifest_json"]),
+             "manifest_hash": row["manifest_hash"], "snapshot_path": row["snapshot_path"],
+             "created_at": row["created_at"]}
+            for row in rows
+        ]
+
     def next_queued_runs(self) -> list[RunRecord]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1224,6 +1242,52 @@ class Store:
                 raise KeyError(f"schedule not found: {schedule_id}")
         return self.get_schedule(schedule_id)
 
+    def update_schedule(
+        self, schedule_id: str, *, name: str, trigger_type: str,
+        expression: str, timezone: str, prompt: str, context_profile: str,
+        workspace_id: str, conversation_policy: str, concurrency_policy: str,
+        misfire_policy: str, misfire_grace_seconds: int,
+        notification_policy: str, notification_channel: str | None,
+        notification_chat_id: str | None, next_run_at: str | None,
+        expected_version: int | None = None,
+    ) -> ScheduleRecord:
+        """Publish a complete schedule generation with optimistic concurrency."""
+        now = utc_now()
+        with self._connect() as connection:
+            if connection.execute("SELECT 1 FROM workspaces WHERE id=?", (workspace_id,)).fetchone() is None:
+                raise KeyError(f"workspace not found: {workspace_id}")
+            current = connection.execute(
+                "SELECT * FROM schedules WHERE id=? AND deleted_at IS NULL", (schedule_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"schedule not found: {schedule_id}")
+            predicates = "id=? AND deleted_at IS NULL"
+            parameters: list[Any] = [
+                name.strip(), trigger_type, expression.strip(), timezone, prompt.strip(),
+                context_profile, workspace_id, conversation_policy, concurrency_policy,
+                misfire_policy, int(misfire_grace_seconds), notification_policy,
+                notification_channel, notification_chat_id, next_run_at, now, schedule_id,
+            ]
+            if expected_version is not None:
+                predicates += " AND version=?"
+                parameters.append(expected_version)
+            connection.execute(
+                "UPDATE trigger_occurrences SET state='SKIPPED', decision_reason=?, finished_at=?, updated_at=? "
+                "WHERE schedule_id=? AND state IN ('PENDING','CLAIMED')",
+                ("superseded by schedule generation", now, now, schedule_id),
+            )
+            cursor = connection.execute(
+                "UPDATE schedules SET name=?, trigger_type=?, expression=?, timezone=?, prompt=?, "
+                "context_profile=?, workspace_id=?, conversation_policy=?, concurrency_policy=?, "
+                "misfire_policy=?, misfire_grace_seconds=?, notification_policy=?, notification_channel=?, "
+                "notification_chat_id=?, generation=generation+1, version=version+1, next_run_at=?, updated_at=? "
+                f"WHERE {predicates}", parameters,
+            )
+            if cursor.rowcount != 1:
+                current = self.get_schedule(schedule_id)
+                raise VersionConflict(f"schedule {schedule_id} version is {current.version}, expected {expected_version}")
+        return self.get_schedule(schedule_id)
+
     def delete_schedule(
         self, schedule_id: str, *, expected_version: int | None = None
     ) -> ScheduleRecord:
@@ -1328,6 +1392,29 @@ class Store:
                 (next_run_at, last_run_at, now, schedule_id, generation),
             )
         return [self.get_trigger(item) for item in inserted]
+
+    def create_manual_trigger(
+        self, schedule_id: str, request_id: str, *, scheduled_for: str | None = None,
+    ) -> TriggerRecord:
+        """Create an idempotent manual occurrence without advancing recurrence."""
+        now = scheduled_for or utc_now()
+        with self._connect() as connection:
+            schedule = connection.execute(
+                "SELECT id, generation FROM schedules WHERE id=? AND deleted_at IS NULL",
+                (schedule_id,),
+            ).fetchone()
+            if schedule is None:
+                raise KeyError(f"schedule not found: {schedule_id}")
+            execution_key = f"{schedule_id}:{int(schedule['generation'])}:manual:{request_id}"
+            trigger_id = str(uuid.uuid5(uuid.NAMESPACE_URL, execution_key))
+            connection.execute(
+                """INSERT OR IGNORE INTO trigger_occurrences(
+                   id, execution_key, schedule_id, generation, scheduled_for,
+                   state, decision_reason, attempt_count, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, 'PENDING', 'manual run', 0, ?, ?)""",
+                (trigger_id, execution_key, schedule_id, int(schedule["generation"]), now, now, now),
+            )
+        return self.get_trigger(trigger_id)
 
     def get_trigger(self, trigger_id: str) -> TriggerRecord:
         with self._connect() as connection:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 
 import httpx
@@ -152,6 +153,58 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("raw-password", body)
         self.assertNotIn("raw-key", body)
         self.assertIn("<redacted>", body)
+
+    async def test_m8b6_automation_run_now_is_idempotent_and_capabilities_are_scoped(self) -> None:
+        store = self.app.state.store
+        workspace = store.create_workspace("automation", self.home / "automation")
+        skill_path = workspace.path / ".agents" / "skills" / "coding"
+        skill_path.mkdir(parents=True)
+        (skill_path / "SKILL.md").write_text("# Coding\n", encoding="utf-8")
+        skill = await self.client.post(
+            "/capabilities/skills", headers=self.headers,
+            json={"id": "coding", "name": "Coding", "path": str(skill_path), "workspace_id": workspace.id},
+        )
+        self.assertEqual(skill.status_code, 201)
+        mcp = await self.client.post(
+            "/capabilities/mcp", headers=self.headers,
+            json={"id": "github", "name": "GitHub", "transport": "stdio", "command": "sh", "env_refs": {"TOKEN": "secret:github-token"}, "workspace_id": workspace.id},
+        )
+        self.assertEqual(mcp.status_code, 201)
+        capabilities = await self.client.get(
+            "/api/v1/capabilities", headers=self.headers, params={"workspace_id": workspace.id}
+        )
+        self.assertEqual(capabilities.status_code, 200)
+        self.assertEqual(capabilities.json()["workspace"]["id"], workspace.id)
+        self.assertIn("secret:github-token", capabilities.text)
+        self.assertNotIn("raw-secret", capabilities.text)
+        self.assertNotIn("GRAVITYCLAW_SECRET", capabilities.text)
+
+        created = await self.client.post(
+            "/api/v1/automations", headers=self.headers,
+            json={"name": "Manual check", "trigger_type": "interval", "expression": "3600", "prompt": "check", "workspace_id": workspace.id},
+        )
+        self.assertEqual(created.status_code, 201)
+        schedule = created.json()
+        with patch.object(self.app.state.scheduler.manager, "activate", new=AsyncMock()):
+            first = await self.client.post(
+                f"/api/v1/automations/{schedule['id']}/run-now", headers=self.headers,
+                json={"request_id": "browser-retry-1"},
+            )
+            second = await self.client.post(
+                f"/api/v1/automations/{schedule['id']}/run-now", headers=self.headers,
+                json={"request_id": "browser-retry-1"},
+            )
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(first.json()["trigger"]["id"], second.json()["trigger"]["id"])
+        triggers = await self.client.get(f"/api/v1/automations/{schedule['id']}", headers=self.headers)
+        self.assertEqual(len([item for item in triggers.json()["triggers"] if ":manual:browser-retry-1" in item["execution_key"]]), 1)
+
+        stale = await self.client.post(
+            f"/api/v1/capabilities/mcp/github/disable", headers=self.headers,
+            json={"expected_updated_at": "stale"},
+        )
+        self.assertEqual(stale.status_code, 409)
 
 
 if __name__ == "__main__":

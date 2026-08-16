@@ -24,6 +24,7 @@ from .store import (
     SCHEDULE_CONCURRENCY,
     SCHEDULE_TYPES,
     ScheduleRecord,
+    RunRecord,
     Store,
     TriggerRecord,
 )
@@ -140,6 +141,39 @@ class Scheduler:
             kwargs.setdefault("misfire_policy", "MISFIRE_SKIP")
             kwargs.setdefault("concurrency_policy", "SKIP")
         return self.store.create_schedule(**kwargs)
+
+    def update_schedule(self, schedule_id: str, **kwargs: Any) -> ScheduleRecord:
+        trigger_type = str(kwargs["trigger_type"])
+        profile = str(kwargs.get("context_profile") or ("heartbeat" if trigger_type == "heartbeat" else "scheduled"))
+        self.validate(
+            trigger_type=trigger_type, expression=str(kwargs["expression"]),
+            timezone=str(kwargs["timezone"]), context_profile=profile,
+        )
+        next_run_at = self.first_run_at(
+            trigger_type=trigger_type, expression=str(kwargs["expression"]),
+            timezone=str(kwargs["timezone"]), start_at=kwargs.get("start_at"),
+        )
+        if trigger_type == "heartbeat":
+            kwargs["misfire_policy"] = "MISFIRE_SKIP"
+            kwargs["concurrency_policy"] = "SKIP"
+        kwargs["context_profile"] = profile
+        kwargs.pop("start_at", None)
+        return self.store.update_schedule(schedule_id, next_run_at=next_run_at, **kwargs)
+
+    async def run_now(self, schedule_id: str, request_id: str) -> tuple[TriggerRecord, RunRecord | None]:
+        if not request_id.strip():
+            raise ValueError("run-now request id must not be empty")
+        self.store.recover_trigger_leases()
+        self.store.sync_trigger_states()
+        self.store.create_manual_trigger(schedule_id, request_id.strip())
+        await self._dispatch_due()
+        self.store.sync_trigger_states()
+        candidates = self.store.list_triggers(schedule_id=schedule_id, limit=10000)
+        selected = next(
+            item for item in candidates
+            if item.execution_key.endswith(f":manual:{request_id.strip()}")
+        )
+        return selected, self.store.get_run(selected.run_id) if selected.run_id else None
 
     async def start(self) -> SchedulerReport:
         self.store.initialize()

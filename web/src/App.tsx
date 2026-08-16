@@ -4,6 +4,8 @@ import { presentationForRun, useControlReplay } from "./replay";
 import { RichRunInspector } from "./RunInspector";
 import { MemoryStudio } from "./MemoryStudio";
 import { ContextStudio } from "./ContextStudio";
+import { AutomationsStudio } from "./AutomationsStudio";
+import { CapabilitiesStudio } from "./CapabilitiesStudio";
 import type { Conversation, ConversationDetail, ControlState, Message, PersistedEvent, RunRecord } from "./types";
 
 const navItems = [
@@ -89,7 +91,9 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
         {view === "runs" && <Runs state={state} onRunSelect={setSelectedRun} />}
         {view === "memory" && <MemoryStudio />}
         {view === "context" && <ContextStudio />}
-        {view !== "home" && view !== "runs" && view !== "conversations" && view !== "memory" && view !== "context" && <ComingSoon title={title} />}
+        {view === "automations" && <AutomationsStudio />}
+        {view === "capabilities" && <CapabilitiesStudio />}
+        {view !== "home" && view !== "runs" && view !== "conversations" && view !== "memory" && view !== "context" && view !== "automations" && view !== "capabilities" && <ComingSoon title={title} />}
       </div>
       {selectedRun && <RichRunInspector run={selectedRun} state={state} onClose={() => setSelectedRun(null)} />}
       <button className="command-fab" onClick={() => setFocus(!focus)} aria-label="Open command palette">⌘K</button>
