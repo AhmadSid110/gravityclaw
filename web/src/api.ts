@@ -1,4 +1,4 @@
-import type { ControlSnapshot, PersistedEvent, RunRecord } from "./types";
+import type { Conversation, ConversationDetail, ControlSnapshot, PersistedEvent, RunRecord } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -33,6 +33,42 @@ export async function getHome(): Promise<ControlSnapshot> {
 
 export async function getRuns(): Promise<RunRecord[]> {
   return request("/api/v1/runs");
+}
+
+export async function getConversations(): Promise<Conversation[]> {
+  return request("/api/v1/conversations");
+}
+
+export async function getConversation(conversationId: string): Promise<ConversationDetail> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}`);
+}
+
+export async function getWorkspaces(): Promise<Array<{ id: string; name: string; path: string }>> {
+  return request("/api/v1/workspaces");
+}
+
+export async function createConversation(workspaceId: string, title?: string): Promise<Conversation> {
+  return request("/conversations", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ workspace_id: workspaceId, channel: "web", title }),
+  });
+}
+
+export async function submitRun(conversationId: string, prompt: string): Promise<RunRecord> {
+  return request(`/conversations/${encodeURIComponent(conversationId)}/runs`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ prompt, context_profile: "chat" }),
+  });
+}
+
+export async function cancelRun(run: RunRecord): Promise<RunRecord> {
+  return request(`/runs/${encodeURIComponent(run.id)}/cancel`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ expected_version: run.version }),
+  });
 }
 
 export async function getTimeline(runId: string): Promise<{ run: RunRecord; events: PersistedEvent[] }> {

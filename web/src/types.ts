@@ -22,6 +22,48 @@ export interface RunRecord {
   version: number;
 }
 
+export interface Conversation {
+  id: string;
+  workspace_id: string;
+  channel: string;
+  channel_key: string | null;
+  title: string | null;
+  agy_conversation_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Message {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  created_at: string;
+  source_run_id: string | null;
+}
+
+export interface ConversationDetail {
+  conversation: Conversation;
+  messages: Message[];
+  runs: RunRecord[];
+}
+
+export interface ToolActivity {
+  id: string;
+  name: string;
+  state: "running" | "finished" | "failed";
+  detail: string;
+}
+
+export interface PresentationState {
+  runId: string;
+  status: RunStatus;
+  assistantText: string;
+  currentTool: ToolActivity | null;
+  completedTools: ToolActivity[];
+  subagents: string[];
+}
+
 export interface PersistedEvent {
   id: number;
   run_id: string;

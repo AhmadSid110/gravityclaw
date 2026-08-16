@@ -100,6 +100,26 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         replay = store.list_events_global(after_id=cursor)
         self.assertTrue(all(item.id > cursor for item in replay))
 
+    async def test_web_and_telegram_origins_share_the_same_conversation_contract(self) -> None:
+        store = self.app.state.store
+        workspace = store.create_workspace("shared", self.home / "shared")
+        telegram = store.create_conversation(
+            workspace.id, channel="telegram", channel_key="chat:42", title="Telegram thread"
+        )
+        listed = await self.client.get("/api/v1/conversations", headers=self.headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()[0]["id"], telegram.id)
+        submitted = await self.client.post(
+            f"/conversations/{telegram.id}/runs", headers=self.headers,
+            json={"prompt": "Continue from Web"},
+        )
+        self.assertEqual(submitted.status_code, 202)
+        detail = await self.client.get(
+            f"/api/v1/conversations/{telegram.id}", headers=self.headers
+        )
+        self.assertEqual(detail.json()["conversation"]["channel"], "telegram")
+        self.assertEqual(detail.json()["messages"][-1]["content"], "Continue from Web")
+
     async def test_audit_redacts_secret_shaped_values(self) -> None:
         self.app.state.store.record_audit(
             actor="control-token", action="test", resource_type="mcp",

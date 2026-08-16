@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { getSession, login, logout } from "./api";
-import { useControlReplay } from "./replay";
-import type { ControlState, PersistedEvent, RunRecord } from "./types";
+import { cancelRun, createConversation, getConversation, getConversations, getSession, getTimeline, getWorkspaces, login, logout, submitRun } from "./api";
+import { presentationForRun, useControlReplay } from "./replay";
+import type { Conversation, ConversationDetail, ControlState, Message, PersistedEvent, RunRecord } from "./types";
 
 const navItems = [
   ["home", "⌂", "Home"],
@@ -82,6 +82,7 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
       <header className="topbar"><button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation">☰</button><div className="breadcrumb"><span>GravityClaw</span><span className="crumb-separator">/</span><strong>{title}</strong></div><div className="topbar-actions"><button className="palette-hint" onClick={() => setFocus(!focus)}><span>⌘</span><span>K</span></button><button className="icon-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Toggle theme">{theme === "dark" ? "☼" : "☾"}</button><span className="system-health"><span className="status-dot green" /> Healthy</span></div></header>
       <div className="content-shell">
         {view === "home" && <Home state={state} onRunSelect={setSelectedRun} />}
+        {view === "conversations" && <ConversationWorkspace state={state} focus={focus} onToggleFocus={() => setFocus(!focus)} />}
         {view === "runs" && <Runs state={state} onRunSelect={setSelectedRun} />}
         {view !== "home" && view !== "runs" && <ComingSoon title={title} />}
       </div>
@@ -107,6 +108,90 @@ function Runs({ state, onRunSelect }: { state: ControlState; onRunSelect: (run: 
   const runs = state.activeRuns;
   return <div className="page fade-in"><div className="page-heading"><div><div className="eyebrow">OPERATIONS</div><h1>Runs</h1><p className="muted">Every execution, one durable timeline.</p></div><button className="secondary-button">⌕ <span>Search runs</span></button></div><div className="filter-bar"><button className="filter active">All <span>⌄</span></button><button className="filter">Workspace <span>⌄</span></button><button className="filter">State <span>⌄</span></button><span className="filter-count">{runs.length} visible</span></div><section className="panel runs-table"><div className="table-head"><span>STATE</span><span>TASK</span><span>WORKSPACE</span><span>VERSION</span><span>TIME</span></div>{runs.length === 0 && <EmptyState icon="ϟ" title="No runs yet" detail="Your execution history will appear here." />}{runs.map((run) => <button className="table-row" key={run.id} onClick={() => onRunSelect(run)}><span><StatusBadge status={run.status} /></span><span className="task-cell"><strong>{String(run.request.prompt ?? "Untitled run")}</strong><small>{run.id.slice(0, 8)} · {run.request.context_profile ?? "chat"}</small></span><span className="workspace-cell">gravityclaw</span><span className="mono">v{run.version}</span><span className="muted-text">{formatTime(run.created_at)}</span></button>)}</section></div>;
 }
+
+function ConversationWorkspace({ state, focus, onToggleFocus }: { state: ControlState; focus: boolean; onToggleFocus: () => void }) {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [timeline, setTimeline] = useState<PersistedEvent[]>([]);
+  const [draft, setDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getConversations().then((items) => {
+      if (cancelled) return;
+      setConversations(items);
+      setSelectedId((current) => current ?? items[0]?.id ?? null);
+      setLoading(false);
+    }).catch((reason) => { if (!cancelled) { setError(reason instanceof Error ? reason.message : "Unable to load conversations"); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) { setDetail(null); return; }
+    let cancelled = false;
+    setLoading(true);
+    void getConversation(selectedId).then((value) => { if (!cancelled) { setDetail(value); setLoading(false); } }).catch((reason) => { if (!cancelled) { setError(reason instanceof Error ? reason.message : "Unable to open conversation"); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [selectedId]);
+
+  const run = detail?.runs.slice().reverse().find((item) => item.status === "running" || item.status === "queued") ?? detail?.runs.at(-1) ?? null;
+  useEffect(() => {
+    if (!run) { setTimeline([]); return; }
+    let cancelled = false;
+    void getTimeline(run.id).then((value) => { if (!cancelled) setTimeline(value.events); }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [run?.id]);
+
+  useEffect(() => {
+    if (!detail) return;
+    const relevant = state.activity.some((event) => detail.runs.some((item) => item.id === event.run_id) && ["run.completed", "run.failed", "run.cancelled", "run.interrupted"].includes(event.event_type));
+    if (!relevant) return;
+    const timer = window.setTimeout(() => { void getConversation(detail.conversation.id).then(setDetail).catch(() => undefined); }, 180);
+    return () => window.clearTimeout(timer);
+  }, [state.activity, selectedId]);
+
+  async function newConversation() {
+    setError(null);
+    try {
+      const workspaces = await getWorkspaces();
+      if (!workspaces[0]) throw new Error("Create a workspace before starting a conversation.");
+      const conversation = await createConversation(workspaces[0].id);
+      setConversations((items) => [conversation, ...items]);
+      setSelectedId(conversation.id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to create conversation"); }
+  }
+
+  async function send() {
+    const prompt = draft.trim();
+    if (!prompt || !detail || sending) return;
+    setSending(true); setError(null);
+    try {
+      const submitted = await submitRun(detail.conversation.id, prompt);
+      const optimistic: Message = { id: `local:${submitted.id}`, conversation_id: detail.conversation.id, role: "user", content: prompt, created_at: new Date().toISOString(), source_run_id: submitted.id };
+      setDetail((current) => current ? { ...current, messages: [...current.messages, optimistic], runs: [...current.runs, submitted] } : current);
+      setDraft("");
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to send message"); }
+    finally { setSending(false); }
+  }
+
+  const liveEvents = [...timeline, ...state.activity.filter((event) => event.run_id === run?.id)]
+    .filter((event, index, all) => all.findIndex((candidate) => candidate.id === event.id) === index);
+  const presentation = run ? presentationForRun(run, liveEvents) : null;
+  const title = detail?.conversation.title || detail?.messages.find((item) => item.role === "user")?.content.slice(0, 34) || "New conversation";
+  return <div className={`conversation-workspace ${focus ? "focus-mode" : "inspect-mode"}`}>
+    {!focus && <aside className="conversation-nav"><div className="conversation-nav-head"><div><div className="eyebrow">INBOX</div><h2>Conversations</h2></div><button className="new-conversation" onClick={() => void newConversation()} aria-label="New conversation">+</button></div><div className="conversation-list">{loading && conversations.length === 0 && <div className="list-loading">Loading conversations…</div>}{conversations.map((conversation) => <button key={conversation.id} className={`conversation-item ${selectedId === conversation.id ? "selected" : ""}`} onClick={() => setSelectedId(conversation.id)}><span className="conversation-avatar">{(conversation.title || conversation.channel || "G").slice(0, 1).toUpperCase()}</span><span className="conversation-item-copy"><strong>{conversation.title || "Untitled conversation"}</strong><small>{conversation.channel} · {formatTime(conversation.updated_at)}</small></span>{state.activeRuns.some((item) => item.conversation_id === conversation.id && item.status === "running") && <span className="status-dot blue" />}</button>)}{!loading && conversations.length === 0 && <EmptyState icon="◌" title="No conversations" detail="Start one with the plus button." />}</div></aside>}
+    <section className="conversation-main"><div className="conversation-header"><div><div className="eyebrow">{detail?.conversation.channel ? `${detail.conversation.channel.toUpperCase()} · CONVERSATION` : "CONVERSATION"}</div><h1>{title}</h1></div><div className="conversation-header-actions"><button className={`mode-toggle ${focus ? "active" : ""}`} onClick={onToggleFocus}>{focus ? "Focus" : "Inspect"}</button>{run && <StatusBadge status={presentation?.status ?? run.status} />}</div></div>{error && <div className="inline-error workspace-error">{error}</div>}{!detail && !loading && <EmptyState icon="◌" title="Choose a conversation" detail="Your durable conversations will appear here." />}{detail && <div className="message-scroll"><div className="message-list">{detail.messages.map((message) => <MessageCard key={message.id} message={message} />)}{run && presentation && (presentation.assistantText || presentation.currentTool || presentation.completedTools.length || presentation.subagents.length || run.status === "queued") && <LiveRunBlock run={run} presentation={presentation} />}</div></div>}<div className="composer-wrap"><div className="composer"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="Ask GravityClaw…" rows={1} disabled={!detail || sending} /><div className="composer-footer"><span className="composer-context">Workspace: <strong>gravityclaw</strong>{run?.status === "running" && <em> · follow-up will queue</em>}</span><button className="send-button" onClick={() => void send()} disabled={!draft.trim() || !detail || sending}>{sending ? "…" : "Send ↑"}</button></div></div></div></section>
+    {!focus && <aside className="workspace-inspector"><div className="inspector-mini-head"><div className="eyebrow">INSPECTOR</div><span className="status-dot green" /></div>{run ? <><StatusBadge status={presentation?.status ?? run.status} large /><h2 className="inspector-run-title">{String(run.request.prompt ?? title)}</h2><Detail label="Workspace" value="gravityclaw" /><Detail label="Context" value={String(run.request.context_profile ?? "chat")} /><Detail label="Run version" value={`v${run.version}`} />{run.status === "running" && <button className="danger-button" onClick={() => void cancelRun(run).catch((reason) => setError(reason instanceof Error ? reason.message : "Unable to stop run"))}>■ Stop run</button>}<div className="inspector-section"><div className="section-label">LIVE ACTIVITY</div>{presentation?.currentTool && <ActivityChip icon="⚙" text={presentation.currentTool.name} active />}{presentation?.subagents.map((agent) => <ActivityChip key={agent} icon="↳" text={agent} />)}{presentation?.completedTools.slice(-3).map((tool) => <ActivityChip key={tool.id} icon="✓" text={tool.name} />)}</div></> : <EmptyState icon="◎" title="No active run" detail="Run details will appear here while GravityClaw works." />}</aside>}
+  </div>;
+}
+
+function MessageCard({ message }: { message: Message }) { const user = message.role === "user"; return <article className={`message-card ${user ? "user" : "assistant"}`}><div className={`message-avatar ${user ? "user-avatar" : "agent-avatar"}`}>{user ? "A" : "✦"}</div><div className="message-content"><div className="message-meta"><strong>{user ? "You" : "GravityClaw"}</strong><span>{formatTime(message.created_at)}{message.source_run_id && <span className="message-source"> · {message.source_run_id.slice(0, 8)}</span>}</span></div><p>{message.content}</p></div></article>; }
+function LiveRunBlock({ run, presentation }: { run: RunRecord; presentation: ReturnType<typeof presentationForRun> }) { return <article className="live-run-block"><div className="live-run-header"><StatusBadge status={presentation.status} /><span>{presentation.status === "queued" ? "Waiting for the current run to finish" : "Observable activity"}</span></div>{presentation.completedTools.map((tool) => <ActivityChip key={tool.id} icon="✓" text={tool.name} />)}{presentation.currentTool && <ActivityChip icon="⚙" text={`${presentation.currentTool.name} · running`} active detail={presentation.currentTool.detail} />}{presentation.subagents.map((agent) => <ActivityChip key={agent} icon="↳" text={agent} />)}{presentation.assistantText && <p className="streaming-text">{presentation.assistantText}<span className="streaming-cursor">▋</span></p>}{run.status !== "running" && !presentation.assistantText && <div className="system-note">Run {run.status}. GravityClaw preserved the conversation state.</div>}</article>; }
+function ActivityChip({ icon, text, active = false, detail }: { icon: string; text: string; active?: boolean; detail?: string }) { return <div className={`activity-chip ${active ? "active" : ""}`}><span>{icon}</span><div><strong>{text}</strong>{detail && <small>{detail}</small>}</div></div>; }
 
 function Inspector({ run, state, onClose }: { run: RunRecord; state: ControlState; onClose: () => void }) {
   const [tab, setTab] = useState("Run");

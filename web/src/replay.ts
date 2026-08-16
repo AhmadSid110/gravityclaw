@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { controlSocketUrl, getHome } from "./api";
-import type { ControlSnapshot, ControlState, PersistedEvent, RunRecord } from "./types";
+import type { ControlSnapshot, ControlState, PersistedEvent, PresentationState, RunRecord, ToolActivity } from "./types";
 
 const MAX_ACTIVITY = 120;
 
@@ -29,6 +29,43 @@ function initialState(): ControlState {
   };
 }
 
+export function presentationForRun(run: RunRecord, events: PersistedEvent[]): PresentationState {
+  const presentation: PresentationState = {
+    runId: run.id, status: run.status, assistantText: "", currentTool: null,
+    completedTools: [], subagents: [],
+  };
+  for (const event of events.sort((left, right) => left.sequence - right.sequence)) {
+    const payload = event.payload;
+    if (event.event_type === "message.delta") {
+      presentation.assistantText += typeof payload.text_delta === "string" ? payload.text_delta : "";
+    } else if (event.event_type === "tool.started" || event.event_type === "tool.finished" || event.event_type === "tool.failed") {
+      const tool: ToolActivity = {
+        id: `${run.id}:${event.sequence}`,
+        name: String(payload.tool_name ?? payload.tool ?? "Tool activity"),
+        state: event.event_type === "tool.started" ? "running" : event.event_type === "tool.finished" ? "finished" : "failed",
+        detail: String(payload.tool_info ?? payload.command ?? "Observable tool execution"),
+      };
+      if (tool.state === "running") presentation.currentTool = tool;
+      else {
+        presentation.completedTools = [...presentation.completedTools, tool];
+        if (presentation.currentTool?.name === tool.name) presentation.currentTool = null;
+      }
+    } else if (event.event_type === "subagent.updated") {
+      const info = payload.subagent_info;
+      const label = typeof info === "string" ? info : typeof info === "object" && info !== null ? String((info as Record<string, unknown>).name ?? "Subagent") : "Subagent active";
+      if (!presentation.subagents.includes(label)) presentation.subagents = [...presentation.subagents, label];
+    } else if (event.event_type === "agent.completed" || event.event_type === "run.completed") {
+      presentation.status = "completed";
+      if (!presentation.assistantText && typeof payload.response === "string") presentation.assistantText = payload.response;
+    } else if (event.event_type === "agent.failed" || event.event_type === "run.failed") presentation.status = "failed";
+    else if (event.event_type === "run.cancelled") presentation.status = "cancelled";
+    else if (event.event_type === "run.interrupted") presentation.status = "interrupted";
+    else if (event.event_type === "run.running") presentation.status = "running";
+    else if (event.event_type === "run.queued") presentation.status = "queued";
+  }
+  return presentation;
+}
+
 export class ControlReplay {
   private socket: WebSocket | null = null;
   private reconnectTimer: number | undefined;
@@ -53,11 +90,16 @@ export class ControlReplay {
     this.stopped = false;
     try {
       const snapshot = await getHome();
+      const snapshotActivity = snapshot.activity?.map((item) => item.event) ?? [];
+      const mergedActivity = [...this.state.activity, ...snapshotActivity]
+        .filter((event, index, all) => all.findIndex((candidate) => candidate.id === event.id) === index)
+        .sort((left, right) => left.id - right.id)
+        .slice(-MAX_ACTIVITY);
       this.publish({
         snapshot,
         activeRuns: snapshot.active_runs,
-        activity: snapshot.activity?.map((item) => item.event).slice(-MAX_ACTIVITY) ?? [],
-        cursor: snapshot.activity?.at(-1)?.cursor ?? this.state.cursor,
+        activity: mergedActivity,
+        cursor: this.state.cursor || snapshot.activity?.at(-1)?.cursor || 0,
         connection: "connecting",
         error: null,
       });

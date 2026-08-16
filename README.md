@@ -32,6 +32,9 @@ records. See [the M8A report](docs/milestone-8a.md).
 The M8B foundation adds the React/Vite responsive shell, browser-safe session
 bridge, centralized control replay client, Home, Runs, and initial run inspector.
 See [the M8B foundation report](docs/milestone-8b-foundation.md).
+M8B.3 adds the durable Conversation Workspace with Web/Telegram convergence,
+queued follow-ups, live activity reduction, and Focus/Inspect modes. See
+[the M8B.3 report](docs/milestone-8b3.md).
 
 ## Core server
 
