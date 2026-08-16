@@ -1,4 +1,4 @@
-import type { Artifact, Conversation, ConversationDetail, ControlSnapshot, PersistedEvent, RunRecord } from "./types";
+import type { Artifact, ContextPreview, Conversation, ConversationDetail, ControlSnapshot, ContextManifest, IdentityDocument, JournalRecord, MemoryRecord, MemoryUsage, PersistedEvent, RunRecord } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -84,11 +84,63 @@ export async function getArtifact(artifactId: string): Promise<Artifact> {
 }
 
 export async function getRunContext(runId: string): Promise<Record<string, unknown>> {
-  return request(`/runs/${encodeURIComponent(runId)}/context`);
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}/context`);
 }
 
 export async function getRunCapabilities(runId: string): Promise<Record<string, unknown>> {
-  return request(`/runs/${encodeURIComponent(runId)}/capabilities`);
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}/capabilities`);
+}
+
+export async function getIdentity(): Promise<IdentityDocument[]> {
+  return request("/api/v1/identity");
+}
+
+export async function getIdentityHistory(name: string): Promise<IdentityDocument[]> {
+  return request(`/api/v1/identity/${encodeURIComponent(name)}/history`);
+}
+
+export async function updateIdentity(name: string, content: string, expectedVersion: number): Promise<IdentityDocument> {
+  return request(`/api/v1/identity/${encodeURIComponent(name)}`, {
+    method: "PUT", headers: jsonHeaders, body: JSON.stringify({ content, expected_version: expectedVersion }),
+  });
+}
+
+export async function getMemories(kind?: string): Promise<MemoryRecord[]> {
+  const query = kind ? `?kind=${encodeURIComponent(kind)}` : "";
+  return request(`/api/v1/memories${query}`);
+}
+
+export async function searchMemories(query: string): Promise<MemoryRecord[]> {
+  return request(`/api/v1/memories/search?q=${encodeURIComponent(query)}`);
+}
+
+export async function getMemory(id: string): Promise<MemoryUsage> {
+  return request(`/api/v1/memories/${encodeURIComponent(id)}`);
+}
+
+export async function getJournals(): Promise<JournalRecord[]> {
+  return request("/api/v1/journals");
+}
+
+export async function getJournal(date: string): Promise<JournalRecord> {
+  return request(`/api/v1/journals/${encodeURIComponent(date)}`);
+}
+
+export async function updateJournal(date: string, content: string, expectedSha256: string): Promise<JournalRecord> {
+  return request(`/api/v1/journals/${encodeURIComponent(date)}`, {
+    method: "PUT", headers: jsonHeaders, body: JSON.stringify({ content, expected_sha256: expectedSha256 }),
+  });
+}
+
+export async function previewContext(task: string, profile: string, conversationId?: string): Promise<ContextPreview> {
+  return request("/api/v1/context/preview", {
+    method: "POST", headers: jsonHeaders,
+    body: JSON.stringify({ task, profile, conversation_id: conversationId }),
+  });
+}
+
+export async function getRunContextManifest(runId: string): Promise<ContextManifest> {
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}/context`);
 }
 
 export function controlSocketUrl(cursor: number): string {

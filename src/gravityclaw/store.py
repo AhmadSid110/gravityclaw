@@ -21,7 +21,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 RUN_STATUSES = (
     "queued",
     "running",
@@ -236,6 +236,7 @@ class Store:
                 connection.executescript(_SCHEDULER_SCHEMA)
                 connection.executescript(_CAPABILITY_SCHEMA)
                 connection.executescript(_CONTROL_SCHEMA)
+                connection.executescript(_IDENTITY_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -292,12 +293,17 @@ class Store:
                     )
                 connection.executescript(_CONTROL_SCHEMA)
                 self._set_schema_version(connection, 8)
+                version = 8
+            if version == 8:
+                connection.executescript(_IDENTITY_SCHEMA)
+                self._set_schema_version(connection, 9)
             connection.executescript(_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
             connection.executescript(_CONTEXT_SCHEMA)
             connection.executescript(_SCHEDULER_SCHEMA)
             connection.executescript(_CAPABILITY_SCHEMA)
             connection.executescript(_CONTROL_SCHEMA)
+            connection.executescript(_IDENTITY_SCHEMA)
             self._ensure_message_index(connection)
 
     @staticmethod
@@ -1720,6 +1726,93 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_memories(self, *, kind: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        query = "SELECT * FROM memories"
+        parameters: list[Any] = []
+        if kind:
+            query += " WHERE kind=?"
+            parameters.append(kind)
+        query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(query, parameters).fetchall()]
+
+    def get_memory(self, memory_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"memory not found: {memory_id}")
+        return dict(row)
+
+    def memory_usage(self, memory_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        label = f"memory:{memory_id}"
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id, manifest_json FROM context_manifests "
+                "WHERE manifest_json LIKE ? ORDER BY created_at DESC LIMIT ?",
+                (f"%{label}%", limit),
+            ).fetchall()
+        usage: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                manifest = json.loads(row["manifest_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            source = next((item for item in manifest.get("sources", [])
+                           if item.get("label") == label), None)
+            if source is not None:
+                usage.append({"run_id": row["run_id"], **source})
+        return usage
+
+    def sync_identity_revision(self, name: str, sha256_value: str, content: str) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT version, sha256 FROM identity_revisions WHERE name=? "
+                "ORDER BY version DESC LIMIT 1", (name,)
+            ).fetchone()
+            if row is None:
+                version = 1
+                connection.execute(
+                    "INSERT INTO identity_revisions(name, version, sha256, content, created_at) "
+                    "VALUES(?,?,?,?,?)", (name, version, sha256_value, content, now)
+                )
+            elif row["sha256"] != sha256_value:
+                version = int(row["version"]) + 1
+                connection.execute(
+                    "INSERT INTO identity_revisions(name, version, sha256, content, created_at) "
+                    "VALUES(?,?,?,?,?)", (name, version, sha256_value, content, now)
+                )
+            else:
+                version = int(row["version"])
+            return {"name": name, "version": version, "sha256": sha256_value, "updated_at": now}
+
+    def list_identity_revisions(self, name: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT name, version, sha256, content, created_at FROM identity_revisions "
+                "WHERE name=? ORDER BY version DESC LIMIT ?", (name, limit)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def append_identity_revision(self, name: str, content: str, sha256_value: str,
+                                 expected_version: int | None = None) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT version FROM identity_revisions WHERE name=? ORDER BY version DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+            current = int(row["version"]) if row else 0
+            if expected_version is not None and current != expected_version:
+                raise VersionConflict(f"identity {name} version is {current}, expected {expected_version}")
+            version = current + 1
+            connection.execute(
+                "INSERT INTO identity_revisions(name, version, sha256, content, created_at) VALUES(?,?,?,?,?)",
+                (name, version, sha256_value, content, now),
+            )
+        return {"name": name, "version": version, "sha256": sha256_value, "updated_at": now}
+
     def get_context_manifest(self, run_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute(
@@ -2430,4 +2523,17 @@ CREATE TABLE IF NOT EXISTS control_audit (
 CREATE INDEX IF NOT EXISTS control_audit_created ON control_audit(created_at, id);
 CREATE INDEX IF NOT EXISTS control_audit_resource
     ON control_audit(resource_type, resource_id, id);
+"""
+
+_IDENTITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS identity_revisions (
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(name, version)
+);
+CREATE INDEX IF NOT EXISTS identity_revisions_latest
+    ON identity_revisions(name, version DESC);
 """

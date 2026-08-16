@@ -77,6 +77,44 @@ class MilestoneThreeApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summaries.status_code, 200)
         self.assertEqual(summaries.json(), [])
 
+    async def test_memory_studio_endpoints_are_versioned_and_read_only(self) -> None:
+        identity = await self.client.get("/api/v1/identity")
+        self.assertEqual(identity.status_code, 200)
+        soul = next(item for item in identity.json() if item["name"] == "SOUL.md")
+        updated = await self.client.put(
+            "/api/v1/identity/SOUL.md",
+            json={"content": "# Soul\n\nBe precise.\n", "expected_version": soul["version"]},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["version"], soul["version"] + 1)
+        stale = await self.client.put(
+            "/api/v1/identity/SOUL.md",
+            json={"content": "stale", "expected_version": soul["version"]},
+        )
+        self.assertEqual(stale.status_code, 409)
+        history = await self.client.get("/api/v1/identity/SOUL.md/history")
+        self.assertEqual(history.status_code, 200)
+        self.assertGreaterEqual(len(history.json()), 2)
+
+        created = await self.client.post(
+            "/memories", json={"content": "SQLite WAL recovery is reliable", "source": "test"}
+        )
+        self.assertEqual(created.status_code, 201)
+        records = await self.client.get("/api/v1/memories")
+        self.assertEqual(records.status_code, 200)
+        inspected = await self.client.get(f"/api/v1/memories/{created.json()['id']}")
+        self.assertEqual(inspected.status_code, 200)
+        self.assertEqual(inspected.json()["content"], "SQLite WAL recovery is reliable")
+
+        preview = await self.client.post(
+            "/api/v1/context/preview",
+            json={"task": "Investigate SQLite recovery", "profile": "coding"},
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertTrue(preview.json()["preview"])
+        with self.app.state.store._connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
+
 
 class TelegramSettingsTests(unittest.TestCase):
     def test_token_file_is_loaded_without_appearing_in_settings_repr(self) -> None:

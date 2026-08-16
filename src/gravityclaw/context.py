@@ -439,6 +439,45 @@ class RunContextCompiler:
             ),
         )
 
+    def preview(self, *, task: str, profile: str = "chat",
+                conversation_id: str | None = None) -> CompiledContext:
+        """Compile a read-only context preview without creating a run or watermark."""
+        conversation = self.store.get_conversation(conversation_id) if conversation_id else None
+        policy = self.builder.profiles.get(profile)
+        if policy is None:
+            raise ValueError(f"unknown context profile: {profile}")
+        history = []
+        artifacts = []
+        prior_summary = None
+        watermark = None
+        resumed = False
+        if conversation is not None:
+            resumed = bool(conversation.agy_conversation_id)
+            watermark = self.store.get_context_watermark(conversation.id)
+            prior_summary = self.store.latest_context_summary(conversation.id)
+            if not resumed:
+                history = self.store.messages_after(
+                    conversation.id,
+                    after_message_id=(str(prior_summary["last_message_id"]) if prior_summary else None),
+                )
+                artifacts = self.store.relevant_artifacts(conversation.id, task, limit=8)
+        return self.builder.compile(
+            task=task,
+            identity=self.identity.load_execution_identity(),
+            curated_memory=self.identity.load_curated_memory(),
+            memories=self.memory.retrieve(task, limit=policy.retrieval_limit),
+            history=history,
+            is_resumed_backend_conversation=resumed,
+            profile=profile,
+            artifacts=artifacts,
+            previous_identity_hashes=(watermark.identity_hashes if watermark else None),
+            summary_version=int(prior_summary["version"]) if prior_summary else 0,
+            prior_summary=prior_summary,
+            heartbeat_instructions=(
+                self.identity.load(("HEARTBEAT.md",))[0] if profile == "heartbeat" else None
+            ),
+        )
+
 
 def _category_cap(profile: ContextProfile, category: str) -> int:
     if category in {"identity"}:

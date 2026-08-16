@@ -71,6 +71,19 @@ class IdentityStore:
     def load_execution_identity(self) -> list[IdentityDocument]:
         return self.load(EXECUTION_IDENTITY_FILES)
 
+    def update(self, name: str, content: str) -> IdentityDocument:
+        """Atomically replace a supported identity document."""
+        if name not in DEFAULT_DOCUMENTS:
+            raise ValueError(f"unsupported identity document: {name}")
+        data = content.encode("utf-8")
+        if not data.strip():
+            raise ValueError("identity document must not be empty")
+        if len(data) > self.max_document_bytes:
+            raise ValueError(f"identity document is too large: {name}")
+        path = self.home / name
+        _atomic_write(path, content)
+        return self.load((name,))[0]
+
 
 def _atomic_write(path: Path, content: str) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)

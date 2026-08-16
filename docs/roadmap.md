@@ -10,7 +10,8 @@
 - M8A — Authenticated control plane and durable read models: verified
 - M8B foundation — Responsive shell and replay/session foundation: verified
 - M8B.3 — Conversation Workspace: verified
-- M8B.4 — Rich Run and Subagent Inspector: in progress
+- M8B.4 — Rich Run and Subagent Inspector: checkpointed
+- M8B.5 — Context and Memory Studio: implemented, verification pending
 - M9 — Hardening and packaging: planned
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,

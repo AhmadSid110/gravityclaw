@@ -10,6 +10,9 @@ export default defineConfig({
       "/auth": "http://127.0.0.1:8787",
       "/health": "http://127.0.0.1:8787",
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },
+      "/conversations": "http://127.0.0.1:8787",
+      "/runs": "http://127.0.0.1:8787",
+      "/memories": "http://127.0.0.1:8787",
     },
   },
 });

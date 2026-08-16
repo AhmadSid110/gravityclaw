@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import hmac
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
@@ -109,6 +110,22 @@ class MemoryCreate(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
+class IdentityUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=256_000)
+    expected_version: int = Field(ge=1)
+
+
+class JournalUpdate(BaseModel):
+    content: str = Field(max_length=1_000_000)
+    expected_sha256: str | None = None
+
+
+class ContextPreview(BaseModel):
+    task: str = Field(min_length=1, max_length=12_000)
+    profile: str = Field(default="chat", pattern="^(chat|coding|heartbeat|scheduled)$")
+    conversation_id: str | None = None
+
+
 class ArtifactCreate(BaseModel):
     kind: str = Field(min_length=1, max_length=100)
     content: str = Field(min_length=1, max_length=5_000_000)
@@ -189,6 +206,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     identity.bootstrap()
     # initialize before constructing services used by dispatch/retrieval
     store.initialize()
+    identity_lock = threading.Lock()
     memory = MemoryService(configured.home, store)
     channel_store = ChannelStore(store)
     capabilities = CapabilityManager(
@@ -570,6 +588,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.get("/runs/{run_id}/context")
+    @app.get("/api/v1/runs/{run_id}/context")
     async def inspect_run_context(run_id: str) -> dict[str, Any]:
         try:
             return store.get_context_manifest(run_id)
@@ -577,6 +596,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/runs/{run_id}/capabilities")
+    @app.get("/api/v1/runs/{run_id}/capabilities")
     async def inspect_run_capabilities(run_id: str) -> dict[str, Any]:
         try:
             return store.get_capability_manifest(run_id)
@@ -632,14 +652,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/identity")
     async def list_identity() -> list[dict[str, Any]]:
-        return [
-            {
-                "name": document.name,
-                "content": document.content,
-                "sha256": document.sha256,
-            }
-            for document in identity.load()
-        ]
+        return [_identity_json(document) for document in identity.load()]
+
+    @app.get("/api/v1/identity")
+    async def control_identity() -> list[dict[str, Any]]:
+        result = []
+        for document in identity.load((
+            "SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md", "HEARTBEAT.md"
+        )):
+            result.append({**_identity_json(document), **store.sync_identity_revision(
+                document.name, document.sha256, document.content
+            )})
+        return result
+
+    @app.get("/api/v1/identity/{name}/history")
+    async def identity_history(name: str) -> list[dict[str, Any]]:
+        if name not in ("SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md", "HEARTBEAT.md"):
+            raise HTTPException(status_code=404, detail="identity document not found")
+        document = identity.load((name,))[0]
+        store.sync_identity_revision(name, document.sha256, document.content)
+        return store.list_identity_revisions(name)
+
+    @app.put("/api/v1/identity/{name}")
+    async def update_identity(name: str, body: IdentityUpdate, request: Request) -> dict[str, Any]:
+        if name not in ("SOUL.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md", "HEARTBEAT.md"):
+            raise HTTPException(status_code=404, detail="identity document not found")
+        try:
+            with identity_lock:
+                current = identity.load((name,))[0]
+                revision = store.sync_identity_revision(name, current.sha256, current.content)
+                if int(revision["version"]) != body.expected_version:
+                    raise VersionConflict(
+                        f"identity {name} version is {revision['version']}, expected {body.expected_version}"
+                    )
+                updated = identity.update(name, body.content)
+                result = store.append_identity_revision(
+                    name, updated.content, updated.sha256, expected_version=body.expected_version
+                )
+                store.record_audit(actor=request.state.actor, action="identity.update",
+                                   resource_type="identity", resource_id=name,
+                                   expected_version=body.expected_version,
+                                   resulting_version=result["version"])
+                return {**_identity_json(updated), **result}
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/memories", status_code=201)
     async def record_memory(body: MemoryCreate, request: Request) -> dict[str, str]:
@@ -663,6 +721,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = Query(default=8, ge=1, le=100),
     ) -> list[dict[str, Any]]:
         return memory.retrieve(q, limit=limit)
+
+    @app.get("/api/v1/memories")
+    async def list_memories(kind: str | None = None, limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
+        return store.list_memories(kind=kind, limit=limit)
+
+    @app.get("/api/v1/memories/search")
+    async def control_search_memories(q: str = Query(min_length=1, max_length=10_000), limit: int = Query(default=50, ge=1, le=100)) -> list[dict[str, Any]]:
+        return memory.retrieve(q, limit=limit)
+
+    @app.get("/api/v1/memories/{memory_id}")
+    async def inspect_memory(memory_id: str) -> dict[str, Any]:
+        try:
+            return {**store.get_memory(memory_id), "usage": store.memory_usage(memory_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/v1/journals")
+    async def list_journals() -> list[dict[str, Any]]:
+        return memory.list_journals()
+
+    @app.get("/api/v1/journals/{date}")
+    async def get_journal(date: str) -> dict[str, Any]:
+        try:
+            return memory.read_journal(date)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/v1/journals/{date}")
+    async def update_journal(date: str, body: JournalUpdate, request: Request) -> dict[str, Any]:
+        try:
+            result = memory.update_journal(date, body.content, body.expected_sha256)
+            store.record_audit(actor=request.state.actor, action="journal.update",
+                               resource_type="journal", resource_id=date)
+            return result
+        except ValueError as exc:
+            status = 409 if "changed" in str(exc) else 422
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    @app.post("/api/v1/context/preview")
+    async def context_preview(body: ContextPreview) -> dict[str, Any]:
+        try:
+            compiled = context_compiler.preview(
+                task=body.task, profile=body.profile, conversation_id=body.conversation_id
+            )
+            manifest = compiled.manifest()
+            manifest.pop("summary_proposal", None)
+            return {"manifest": manifest, "preview": True, "prompt_characters": len(compiled.prompt)}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
     # Versioned control-plane read models. These are deliberately composed
@@ -832,6 +939,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 def _run_json(run: RunRecord) -> dict[str, Any]:
     return asdict(run)
+
+
+def _identity_json(document: Any) -> dict[str, Any]:
+    return {
+        "name": document.name,
+        "content": document.content,
+        "sha256": document.sha256,
+    }
 
 
 def _event_json(event: PersistedEvent) -> dict[str, Any]:

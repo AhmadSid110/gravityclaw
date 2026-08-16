@@ -38,6 +38,9 @@ queued follow-ups, live activity reduction, and Focus/Inspect modes. See
 M8B.4 adds the shared live/historical Run Inspector with tool cards, subagent
 activity, lazy artifacts, immutable manifests, and redacted raw events. See
 [the M8B.4 report](docs/milestone-8b4.md).
+M8B.5 adds Context + Memory Studio with versioned identity editing, journal and
+FTS memory views, run provenance, immutable context inspection, and read-only
+context simulation. See [the M8B.5 report](docs/milestone-8b5.md).
 
 ## Core server
 

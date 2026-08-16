@@ -131,3 +131,71 @@ export interface ControlState {
   connection: "connecting" | "connected" | "reconnecting" | "offline";
   error: string | null;
 }
+
+export interface IdentityDocument {
+  name: string;
+  content: string;
+  sha256: string;
+  version: number;
+  updated_at?: string;
+}
+
+export interface MemoryRecord {
+  id: string;
+  kind: "episodic" | "curated" | "fact";
+  content: string;
+  source: string;
+  source_conversation_id: string | null;
+  confidence: number;
+  created_at: string;
+  updated_at: string;
+  rank?: number;
+}
+
+export interface MemoryUsage extends MemoryRecord {
+  usage: Array<Record<string, unknown>>;
+}
+
+export interface JournalRecord {
+  date: string;
+  name?: string;
+  content?: string;
+  characters?: number;
+  sha256: string;
+  updated_at?: string;
+}
+
+export interface ContextManifest {
+  version?: number;
+  profile?: string;
+  lifecycle?: string;
+  characters?: number;
+  estimated_tokens?: number;
+  budget_tokens?: number;
+  prompt_sha256?: string;
+  identity_fingerprint?: string;
+  context_fingerprint?: string;
+  included_sources?: string[];
+  omitted_sources?: string[];
+  invalidated_sources?: string[];
+  sources?: Array<{
+    label: string;
+    category: string;
+    trust: string;
+    tier: number;
+    priority: number;
+    estimated_tokens: number;
+    sha256: string | null;
+    provenance: string | null;
+    confidence: number | null;
+    included: boolean;
+    exclusion_reason: string | null;
+  }>;
+  [key: string]: unknown;
+}
+
+export interface ContextPreview {
+  manifest: ContextManifest;
+  preview: boolean;
+  prompt_characters: number;
+}

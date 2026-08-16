@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { cancelRun, createConversation, getConversation, getConversations, getRuns, getSession, getTimeline, getWorkspaces, login, logout, submitRun } from "./api";
 import { presentationForRun, useControlReplay } from "./replay";
 import { RichRunInspector } from "./RunInspector";
+import { MemoryStudio } from "./MemoryStudio";
+import { ContextStudio } from "./ContextStudio";
 import type { Conversation, ConversationDetail, ControlState, Message, PersistedEvent, RunRecord } from "./types";
 
 const navItems = [
@@ -85,7 +87,9 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
         {view === "home" && <Home state={state} onRunSelect={setSelectedRun} onOpenRuns={() => setView("runs")} />}
         {view === "conversations" && <ConversationWorkspace state={state} focus={focus} onToggleFocus={() => setFocus(!focus)} onRunSelect={setSelectedRun} />}
         {view === "runs" && <Runs state={state} onRunSelect={setSelectedRun} />}
-        {view !== "home" && view !== "runs" && view !== "conversations" && <ComingSoon title={title} />}
+        {view === "memory" && <MemoryStudio />}
+        {view === "context" && <ContextStudio />}
+        {view !== "home" && view !== "runs" && view !== "conversations" && view !== "memory" && view !== "context" && <ComingSoon title={title} />}
       </div>
       {selectedRun && <RichRunInspector run={selectedRun} state={state} onClose={() => setSelectedRun(null)} />}
       <button className="command-fab" onClick={() => setFocus(!focus)} aria-label="Open command palette">⌘K</button>
