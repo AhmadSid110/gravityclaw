@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import hmac
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -175,6 +176,10 @@ class RunCancel(BaseModel):
     expected_version: int | None = Field(default=None, ge=1)
 
 
+class SessionLogin(BaseModel):
+    token: str = Field(min_length=1, max_length=4096)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings.from_environment()
     configured.home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -267,10 +272,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def control_auth(request: Request, call_next: Any) -> Any:
-        public = request.url.path in {"/health", "/docs", "/openapi.json", "/redoc"}
+        public = request.url.path in {
+            "/health", "/docs", "/openapi.json", "/redoc", "/auth/session"
+        }
         if configured.control_token is not None and not public:
             provided = _bearer_token(request.headers.get("authorization"))
-            if provided is None or not hmac.compare_digest(provided, configured.control_token):
+            session = request.cookies.get("gravityclaw_session")
+            if not _credential_authorized(provided, session, configured.control_token):
                 return JSONResponse(
                     {"detail": "control-plane authentication required"},
                     status_code=401,
@@ -290,6 +298,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "reconciliation": app.state.reconciliation,
             "scheduler": app.state.scheduler_reconciliation,
         }
+
+    @app.post("/auth/session")
+    async def create_browser_session(body: SessionLogin, response: Response) -> dict[str, Any]:
+        if configured.control_token is None:
+            raise HTTPException(status_code=503, detail="control authentication is disabled")
+        if not hmac.compare_digest(body.token, configured.control_token):
+            raise HTTPException(status_code=401, detail="invalid control token")
+        response.set_cookie(
+            "gravityclaw_session", _session_cookie(configured.control_token),
+            max_age=12 * 60 * 60, httponly=True,
+            secure=os.environ.get("GRAVITYCLAW_COOKIE_SECURE", "0") == "1",
+            samesite="lax", path="/",
+        )
+        return {"authenticated": True, "expires_in": 12 * 60 * 60}
+
+    @app.get("/auth/session")
+    async def browser_session(request: Request) -> dict[str, Any]:
+        authenticated = configured.control_token is None or _credential_authorized(
+            _bearer_token(request.headers.get("authorization")),
+            request.cookies.get("gravityclaw_session"), configured.control_token,
+        )
+        return {"authenticated": authenticated}
+
+    @app.delete("/auth/session")
+    async def delete_browser_session(response: Response) -> dict[str, bool]:
+        response.delete_cookie("gravityclaw_session", path="/")
+        return {"authenticated": False}
 
     @app.post("/schedules", status_code=201)
     async def create_schedule(body: ScheduleCreate, request: Request) -> dict[str, Any]:
@@ -834,7 +869,39 @@ def _websocket_authorized(websocket: WebSocket, expected: str | None) -> bool:
         # single-user control plane; deployments should prefer a same-origin
         # cookie or a reverse proxy that injects the header.
         provided = websocket.query_params.get("access_token")
-    return provided is not None and hmac.compare_digest(provided, expected)
+    return _credential_authorized(
+        provided, websocket.cookies.get("gravityclaw_session"), expected
+    )
+
+
+def _credential_authorized(
+    bearer: str | None, session: str | None, expected: str | None
+) -> bool:
+    if expected is None:
+        return True
+    if bearer is not None and hmac.compare_digest(bearer, expected):
+        return True
+    if session is None:
+        return False
+    try:
+        issued, expires, signature = session.split(".", 2)
+        payload = f"{issued}.{expires}"
+        if int(expires) < int(time.time()):
+            return False
+        expected_signature = hmac.new(
+            expected.encode("utf-8"), payload.encode("ascii"), "sha256"
+        ).hexdigest()
+        return hmac.compare_digest(signature, expected_signature)
+    except (ValueError, UnicodeEncodeError):
+        return False
+
+
+def _session_cookie(secret: str, *, now: int | None = None) -> str:
+    issued = int(time.time()) if now is None else now
+    expires = issued + 12 * 60 * 60
+    payload = f"{issued}.{expires}"
+    signature = hmac.new(secret.encode("utf-8"), payload.encode("ascii"), "sha256").hexdigest()
+    return f"{payload}.{signature}"
 
 
 def _control_token_from_environment() -> str | None:

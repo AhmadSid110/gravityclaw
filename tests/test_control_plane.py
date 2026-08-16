@@ -38,6 +38,21 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(wrong.status_code, 401)
 
+    async def test_browser_session_uses_httponly_cookie_without_local_storage_token(self) -> None:
+        invalid = await self.client.post("/auth/session", json={"token": "wrong"})
+        self.assertEqual(invalid.status_code, 401)
+        login = await self.client.post("/auth/session", json={"token": "m8-test-token"})
+        self.assertEqual(login.status_code, 200)
+        self.assertIn("gravityclaw_session", login.headers.get("set-cookie", ""))
+        self.assertEqual(
+            (await self.client.get("/api/v1/control/home")).status_code, 200
+        )
+        logout = await self.client.delete("/auth/session")
+        self.assertEqual(logout.status_code, 200)
+        self.assertEqual(
+            (await self.client.get("/api/v1/control/home")).status_code, 401
+        )
+
     async def test_schedule_mutations_use_versions_and_write_audit_records(self) -> None:
         workspace = self.app.state.store.create_workspace("control", self.home / "workspace")
         created = await self.client.post(

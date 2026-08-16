@@ -8,7 +8,7 @@
 - M6 — Heartbeat and scheduling: verified
 - M7 — Skills and MCP management: verified
 - M8A — Authenticated control plane and durable read models: in progress
-- M8B — Premium responsive operating console: planned
+- M8B — Premium responsive operating console: foundation in progress
 - M9 — Hardening and packaging: planned
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,

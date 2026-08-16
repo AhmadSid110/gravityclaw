@@ -6,3 +6,5 @@ __pycache__/
 .coverage
 dist/
 build/
+web/node_modules/
+web/dist/

@@ -29,6 +29,9 @@ atomic configuration publication. See the
 Milestone 8A adds the authenticated control-plane contract, durable read
 models, global event replay, optimistic schedule mutations, and redacted audit
 records. See [the M8A report](docs/milestone-8a.md).
+The M8B foundation adds the React/Vite responsive shell, browser-safe session
+bridge, centralized control replay client, Home, Runs, and initial run inspector.
+See [the M8B foundation report](docs/milestone-8b-foundation.md).
 
 ## Core server
 
