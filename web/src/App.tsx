@@ -16,7 +16,7 @@ const navItems = [
   ["channels", "◉", "Channels"],
 ] as const;
 
-type View = typeof navItems[number][0];
+type View = typeof navItems[number][0] | "usage" | "settings";
 
 function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -64,7 +64,7 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [selectedRun, setSelectedRun] = useState<RunRecord | null>(null);
   const state = useControlReplay();
-  const title = navItems.find(([id]) => id === view)?.[2] ?? "Home";
+  const title = navItems.find(([id]) => id === view)?.[2] ?? (view === "usage" ? "Usage" : view === "settings" ? "Settings" : "Home");
   return <div className={`app ${theme}`}>
     <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
       <div className="brand-lockup sidebar-brand"><div className="brand-mark">✦</div><div><strong>GravityClaw</strong><span>Control Center</span></div></div>
@@ -74,18 +74,18 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
       </nav>
       <div className="nav-divider" />
       <div className="section-label">SYSTEM</div>
-      <button className="nav-item"><span className="nav-icon">◒</span><span>Usage</span></button>
-      <button className="nav-item"><span className="nav-icon">⚙</span><span>Settings</span></button>
+      <button className={`nav-item ${view === "usage" ? "active" : ""}`} onClick={() => { setView("usage"); setMobileNav(false); }}><span className="nav-icon">◒</span><span>Usage</span></button>
+      <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => { setView("settings"); setMobileNav(false); }}><span className="nav-icon">⚙</span><span>Settings</span></button>
       <div className="sidebar-bottom"><div className="connection-line"><span className={`status-dot ${state.connection === "connected" ? "green" : "amber"}`} />{state.connection === "connected" ? "Live" : state.connection}</div><button className="user-chip" onClick={() => void onLogout()}><span className="avatar">A</span><span>Ahmad</span><span>⌄</span></button></div>
     </aside>
     {mobileNav && <button className="scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
     <main className="main-shell">
-      <header className="topbar"><button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation">☰</button><div className="breadcrumb"><span>GravityClaw</span><span className="crumb-separator">/</span><strong>{title}</strong></div><div className="topbar-actions"><button className="palette-hint" onClick={() => setFocus(!focus)}><span>⌘</span><span>K</span></button><button className="icon-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Toggle theme">{theme === "dark" ? "☼" : "☾"}</button><span className="system-health"><span className="status-dot green" /> Healthy</span></div></header>
+      <header className="topbar"><button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation">☰</button><div className="breadcrumb"><span>GravityClaw</span><span className="crumb-separator">/</span><strong>{title}</strong></div><div className="topbar-actions"><button className="palette-hint" onClick={() => setFocus(!focus)} aria-label="Open command palette"><span>⌘</span><span>K</span></button><button className="icon-button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Toggle theme">{theme === "dark" ? "☼" : "☾"}</button><span className="system-health"><span className="status-dot green" /> Healthy</span></div></header>
       <div className="content-shell">
-        {view === "home" && <Home state={state} onRunSelect={setSelectedRun} />}
+        {view === "home" && <Home state={state} onRunSelect={setSelectedRun} onOpenRuns={() => setView("runs")} />}
         {view === "conversations" && <ConversationWorkspace state={state} focus={focus} onToggleFocus={() => setFocus(!focus)} onRunSelect={setSelectedRun} />}
         {view === "runs" && <Runs state={state} onRunSelect={setSelectedRun} />}
-        {view !== "home" && view !== "runs" && <ComingSoon title={title} />}
+        {view !== "home" && view !== "runs" && view !== "conversations" && <ComingSoon title={title} />}
       </div>
       {selectedRun && <RichRunInspector run={selectedRun} state={state} onClose={() => setSelectedRun(null)} />}
       <button className="command-fab" onClick={() => setFocus(!focus)} aria-label="Open command palette">⌘K</button>
@@ -94,14 +94,14 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
   </div>;
 }
 
-function Home({ state, onRunSelect }: { state: ControlState; onRunSelect: (run: RunRecord) => void }) {
+function Home({ state, onRunSelect, onOpenRuns }: { state: ControlState; onRunSelect: (run: RunRecord) => void; onOpenRuns: () => void }) {
   const snapshot = state.snapshot;
   const active = state.activeRuns.filter((run) => run.status === "running");
   const queued = state.activeRuns.filter((run) => run.status === "queued");
   return <div className="page fade-in"><div className="page-heading"><div><div className="eyebrow">SUNDAY · AUGUST 16, 2026</div><h1>Good evening, Ahmad <span className="wave">✦</span></h1><p className="muted">GravityClaw is keeping watch.</p></div><div className="live-pill"><span className="status-dot green" /> {state.connection === "connected" ? "Live" : "Reconnecting"}</div></div>
     <section className="stat-grid"><StatCard label="Active runs" value={String(active.length)} detail={active.length ? "Agent activity in progress" : "Nothing running"} accent="blue" /><StatCard label="Queued" value={String(queued.length)} detail={queued.length ? "Waiting for a conversation lock" : "Queue is clear"} accent="violet" /><StatCard label="Next heartbeat" value={nextHeartbeat(snapshot)} detail="Autonomous check" accent="amber" /></section>
-    <div className="content-grid"><section className="panel active-panel"><PanelHeader title="Active now" link={active.length ? "View all runs" : undefined} onLink={() => undefined} />{active.length === 0 && <EmptyState icon="◌" title="GravityClaw is quiet" detail="Start a conversation when you have something to build, inspect, or untangle." />}{active.map((run) => <RunRow key={run.id} run={run} onClick={() => onRunSelect(run)} />)}</section><section className="panel"><PanelHeader title="Up next" /><div className="schedule-row"><span className="schedule-icon">◷</span><div><strong>Main heartbeat</strong><span>Next evaluation in 18m</span></div><span className="schedule-state">Enabled</span></div><div className="schedule-row"><span className="schedule-icon subdued">◌</span><div><strong>Weekly dependency review</strong><span>Monday · 09:00 · gravityclaw</span></div><span className="schedule-state muted-text">Tomorrow</span></div></section></div>
-    <section className="panel activity-panel"><PanelHeader title="Recent activity" link="Open runs" onLink={() => undefined} /><div className="activity-list">{state.activity.slice(-8).reverse().map((event) => <ActivityRow key={event.id} event={event} />)}</div></section>
+    <div className="content-grid"><section className="panel active-panel"><PanelHeader title="Active now" link={active.length ? "View all runs" : undefined} onLink={onOpenRuns} />{active.length === 0 && <EmptyState icon="◌" title="GravityClaw is quiet" detail="Start a conversation when you have something to build, inspect, or untangle." />}{active.map((run) => <RunRow key={run.id} run={run} onClick={() => onRunSelect(run)} />)}</section><section className="panel"><PanelHeader title="Up next" /><div className="schedule-row"><span className="schedule-icon">◷</span><div><strong>Main heartbeat</strong><span>Next evaluation in 18m</span></div><span className="schedule-state">Enabled</span></div><div className="schedule-row"><span className="schedule-icon subdued">◌</span><div><strong>Weekly dependency review</strong><span>Monday · 09:00 · gravityclaw</span></div><span className="schedule-state muted-text">Tomorrow</span></div></section></div>
+    <section className="panel activity-panel"><PanelHeader title="Recent activity" link="Open runs" onLink={onOpenRuns} /><div className="activity-list">{state.activity.slice(-8).reverse().map((event) => <ActivityRow key={event.id} event={event} />)}</div></section>
   </div>;
 }
 
