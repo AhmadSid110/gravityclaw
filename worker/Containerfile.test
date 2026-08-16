@@ -1,0 +1,8 @@
+FROM docker.io/library/python:3.14-slim
+
+RUN useradd --create-home --uid 1000 worker
+COPY --chmod=0555 worker/entry.py /opt/gravityclaw/entry.py
+COPY --chmod=0555 worker/fake_agent.py /opt/gravityclaw/fake_agent.py
+USER worker
+WORKDIR /workspace
+ENTRYPOINT ["python", "/opt/gravityclaw/entry.py", "--"]

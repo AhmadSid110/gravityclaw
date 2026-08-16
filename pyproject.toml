@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gravityclaw"
+version = "0.3.0"
+description = "Persistent personal-agent orchestration powered by the official Antigravity CLI"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116,<1",
+    "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+]
+
+[project.scripts]
+gravityclaw-agy-probe = "gravityclaw.probe:main"
+gravityclaw-server = "gravityclaw.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gravityclaw"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
