@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .agy import _normalize_event
+from .capabilities import CapabilityManager
 from .context import RunContextCompiler
 from .event_bus import EventBus
 from .events import AgentEvent
@@ -46,6 +47,7 @@ class RunManager:
         event_bus: EventBus | None = None,
         poll_interval: float = 0.2,
         context_compiler: RunContextCompiler | None = None,
+        capability_manager: CapabilityManager | None = None,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -53,6 +55,7 @@ class RunManager:
         self.event_bus = event_bus or EventBus()
         self.poll_interval = poll_interval
         self.context_compiler = context_compiler
+        self.capability_manager = capability_manager
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._conversation_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -261,7 +264,13 @@ class RunManager:
                     claimed = self.store.prepare_run_context(
                         claimed.id, compiled.prompt, compiled.manifest()
                     )
+                if self.capability_manager is not None:
+                    claimed = self.capability_manager.prepare_run(
+                        claimed, conversation, workspace
+                    )
                 spec = self.spec_factory.build(claimed, conversation, workspace)
+                if self.capability_manager is not None:
+                    spec = self.capability_manager.apply_to_spec(spec, claimed)
                 LOGGER.debug("starting worker for run %s", claimed.id)
                 snapshot = await self.backend.start(spec)
                 LOGGER.debug(

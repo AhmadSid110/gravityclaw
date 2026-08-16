@@ -21,7 +21,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 RUN_STATUSES = (
     "queued",
     "running",
@@ -216,6 +216,7 @@ class Store:
                 connection.executescript(_CHANNEL_SCHEMA)
                 connection.executescript(_CONTEXT_SCHEMA)
                 connection.executescript(_SCHEDULER_SCHEMA)
+                connection.executescript(_CAPABILITY_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -256,10 +257,15 @@ class Store:
             if version == 5:
                 connection.executescript(_SCHEDULER_SCHEMA)
                 self._set_schema_version(connection, 6)
+                version = 6
+            if version == 6:
+                connection.executescript(_CAPABILITY_SCHEMA)
+                self._set_schema_version(connection, 7)
             connection.executescript(_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
             connection.executescript(_CONTEXT_SCHEMA)
             connection.executescript(_SCHEDULER_SCHEMA)
+            connection.executescript(_CAPABILITY_SCHEMA)
             self._ensure_message_index(connection)
 
     @staticmethod
@@ -688,6 +694,63 @@ class Store:
                 None,
             )
         return self.get_run(run_id)
+
+    def prepare_run_capabilities(
+        self, run_id: str, manifest: Mapping[str, Any], snapshot_path: str
+    ) -> RunRecord:
+        """Persist an immutable capability snapshot before a worker starts."""
+        if not snapshot_path:
+            raise ValueError("capability snapshot path must not be empty")
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"run not found: {run_id}")
+            if row["status"] != "running":
+                raise ValueError("capabilities can only be prepared for a running run")
+            request = json.loads(row["request_json"])
+            existing = request.get("capability_manifest")
+            if existing is not None:
+                if existing != dict(manifest) or request.get("capability_snapshot") != snapshot_path:
+                    raise ValueError("refusing to replace an existing capability snapshot")
+                return _run(row)
+            request["capability_manifest"] = dict(manifest)
+            request["capability_snapshot"] = snapshot_path
+            now = utc_now()
+            connection.execute(
+                "UPDATE runs SET request_json=?, version=version+1 WHERE id=?",
+                (json.dumps(request, ensure_ascii=False, separators=(",", ":")), run_id),
+            )
+            connection.execute(
+                """INSERT INTO capability_manifests(
+                   run_id, workspace_id, profile, manifest_json, manifest_hash,
+                   snapshot_path, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, str(manifest["workspace_id"]), str(manifest["profile"]),
+                    json.dumps(dict(manifest), ensure_ascii=False, separators=(",", ":")),
+                    str(manifest["manifest_hash"]), snapshot_path, now,
+                ),
+            )
+            self._append_event_tx(
+                connection, run_id, "run.capabilities_compiled", None,
+                {"manifest_hash": manifest["manifest_hash"],
+                 "skill_count": len(manifest.get("skills", [])),
+                 "mcp_count": len(manifest.get("mcp", []))}, None, None,
+            )
+        return self.get_run(run_id)
+
+    def get_capability_manifest(self, run_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT manifest_json FROM capability_manifests WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            run = self.get_run(run_id)
+            value = run.request.get("capability_manifest")
+            if not isinstance(value, dict):
+                raise KeyError(f"capability manifest not found: {run_id}")
+            return value
+        return json.loads(row["manifest_json"])
 
     def next_queued_runs(self) -> list[RunRecord]:
         with self._connect() as connection:
@@ -2103,4 +2166,74 @@ CREATE TABLE IF NOT EXISTS trigger_occurrences (
 );
 CREATE INDEX IF NOT EXISTS trigger_due ON trigger_occurrences(state, scheduled_for);
 CREATE INDEX IF NOT EXISTS trigger_schedule ON trigger_occurrences(schedule_id, scheduled_for);
+"""
+
+_CAPABILITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL CHECK(scope IN ('global','workspace')),
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    profiles_json TEXT NOT NULL DEFAULT '[]',
+    sha256 TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT 'unversioned',
+    validation_state TEXT NOT NULL CHECK(validation_state IN ('VALID','INVALID','MISSING')),
+    validation_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((scope='global' AND workspace_id IS NULL) OR (scope='workspace' AND workspace_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS skills_scope ON skills(scope, workspace_id, enabled);
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    transport TEXT NOT NULL CHECK(transport IN ('stdio','sse','http')),
+    command TEXT,
+    url TEXT,
+    args_json TEXT NOT NULL DEFAULT '[]',
+    env_refs_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    scope TEXT NOT NULL CHECK(scope IN ('global','workspace')),
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+    config_hash TEXT NOT NULL,
+    health_state TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK(health_state IN ('UNKNOWN','HEALTHY','DEGRADED','UNAVAILABLE','MISCONFIGURED')),
+    health_error TEXT,
+    last_checked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((transport='stdio' AND command IS NOT NULL AND url IS NULL) OR
+          (transport IN ('sse','http') AND url IS NOT NULL AND command IS NULL)),
+    CHECK((scope='global' AND workspace_id IS NULL) OR (scope='workspace' AND workspace_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS mcp_scope ON mcp_servers(scope, workspace_id, enabled);
+
+CREATE TABLE IF NOT EXISTS capability_bindings (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    capability_type TEXT NOT NULL CHECK(capability_type IN ('skill','mcp')),
+    capability_id TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(workspace_id, capability_type, capability_id, profile)
+);
+CREATE INDEX IF NOT EXISTS capability_binding_lookup
+    ON capability_bindings(workspace_id, capability_type, profile, enabled);
+
+CREATE TABLE IF NOT EXISTS capability_manifests (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    profile TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    snapshot_path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS capability_manifest_workspace
+    ON capability_manifests(workspace_id, created_at);
 """

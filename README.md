@@ -22,6 +22,10 @@ watermarks, summaries, artifact references, and hash invalidation. See the
 interval, cron, and heartbeat scheduling with leases, misfire policies,
 timezone-aware recurrence, and crash-safe trigger/run linking. See the
 [Milestone 6 report](docs/milestone-6.md).
+Milestone 7 adds workspace-scoped native AGY skills and MCP governance with
+immutable per-run capability snapshots, secret references, health state, and
+atomic configuration publication. See the
+[Milestone 7 report](docs/milestone-7.md).
 
 ## Core server
 

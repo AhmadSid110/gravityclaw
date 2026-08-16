@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from .channel_store import ChannelStore
 from .channel_runtime import ChannelRuntime
+from .capabilities import CapabilityManager
 from .context import ContextBuilder, RunContextCompiler
 from .event_bus import EventBus
 from .execution import (
@@ -39,6 +40,7 @@ class Settings:
     telegram_default_workspace: str | None = None
     telegram_api_root: str = "https://api.telegram.org"
     scheduler_poll_interval: float = 1.0
+    secret_dir: Path | None = field(default=None, repr=False)
 
     @property
     def database(self) -> Path:
@@ -65,6 +67,10 @@ class Settings:
             ),
             scheduler_poll_interval=float(
                 os.environ.get("GRAVITYCLAW_SCHEDULER_POLL_INTERVAL", "1.0")
+            ),
+            secret_dir=(
+                Path(os.environ["GRAVITYCLAW_SECRET_DIR"]).resolve()
+                if os.environ.get("GRAVITYCLAW_SECRET_DIR") else None
             ),
         )
 
@@ -130,6 +136,33 @@ class ScheduleCreate(BaseModel):
     notification_chat_id: str | None = None
 
 
+class SkillCreate(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    path: str
+    workspace_id: str | None = None
+    profiles: list[str] = Field(default_factory=list)
+    version: str = "unversioned"
+
+
+class MCPCreate(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200)
+    transport: str = Field(pattern="^(stdio|sse|http)$")
+    command: str | None = None
+    url: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env_refs: dict[str, str] = Field(default_factory=dict)
+    workspace_id: str | None = None
+
+
+class CapabilityBindingCreate(BaseModel):
+    workspace_id: str
+    capability_type: str = Field(pattern="^(skill|mcp)$")
+    capability_id: str
+    profile: str = "*"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings.from_environment()
     configured.home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -141,6 +174,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     store.initialize()
     memory = MemoryService(configured.home, store)
     channel_store = ChannelStore(store)
+    capabilities = CapabilityManager(
+        configured.home, store, secret_dir=configured.secret_dir
+    )
     context_compiler = RunContextCompiler(
         store, identity, memory, ContextBuilder()
     )
@@ -163,6 +199,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         bus,
         poll_interval=configured.poll_interval,
         context_compiler=context_compiler,
+        capability_manager=capabilities,
     )
     scheduler = Scheduler(
         store, manager, channel_store,
@@ -201,7 +238,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await scheduler.close()
             await manager.close()
 
-    app = FastAPI(title="GravityClaw Core", version="0.6.0", lifespan=lifespan)
+    app = FastAPI(title="GravityClaw Core", version="0.7.0", lifespan=lifespan)
     app.state.settings = configured
     app.state.store = store
     app.state.event_bus = bus
@@ -211,6 +248,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.channel_store = channel_store
     app.state.channel_runtime = channel_runtime
     app.state.scheduler = scheduler
+    app.state.capabilities = capabilities
     app.state.scheduler_reconciliation = {}
 
     @app.get("/health")
@@ -267,6 +305,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return asdict(store.delete_schedule(schedule_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/capabilities/skills", status_code=201)
+    async def register_skill(body: SkillCreate) -> dict[str, Any]:
+        try:
+            return _skill_json(capabilities.register_skill(
+                skill_id=body.id, name=body.name, path=Path(body.path),
+                workspace_id=body.workspace_id, profiles=body.profiles,
+                version=body.version,
+            ))
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/capabilities/skills")
+    async def list_skills(workspace_id: str | None = None) -> list[dict[str, Any]]:
+        return [_skill_json(item) for item in capabilities.list_skills(workspace_id)]
+
+    @app.post("/capabilities/skills/{skill_id}/enable")
+    async def enable_skill(skill_id: str) -> dict[str, Any]:
+        try:
+            return _skill_json(capabilities.set_skill_enabled(skill_id, True))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/capabilities/skills/{skill_id}/disable")
+    async def disable_skill(skill_id: str) -> dict[str, Any]:
+        try:
+            return _skill_json(capabilities.set_skill_enabled(skill_id, False))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/capabilities/mcp", status_code=201)
+    async def register_mcp(body: MCPCreate) -> dict[str, Any]:
+        try:
+            return _mcp_json(capabilities.register_mcp(**body.model_dump()))
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/capabilities/mcp")
+    async def list_mcp(workspace_id: str | None = None) -> list[dict[str, Any]]:
+        return [_mcp_json(item) for item in capabilities.list_mcp(workspace_id)]
+
+    @app.post("/capabilities/mcp/{server_id}/health")
+    async def health_mcp(server_id: str) -> dict[str, Any]:
+        try:
+            return _mcp_json(capabilities.health_check(server_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/capabilities/bind", status_code=204)
+    async def bind_capability(body: CapabilityBindingCreate) -> None:
+        try:
+            capabilities.bind(**body.model_dump())
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/workspaces", status_code=201)
     async def create_workspace(body: WorkspaceCreate) -> dict[str, Any]:
@@ -345,6 +437,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def inspect_run_context(run_id: str) -> dict[str, Any]:
         try:
             return store.get_context_manifest(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/runs/{run_id}/capabilities")
+    async def inspect_run_capabilities(run_id: str) -> dict[str, Any]:
+        try:
+            return store.get_capability_manifest(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -455,6 +554,16 @@ def _run_json(run: RunRecord) -> dict[str, Any]:
 
 def _event_json(event: PersistedEvent) -> dict[str, Any]:
     return asdict(event)
+
+
+def _skill_json(skill: Any) -> dict[str, Any]:
+    value = asdict(skill)
+    value["path"] = str(skill.path)
+    return value
+
+
+def _mcp_json(server: Any) -> dict[str, Any]:
+    return asdict(server)
 
 
 def _telegram_token_from_environment() -> str | None:

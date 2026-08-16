@@ -30,6 +30,7 @@ class ContainerSpec:
     memory: str = "2g"
     cpus: float = 2.0
     pids_limit: int = 256
+    mounts: tuple[tuple[Path, str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +112,8 @@ class PodmanExecutionBackend:
             command.extend(
                 ["--volume", f"{spec.home_volume}:/home/worker:rw,rprivate,U"]
             )
+        for source, target, mode in spec.mounts:
+            command.extend(["--volume", f"{source.resolve()}:{target}:{mode},rprivate"])
         for key, value in sorted(spec.environment.items()):
             command.extend(["--env", f"{key}={value}"])
         command.append(spec.image)
@@ -216,10 +219,27 @@ class PodmanExecutionBackend:
         )
         if completed.returncode != 0:
             raise RuntimeError(
-                f"command failed ({completed.returncode}): {command[0]} {command[1]}: "
+                f"command failed ({completed.returncode}): {_redact_command(command)}: "
                 + completed.stderr.decode("utf-8", errors="replace").strip()
             )
         return completed.stdout.decode("utf-8", errors="replace")
+
+
+def _redact_command(command: Sequence[str]) -> str:
+    values: list[str] = []
+    redact_next = False
+    for item in command:
+        if redact_next:
+            values.append("<redacted>")
+            redact_next = False
+        elif item in {"--env", "--env-file"}:
+            values.append(item)
+            redact_next = True
+        elif item.startswith("--env="):
+            values.append("--env=<redacted>")
+        else:
+            values.append(str(item))
+    return " ".join(values)
 
 
 class AgyContainerSpecFactory:

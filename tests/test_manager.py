@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from gravityclaw.context import RunContextCompiler
+from gravityclaw.capabilities import CapabilityManager
 from gravityclaw.execution import ContainerSpec, WorkerSnapshot
 from gravityclaw.identity import IdentityStore
 from gravityclaw.manager import RunManager
@@ -77,6 +78,7 @@ class ManagerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.compiler = RunContextCompiler(
             self.store, self.identity, self.memory
         )
+        self.capabilities = CapabilityManager(root, self.store)
         self.backend = SlowBackend()
         self.factory = Factory()
         self.manager = RunManager(
@@ -85,6 +87,7 @@ class ManagerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.factory,
             poll_interval=0.01,
             context_compiler=self.compiler,
+            capability_manager=self.capabilities,
         )
         await self.manager.start()
 
@@ -133,6 +136,10 @@ class ManagerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "run.context_compiled",
             [event.event_type for event in self.store.list_events(run.id)],
+        )
+        self.assertEqual(
+            self.store.get_capability_manifest(run.id)["workspace_id"],
+            self.conversation.workspace_id,
         )
         self.backend.release.set()
 
