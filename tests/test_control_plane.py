@@ -154,6 +154,35 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("raw-key", body)
         self.assertIn("<redacted>", body)
 
+    async def test_inspector_timeline_is_cursor_paginated(self) -> None:
+        from gravityclaw.events import AgentEvent
+
+        workspace = self.app.state.store.create_workspace("pagination", self.home / "pagination")
+        conversation = self.app.state.store.create_conversation(workspace.id)
+        run = self.app.state.store.submit_run(conversation.id, {"prompt": "paginate"})
+        for index in range(3):
+            self.app.state.store.append_event(run.id, AgentEvent("test.event", run.id, data={"index": index}))
+        first = await self.client.get(f"/api/v1/runs/{run.id}/timeline?limit=2", headers=self.headers)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(len(first.json()["events"]), 2)
+        self.assertTrue(first.json()["has_more"])
+        second = await self.client.get(
+            f"/api/v1/runs/{run.id}/timeline?after={first.json()['next_after']}&limit=2",
+            headers=self.headers,
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.json()["has_more"])
+        self.assertEqual(len(second.json()["events"]), 2)
+
+    async def test_inspector_optional_manifests_use_empty_success_responses(self) -> None:
+        workspace = self.app.state.store.create_workspace("optional", self.home / "optional")
+        conversation = self.app.state.store.create_conversation(workspace.id)
+        run = self.app.state.store.submit_run(conversation.id, {"prompt": "historical"})
+        context = await self.client.get(f"/api/v1/runs/{run.id}/context", headers=self.headers)
+        capabilities = await self.client.get(f"/api/v1/runs/{run.id}/capabilities", headers=self.headers)
+        self.assertEqual(context.status_code, 204)
+        self.assertEqual(capabilities.status_code, 204)
+
     async def test_m8b6_automation_run_now_is_idempotent_and_capabilities_are_scoped(self) -> None:
         store = self.app.state.store
         workspace = store.create_workspace("automation", self.home / "automation")

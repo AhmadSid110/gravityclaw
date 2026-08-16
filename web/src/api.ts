@@ -11,6 +11,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function requestOptional<T>(path: string): Promise<T | null> {
+  const response = await fetch(path, { credentials: "include" });
+  if (response.status === 204 || response.status === 404) return null;
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "request failed");
+    throw new Error(`${response.status}: ${detail || response.statusText}`);
+  }
+  return response.json() as Promise<T>;
+}
+
 export async function getSession(): Promise<{ authenticated: boolean }> {
   return request("/auth/session");
 }
@@ -71,8 +81,8 @@ export async function cancelRun(run: RunRecord): Promise<RunRecord> {
   });
 }
 
-export async function getTimeline(runId: string): Promise<{ run: RunRecord; events: PersistedEvent[] }> {
-  return request(`/api/v1/runs/${encodeURIComponent(runId)}/timeline`);
+export async function getTimeline(runId: string, after = 0, limit = 1000): Promise<{ run: RunRecord; events: PersistedEvent[]; has_more: boolean; next_after: number }> {
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}/timeline?after=${after}&limit=${limit}`);
 }
 
 export async function getRunArtifacts(runId: string): Promise<Artifact[]> {
@@ -83,12 +93,12 @@ export async function getArtifact(artifactId: string): Promise<Artifact> {
   return request(`/api/v1/artifacts/${encodeURIComponent(artifactId)}`);
 }
 
-export async function getRunContext(runId: string): Promise<Record<string, unknown>> {
-  return request(`/api/v1/runs/${encodeURIComponent(runId)}/context`);
+export async function getRunContext(runId: string): Promise<Record<string, unknown> | null> {
+  return requestOptional(`/api/v1/runs/${encodeURIComponent(runId)}/context`);
 }
 
-export async function getRunCapabilities(runId: string): Promise<Record<string, unknown>> {
-  return request(`/api/v1/runs/${encodeURIComponent(runId)}/capabilities`);
+export async function getRunCapabilities(runId: string): Promise<Record<string, unknown> | null> {
+  return requestOptional(`/api/v1/runs/${encodeURIComponent(runId)}/capabilities`);
 }
 
 export async function getIdentity(): Promise<IdentityDocument[]> {

@@ -13,8 +13,8 @@
 - M8B.4 — Rich Run and Subagent Inspector: checkpointed
 - M8B.5 — Context and Memory Studio: verified
 - M8B.6 — Automations and Capabilities: checkpointed
-- M8B.7 — UI polish and accessibility: implemented, verification pending
-- M8B.8 — Full browser/reconnect/performance gate: planned
+- M8B.7 — UI polish and accessibility: verified
+- M8B.8 — Full browser/reconnect/performance gate: verified
 - M9 — Hardening and packaging: planned
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,

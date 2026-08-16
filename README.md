@@ -47,6 +47,9 @@ run snapshots. See [the M8B.6 report](docs/milestone-8b6.md).
 M8B.7 freezes features and polishes the existing console with shared status and
 error states, responsive behavior, keyboard focus, reduced-motion support, and
 streaming-oriented render safeguards. See [the M8B.7 report](docs/milestone-8b7.md).
+M8B.8 completes the browser torture, reconnect, crash-recovery, redaction, and
+10k-event performance gate. Timeline history is cursor-paginated so large runs
+remain navigable without flooding the DOM. See [the M8B.8 report](docs/milestone-8b8.md).
 
 ## Core server
 

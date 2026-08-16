@@ -603,18 +603,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/runs/{run_id}/context")
     @app.get("/api/v1/runs/{run_id}/context")
-    async def inspect_run_context(run_id: str) -> dict[str, Any]:
+    async def inspect_run_context(run_id: str) -> Any:
         try:
+            store.get_run(run_id)
             return store.get_context_manifest(run_id)
         except KeyError as exc:
+            if "manifest not found" in str(exc):
+                return Response(status_code=204)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/runs/{run_id}/capabilities")
     @app.get("/api/v1/runs/{run_id}/capabilities")
-    async def inspect_run_capabilities(run_id: str) -> dict[str, Any]:
+    async def inspect_run_capabilities(run_id: str) -> Any:
         try:
+            store.get_run(run_id)
             return store.get_capability_manifest(run_id)
         except KeyError as exc:
+            if "manifest not found" in str(exc):
+                return Response(status_code=204)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/conversations/{conversation_id}/context-watermark")
@@ -1018,14 +1024,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )[-limit:]]
 
     @app.get("/api/v1/runs/{run_id}/timeline")
-    async def control_run_timeline(run_id: str, after: int = Query(default=0, ge=0)) -> dict[str, Any]:
+    async def control_run_timeline(
+        run_id: str,
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=1000, ge=1, le=5000),
+    ) -> dict[str, Any]:
         try:
             run = store.get_run(run_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"run": _run_json(run), "events": [
-            _event_json(item) for item in store.list_events(run_id, after_sequence=after)
-        ]}
+        events = store.list_events(run_id, after_sequence=after, limit=limit + 1)
+        has_more = len(events) > limit
+        events = events[:limit]
+        return {
+            "run": _run_json(run),
+            "events": [_event_json(item) for item in events],
+            "has_more": has_more,
+            "next_after": events[-1].sequence if events else after,
+        }
 
     @app.get("/api/v1/runs/{run_id}/artifacts")
     async def control_run_artifacts(run_id: str) -> list[dict[str, Any]]:
