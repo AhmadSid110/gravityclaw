@@ -26,6 +26,9 @@ Milestone 7 adds workspace-scoped native AGY skills and MCP governance with
 immutable per-run capability snapshots, secret references, health state, and
 atomic configuration publication. See the
 [Milestone 7 report](docs/milestone-7.md).
+Milestone 8A adds the authenticated control-plane contract, durable read
+models, global event replay, optimistic schedule mutations, and redacted audit
+records. See [the M8A report](docs/milestone-8a.md).
 
 ## Core server
 
@@ -39,7 +42,8 @@ GRAVITYCLAW_HOME="$PWD/.runtime" \
 ```
 
 The server binds `127.0.0.1:8787` by default. Do not expose it publicly; channel
-authentication belongs to a later milestone.
+authentication belongs to the channel layer, and the control plane should also
+be configured with `GRAVITYCLAW_CONTROL_TOKEN_FILE` before remote access.
 
 ## Local protocol probe
 

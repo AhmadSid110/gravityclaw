@@ -21,7 +21,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 RUN_STATUSES = (
     "queued",
     "running",
@@ -169,11 +169,29 @@ class ScheduleRecord:
     notification_channel: str | None
     notification_chat_id: str | None
     generation: int
+    version: int
     next_run_at: str | None
     last_run_at: str | None
     created_at: str
     updated_at: str
     deleted_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRecord:
+    id: int
+    actor: str
+    action: str
+    resource_type: str
+    resource_id: str | None
+    expected_version: int | None
+    resulting_version: int | None
+    payload: dict[str, Any]
+    created_at: str
+
+
+class VersionConflict(ValueError):
+    """A control-plane mutation was based on stale resource state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +235,7 @@ class Store:
                 connection.executescript(_CONTEXT_SCHEMA)
                 connection.executescript(_SCHEDULER_SCHEMA)
                 connection.executescript(_CAPABILITY_SCHEMA)
+                connection.executescript(_CONTROL_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -261,11 +280,24 @@ class Store:
             if version == 6:
                 connection.executescript(_CAPABILITY_SCHEMA)
                 self._set_schema_version(connection, 7)
+                version = 7
+            if version == 7:
+                columns = {
+                    str(item["name"])
+                    for item in connection.execute("PRAGMA table_info(schedules)").fetchall()
+                }
+                if "version" not in columns:
+                    connection.execute(
+                        "ALTER TABLE schedules ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+                    )
+                connection.executescript(_CONTROL_SCHEMA)
+                self._set_schema_version(connection, 8)
             connection.executescript(_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
             connection.executescript(_CONTEXT_SCHEMA)
             connection.executescript(_SCHEDULER_SCHEMA)
             connection.executescript(_CAPABILITY_SCHEMA)
+            connection.executescript(_CONTROL_SCHEMA)
             self._ensure_message_index(connection)
 
     @staticmethod
@@ -1044,6 +1076,30 @@ class Store:
             ).fetchall()
         return [_run(row) for row in rows]
 
+    def list_conversations(
+        self, *, workspace_id: str | None = None, channel: str | None = None,
+        limit: int = 200,
+    ) -> list[Conversation]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if workspace_id is not None:
+            clauses.append("workspace_id=?")
+            parameters.append(workspace_id)
+        if channel is not None:
+            clauses.append("channel=?")
+            parameters.append(channel)
+        parameters.append(limit)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM conversations" + where +
+                " ORDER BY updated_at DESC LIMIT ?", parameters
+            ).fetchall()
+        return [_conversation(row) for row in rows]
+
+    def list_messages(self, conversation_id: str, *, limit: int = 200) -> list[Message]:
+        return self.recent_messages(conversation_id, limit=limit)
+
     # ------------------------------------------------------------------
     # Durable scheduling state. The scheduler never edits runs directly
     # except through submit_scheduled_run(), which atomically links a claimed
@@ -1089,7 +1145,7 @@ class Store:
             expression.strip(), timezone, prompt.strip(), context_profile,
             workspace_id, conversation_policy, concurrency_policy, misfire_policy,
             int(misfire_grace_seconds), notification_policy, notification_channel,
-            notification_chat_id, 1, next_run_at, None, now, now, None,
+            notification_chat_id, 1, 1, next_run_at, None, now, now, None,
         )
         with self._connect() as connection:
             if connection.execute(
@@ -1102,15 +1158,15 @@ class Store:
                     context_profile, workspace_id, conversation_policy,
                     concurrency_policy, misfire_policy, misfire_grace_seconds,
                     notification_policy, notification_channel, notification_chat_id,
-                    generation, next_run_at, created_at, updated_at
-                ) VALUES(?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    generation, version, next_run_at, created_at, updated_at
+                ) VALUES(?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (record.id, record.name, record.trigger_type, record.expression,
                  record.timezone, record.prompt, record.context_profile,
                  record.workspace_id, record.conversation_policy,
                  record.concurrency_policy, record.misfire_policy,
                  record.misfire_grace_seconds, record.notification_policy,
                  record.notification_channel, record.notification_chat_id,
-                 record.generation,
+                 record.generation, record.version,
                  record.next_run_at, record.created_at, record.updated_at),
             )
         return record
@@ -1135,27 +1191,57 @@ class Store:
             ).fetchall()
         return [_schedule(row) for row in rows]
 
-    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> ScheduleRecord:
+    def set_schedule_enabled(
+        self, schedule_id: str, enabled: bool, *, expected_version: int | None = None
+    ) -> ScheduleRecord:
         now = utc_now()
         with self._connect() as connection:
+            predicates = "id=? AND deleted_at IS NULL"
+            parameters: list[Any] = [1 if enabled else 0, now, schedule_id]
+            if expected_version is not None:
+                predicates += " AND version=?"
+                parameters.append(expected_version)
             cursor = connection.execute(
-                "UPDATE schedules SET enabled=?, updated_at=? "
-                "WHERE id=? AND deleted_at IS NULL",
-                (1 if enabled else 0, now, schedule_id),
+                "UPDATE schedules SET enabled=?, version=version+1, updated_at=? "
+                f"WHERE {predicates}",
+                parameters,
             )
             if cursor.rowcount != 1:
+                if expected_version is not None:
+                    try:
+                        current = self.get_schedule(schedule_id)
+                    except KeyError:
+                        raise
+                    raise VersionConflict(
+                        f"schedule {schedule_id} version is {current.version}, expected {expected_version}"
+                    )
                 raise KeyError(f"schedule not found: {schedule_id}")
         return self.get_schedule(schedule_id)
 
-    def delete_schedule(self, schedule_id: str) -> ScheduleRecord:
+    def delete_schedule(
+        self, schedule_id: str, *, expected_version: int | None = None
+    ) -> ScheduleRecord:
         now = utc_now()
         with self._connect() as connection:
+            predicates = "id=? AND deleted_at IS NULL"
+            parameters: list[Any] = [now, now, schedule_id]
+            if expected_version is not None:
+                predicates += " AND version=?"
+                parameters.append(expected_version)
             cursor = connection.execute(
-                "UPDATE schedules SET enabled=0, deleted_at=?, updated_at=? "
-                "WHERE id=? AND deleted_at IS NULL",
-                (now, now, schedule_id),
+                "UPDATE schedules SET enabled=0, version=version+1, deleted_at=?, updated_at=? "
+                f"WHERE {predicates}",
+                parameters,
             )
             if cursor.rowcount != 1:
+                if expected_version is not None:
+                    try:
+                        current = self.get_schedule(schedule_id, include_deleted=True)
+                    except KeyError:
+                        raise
+                    raise VersionConflict(
+                        f"schedule {schedule_id} version is {current.version}, expected {expected_version}"
+                    )
                 raise KeyError(f"schedule not found: {schedule_id}")
             connection.execute(
                 "UPDATE trigger_occurrences SET state='SKIPPED', decision_reason=? "
@@ -1186,7 +1272,8 @@ class Store:
             connection.execute(
                 """UPDATE schedules SET generation=generation+1,
                    next_run_at=COALESCE(?, next_run_at),
-                   enabled=COALESCE(?, enabled), updated_at=? WHERE id=?""",
+                   enabled=COALESCE(?, enabled), version=version+1,
+                   updated_at=? WHERE id=?""",
                 (next_run_at, None if enabled is None else int(enabled), now, schedule_id),
             )
         return self.get_schedule(schedule_id)
@@ -1524,6 +1611,52 @@ class Store:
             ).fetchall()
         return [_event(row) for row in rows]
 
+    def list_events_global(self, *, after_id: int = 0, limit: int = 1000) -> list[PersistedEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?",
+                (after_id, limit),
+            ).fetchall()
+        return [_event(row) for row in rows]
+
+    def latest_event_id(self) -> int:
+        with self._connect() as connection:
+            return int(connection.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0])
+
+    def record_audit(
+        self, *, actor: str, action: str, resource_type: str,
+        resource_id: str | None = None, expected_version: int | None = None,
+        resulting_version: int | None = None, payload: Mapping[str, Any] | None = None,
+    ) -> AuditRecord:
+        clean = _redact_audit(dict(payload or {}))
+        created = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO control_audit(
+                   actor, action, resource_type, resource_id, expected_version,
+                   resulting_version, payload_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                (actor, action, resource_type, resource_id, expected_version,
+                 resulting_version, json.dumps(clean, ensure_ascii=False, separators=(",", ":")), created),
+            )
+            audit_id = int(cursor.lastrowid)
+        return AuditRecord(audit_id, actor, action, resource_type, resource_id,
+                           expected_version, resulting_version, clean, created)
+
+    def list_audit(self, *, after_id: int = 0, limit: int = 200) -> list[AuditRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM control_audit WHERE id>? ORDER BY id LIMIT ?",
+                (after_id, limit),
+            ).fetchall()
+        return [
+            AuditRecord(int(row["id"]), row["actor"], row["action"],
+                        row["resource_type"], row["resource_id"],
+                        row["expected_version"], row["resulting_version"],
+                        json.loads(row["payload_json"]), row["created_at"])
+            for row in rows
+        ]
+
     def add_memory(
         self,
         content: str,
@@ -1782,7 +1915,8 @@ def _schedule(row: sqlite3.Row) -> ScheduleRecord:
         notification_policy=row["notification_policy"],
         notification_channel=row["notification_channel"],
         notification_chat_id=row["notification_chat_id"],
-        generation=int(row["generation"]), next_run_at=row["next_run_at"],
+        generation=int(row["generation"]), version=int(row["version"]),
+        next_run_at=row["next_run_at"],
         last_run_at=row["last_run_at"], created_at=row["created_at"],
         updated_at=row["updated_at"], deleted_at=row["deleted_at"],
     )
@@ -1804,6 +1938,18 @@ def _trigger(row: sqlite3.Row) -> TriggerRecord:
 def _add_seconds(value: str, seconds: int) -> str:
     return (datetime.fromisoformat(value).astimezone(UTC) +
             timedelta(seconds=seconds)).isoformat()
+
+
+def _redact_audit(value: Any, *, key: str = "") -> Any:
+    """Keep control-plane audit useful without allowing secret material in it."""
+    lowered = key.lower()
+    if any(marker in lowered for marker in ("token", "secret", "password", "credential", "api_key")):
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        return {str(k): _redact_audit(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_audit(item, key=key) for item in value]
+    return value
 
 
 _SCHEMA = """
@@ -2131,6 +2277,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     notification_channel TEXT,
     notification_chat_id TEXT,
     generation INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL DEFAULT 1,
     next_run_at TEXT,
     last_run_at TEXT,
     created_at TEXT NOT NULL,
@@ -2236,4 +2383,21 @@ CREATE TABLE IF NOT EXISTS capability_manifests (
 );
 CREATE INDEX IF NOT EXISTS capability_manifest_workspace
     ON capability_manifests(workspace_id, created_at);
+"""
+
+_CONTROL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS control_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT,
+    expected_version INTEGER,
+    resulting_version INTEGER,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_audit_created ON control_audit(created_at, id);
+CREATE INDEX IF NOT EXISTS control_audit_resource
+    ON control_audit(resource_type, resource_id, id);
 """

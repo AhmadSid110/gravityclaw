@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import hmac
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .channel_store import ChannelStore
@@ -25,7 +27,7 @@ from .identity import IdentityStore
 from .manager import RunManager
 from .memory import MemoryService
 from .scheduler import Scheduler
-from .store import PersistedEvent, RunRecord, Store, TERMINAL_RUN_STATUSES
+from .store import PersistedEvent, RunRecord, Store, TERMINAL_RUN_STATUSES, VersionConflict
 from .telegram import TelegramAdapter
 
 
@@ -41,6 +43,7 @@ class Settings:
     telegram_api_root: str = "https://api.telegram.org"
     scheduler_poll_interval: float = 1.0
     secret_dir: Path | None = field(default=None, repr=False)
+    control_token: str | None = field(default=None, repr=False)
 
     @property
     def database(self) -> Path:
@@ -72,6 +75,7 @@ class Settings:
                 Path(os.environ["GRAVITYCLAW_SECRET_DIR"]).resolve()
                 if os.environ.get("GRAVITYCLAW_SECRET_DIR") else None
             ),
+            control_token=_control_token_from_environment(),
         )
 
 
@@ -163,6 +167,14 @@ class CapabilityBindingCreate(BaseModel):
     profile: str = "*"
 
 
+class VersionedMutation(BaseModel):
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class RunCancel(BaseModel):
+    expected_version: int | None = Field(default=None, ge=1)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or Settings.from_environment()
     configured.home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -238,7 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await scheduler.close()
             await manager.close()
 
-    app = FastAPI(title="GravityClaw Core", version="0.7.0", lifespan=lifespan)
+    app = FastAPI(title="GravityClaw Control Plane", version="0.8.0", lifespan=lifespan)
     app.state.settings = configured
     app.state.store = store
     app.state.event_bus = bus
@@ -249,7 +261,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.channel_runtime = channel_runtime
     app.state.scheduler = scheduler
     app.state.capabilities = capabilities
+    app.state.reconciliation = {}
     app.state.scheduler_reconciliation = {}
+    app.state.control_auth_enabled = configured.control_token is not None
+
+    @app.middleware("http")
+    async def control_auth(request: Request, call_next: Any) -> Any:
+        public = request.url.path in {"/health", "/docs", "/openapi.json", "/redoc"}
+        if configured.control_token is not None and not public:
+            provided = _bearer_token(request.headers.get("authorization"))
+            if provided is None or not hmac.compare_digest(provided, configured.control_token):
+                return JSONResponse(
+                    {"detail": "control-plane authentication required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            request.state.actor = "control-token"
+        else:
+            request.state.actor = "local"
+        return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -262,14 +292,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/schedules", status_code=201)
-    async def create_schedule(body: ScheduleCreate) -> dict[str, Any]:
+    async def create_schedule(body: ScheduleCreate, request: Request) -> dict[str, Any]:
         values = body.model_dump()
         if values.get("context_profile") is None:
             values["context_profile"] = (
                 "heartbeat" if body.trigger_type == "heartbeat" else "scheduled"
             )
         try:
-            return asdict(scheduler.create_schedule(**values))
+            record = scheduler.create_schedule(**values)
+            app.state.store.record_audit(
+                actor=request.state.actor, action="schedule.create",
+                resource_type="schedule", resource_id=record.id,
+                resulting_version=record.version,
+                payload={"name": record.name, "trigger_type": record.trigger_type},
+            )
+            return asdict(record)
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -286,34 +323,65 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [asdict(item) for item in store.list_triggers(schedule_id=schedule_id)]
 
     @app.post("/schedules/{schedule_id}/enable")
-    async def enable_schedule(schedule_id: str) -> dict[str, Any]:
+    async def enable_schedule(
+        schedule_id: str, request: Request, body: VersionedMutation = VersionedMutation()
+    ) -> dict[str, Any]:
         try:
-            return asdict(store.set_schedule_enabled(schedule_id, True))
-        except KeyError as exc:
+            record = store.set_schedule_enabled(schedule_id, True, expected_version=body.expected_version)
+            store.record_audit(actor=request.state.actor, action="schedule.enable",
+                               resource_type="schedule", resource_id=schedule_id,
+                               expected_version=body.expected_version,
+                               resulting_version=record.version)
+            return asdict(record)
+        except (KeyError, VersionConflict) as exc:
+            if isinstance(exc, VersionConflict):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/schedules/{schedule_id}/disable")
-    async def disable_schedule(schedule_id: str) -> dict[str, Any]:
+    async def disable_schedule(
+        schedule_id: str, request: Request, body: VersionedMutation = VersionedMutation()
+    ) -> dict[str, Any]:
         try:
-            return asdict(store.set_schedule_enabled(schedule_id, False))
-        except KeyError as exc:
+            record = store.set_schedule_enabled(schedule_id, False, expected_version=body.expected_version)
+            store.record_audit(actor=request.state.actor, action="schedule.disable",
+                               resource_type="schedule", resource_id=schedule_id,
+                               expected_version=body.expected_version,
+                               resulting_version=record.version)
+            return asdict(record)
+        except (KeyError, VersionConflict) as exc:
+            if isinstance(exc, VersionConflict):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.delete("/schedules/{schedule_id}")
-    async def delete_schedule(schedule_id: str) -> dict[str, Any]:
+    async def delete_schedule(
+        schedule_id: str, request: Request, body: VersionedMutation = VersionedMutation()
+    ) -> dict[str, Any]:
         try:
-            return asdict(store.delete_schedule(schedule_id))
-        except KeyError as exc:
+            record = store.delete_schedule(schedule_id, expected_version=body.expected_version)
+            store.record_audit(actor=request.state.actor, action="schedule.delete",
+                               resource_type="schedule", resource_id=schedule_id,
+                               expected_version=body.expected_version,
+                               resulting_version=record.version)
+            return asdict(record)
+        except (KeyError, VersionConflict) as exc:
+            if isinstance(exc, VersionConflict):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/capabilities/skills", status_code=201)
-    async def register_skill(body: SkillCreate) -> dict[str, Any]:
+    async def register_skill(body: SkillCreate, request: Request) -> dict[str, Any]:
         try:
-            return _skill_json(capabilities.register_skill(
+            skill = capabilities.register_skill(
                 skill_id=body.id, name=body.name, path=Path(body.path),
                 workspace_id=body.workspace_id, profiles=body.profiles,
                 version=body.version,
-            ))
+            )
+            store.record_audit(actor=request.state.actor, action="skill.register",
+                               resource_type="skill", resource_id=body.id,
+                               payload={"name": body.name, "workspace_id": body.workspace_id})
+            return _skill_json(skill)
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -322,23 +390,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_skill_json(item) for item in capabilities.list_skills(workspace_id)]
 
     @app.post("/capabilities/skills/{skill_id}/enable")
-    async def enable_skill(skill_id: str) -> dict[str, Any]:
+    async def enable_skill(skill_id: str, request: Request) -> dict[str, Any]:
         try:
-            return _skill_json(capabilities.set_skill_enabled(skill_id, True))
+            skill = capabilities.set_skill_enabled(skill_id, True)
+            store.record_audit(actor=request.state.actor, action="skill.enable",
+                               resource_type="skill", resource_id=skill_id)
+            return _skill_json(skill)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/capabilities/skills/{skill_id}/disable")
-    async def disable_skill(skill_id: str) -> dict[str, Any]:
+    async def disable_skill(skill_id: str, request: Request) -> dict[str, Any]:
         try:
-            return _skill_json(capabilities.set_skill_enabled(skill_id, False))
+            skill = capabilities.set_skill_enabled(skill_id, False)
+            store.record_audit(actor=request.state.actor, action="skill.disable",
+                               resource_type="skill", resource_id=skill_id)
+            return _skill_json(skill)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/capabilities/mcp", status_code=201)
-    async def register_mcp(body: MCPCreate) -> dict[str, Any]:
+    async def register_mcp(body: MCPCreate, request: Request) -> dict[str, Any]:
         try:
-            return _mcp_json(capabilities.register_mcp(**body.model_dump()))
+            server = capabilities.register_mcp(**body.model_dump())
+            store.record_audit(actor=request.state.actor, action="mcp.register",
+                               resource_type="mcp", resource_id=body.id,
+                               payload={"name": body.name, "transport": body.transport,
+                                        "workspace_id": body.workspace_id,
+                                        "env_refs": body.env_refs})
+            return _mcp_json(server)
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -347,45 +427,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_mcp_json(item) for item in capabilities.list_mcp(workspace_id)]
 
     @app.post("/capabilities/mcp/{server_id}/health")
-    async def health_mcp(server_id: str) -> dict[str, Any]:
+    async def health_mcp(server_id: str, request: Request) -> dict[str, Any]:
         try:
-            return _mcp_json(capabilities.health_check(server_id))
+            server = capabilities.health_check(server_id)
+            store.record_audit(actor=request.state.actor, action="mcp.health_check",
+                               resource_type="mcp", resource_id=server_id,
+                               payload={"health_state": server.health_state})
+            return _mcp_json(server)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/capabilities/bind", status_code=204)
-    async def bind_capability(body: CapabilityBindingCreate) -> None:
+    async def bind_capability(body: CapabilityBindingCreate, request: Request) -> None:
         try:
             capabilities.bind(**body.model_dump())
+            store.record_audit(actor=request.state.actor, action="capability.bind",
+                               resource_type=body.capability_type,
+                               resource_id=body.capability_id,
+                               payload={"workspace_id": body.workspace_id, "profile": body.profile})
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/workspaces", status_code=201)
-    async def create_workspace(body: WorkspaceCreate) -> dict[str, Any]:
+    async def create_workspace(body: WorkspaceCreate, request: Request) -> dict[str, Any]:
         try:
             record = store.create_workspace(body.name, Path(body.path))
+            store.record_audit(actor=request.state.actor, action="workspace.create",
+                               resource_type="workspace", resource_id=record.id,
+                               payload={"name": record.name, "path": str(record.path)})
             return {**asdict(record), "path": str(record.path)}
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/conversations", status_code=201)
-    async def create_conversation(body: ConversationCreate) -> dict[str, Any]:
+    async def create_conversation(body: ConversationCreate, request: Request) -> dict[str, Any]:
         try:
-            return asdict(
-                store.create_conversation(
+            record = store.create_conversation(
                     body.workspace_id,
                     channel=body.channel,
                     channel_key=body.channel_key,
                     title=body.title,
                 )
-            )
+            store.record_audit(actor=request.state.actor, action="conversation.create",
+                               resource_type="conversation", resource_id=record.id,
+                               payload={"workspace_id": record.workspace_id, "channel": record.channel})
+            return asdict(record)
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/workspace-aliases", status_code=201)
-    async def set_workspace_alias(body: WorkspaceAliasCreate) -> dict[str, str]:
+    async def set_workspace_alias(body: WorkspaceAliasCreate, request: Request) -> dict[str, str]:
         try:
             channel_store.set_workspace_alias(body.alias, body.workspace_id)
+            store.record_audit(actor=request.state.actor, action="workspace_alias.set",
+                               resource_type="workspace_alias", resource_id=body.alias.lower(),
+                               payload={"workspace_id": body.workspace_id})
             return {"alias": body.alias.lower(), "workspace_id": body.workspace_id}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -395,10 +491,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return channel_store.list_workspace_aliases()
 
     @app.post("/conversations/{conversation_id}/runs", status_code=202)
-    async def submit_run(conversation_id: str, body: RunCreate) -> dict[str, Any]:
-        request = body.model_dump(exclude_none=True)
+    async def submit_run(conversation_id: str, body: RunCreate, request: Request) -> dict[str, Any]:
+        request_data = body.model_dump(exclude_none=True)
         try:
-            return _run_json(await manager.submit(conversation_id, request))
+            record = await manager.submit(conversation_id, request_data)
+            store.record_audit(actor=request.state.actor, action="run.submit",
+                               resource_type="run", resource_id=record.id,
+                               resulting_version=record.version,
+                               payload={"conversation_id": conversation_id})
+            return _run_json(record)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -475,9 +576,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/runs/{run_id}/cancel")
-    async def cancel_run(run_id: str) -> dict[str, Any]:
+    async def cancel_run(
+        run_id: str, request: Request, body: RunCancel = RunCancel()
+    ) -> dict[str, Any]:
         try:
-            return _run_json(await manager.cancel(run_id))
+            current = store.get_run(run_id)
+            if body.expected_version is not None and current.version != body.expected_version:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"run {run_id} version is {current.version}, expected {body.expected_version}",
+                )
+            result = await manager.cancel(run_id)
+            store.record_audit(actor=request.state.actor, action="run.cancel",
+                               resource_type="run", resource_id=run_id,
+                               expected_version=body.expected_version,
+                               resulting_version=result.version)
+            return _run_json(result)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -493,7 +607,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.post("/memories", status_code=201)
-    async def record_memory(body: MemoryCreate) -> dict[str, str]:
+    async def record_memory(body: MemoryCreate, request: Request) -> dict[str, str]:
         try:
             memory_id = memory.record_episode(
                 body.content,
@@ -501,6 +615,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 conversation_id=body.conversation_id,
                 confidence=body.confidence,
             )
+            store.record_audit(actor=request.state.actor, action="memory.record",
+                               resource_type="memory", resource_id=memory_id,
+                               payload={"source": body.source, "conversation_id": body.conversation_id})
             return {"id": memory_id}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -512,10 +629,123 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> list[dict[str, Any]]:
         return memory.retrieve(q, limit=limit)
 
+    # ------------------------------------------------------------------
+    # Versioned control-plane read models. These are deliberately composed
+    # from the existing durable stores; the UI never gets a parallel state DB.
+
+    def control_snapshot(*, include_activity: bool = True) -> dict[str, Any]:
+        runs = store.list_runs()
+        schedules = store.list_schedules()
+        events = store.list_events_global(after_id=max(0, store.latest_event_id() - 50), limit=50)
+        snapshot = {
+            "api_version": "2026-08-16",
+            "health": {
+                "status": "ok",
+                "mode": configured.mode,
+                "telegram": {"enabled": channel_runtime is not None},
+                "auth": {"enabled": configured.control_token is not None},
+            },
+            "counts": {
+                "runs": len(runs),
+                "active_runs": sum(item.status == "running" for item in runs),
+                "queued_runs": sum(item.status == "queued" for item in runs),
+                "schedules": len(schedules),
+            },
+            "active_runs": [_run_json(item) for item in runs if item.status in {"running", "queued"}],
+            "next_schedules": [asdict(item) for item in schedules if item.enabled][:10],
+        }
+        if include_activity:
+            snapshot["activity"] = [
+                {"cursor": item.id, "event": _event_json(item)} for item in events
+            ]
+        return snapshot
+
+    @app.get("/api/v1/control/home")
+    async def control_home() -> dict[str, Any]:
+        return control_snapshot()
+
+    @app.get("/api/v1/workspaces")
+    async def control_workspaces() -> list[dict[str, Any]]:
+        return [{**asdict(item), "path": str(item.path)} for item in store.list_workspaces()]
+
+    @app.get("/api/v1/conversations")
+    async def control_conversations(
+        workspace_id: str | None = None, channel: str | None = None,
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
+        return [asdict(item) for item in store.list_conversations(
+            workspace_id=workspace_id, channel=channel, limit=limit
+        )]
+
+    @app.get("/api/v1/conversations/{conversation_id}")
+    async def control_conversation(conversation_id: str, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+        try:
+            conversation = store.get_conversation(conversation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "conversation": asdict(conversation),
+            "messages": [asdict(item) for item in store.list_messages(conversation_id, limit=limit)],
+            "runs": [_run_json(item) for item in store.list_runs(conversation_id=conversation_id)],
+        }
+
+    @app.get("/api/v1/runs")
+    async def control_runs(
+        status: str | None = None, conversation_id: str | None = None,
+        limit: int = Query(default=200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
+        statuses = (status,) if status else None
+        return [_run_json(item) for item in store.list_runs(
+            conversation_id=conversation_id, statuses=statuses
+        )[-limit:]]
+
+    @app.get("/api/v1/runs/{run_id}/timeline")
+    async def control_run_timeline(run_id: str, after: int = Query(default=0, ge=0)) -> dict[str, Any]:
+        try:
+            run = store.get_run(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"run": _run_json(run), "events": [
+            _event_json(item) for item in store.list_events(run_id, after_sequence=after)
+        ]}
+
+    @app.get("/api/v1/audit")
+    async def control_audit(after: int = Query(default=0, ge=0), limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
+        return [asdict(item) for item in store.list_audit(after_id=after, limit=limit)]
+
+    @app.websocket("/ws/control")
+    async def control_stream(websocket: WebSocket, after: int = Query(default=0, ge=0)) -> None:
+        if not _websocket_authorized(websocket, configured.control_token):
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        cursor = after
+        await websocket.send_json({
+            "type": "control.snapshot",
+            "cursor": cursor,
+            "state": control_snapshot(include_activity=False),
+        })
+        version = bus.global_version()
+        try:
+            while True:
+                events = store.list_events_global(after_id=cursor, limit=1000)
+                for event in events:
+                    await websocket.send_json({
+                        "type": "control.event", "cursor": event.id,
+                        "event": _event_json(event),
+                    })
+                    cursor = event.id
+                version = await bus.wait_global(version)
+        except WebSocketDisconnect:
+            return
+
     @app.websocket("/ws/runs/{run_id}")
     async def run_stream(
         websocket: WebSocket, run_id: str, after: int = Query(default=0, ge=0)
     ) -> None:
+        if not _websocket_authorized(websocket, configured.control_token):
+            await websocket.close(code=4401)
+            return
         await websocket.accept()
         try:
             run = store.get_run(run_id)
@@ -582,4 +812,45 @@ def _telegram_token_from_environment() -> str | None:
     token = data.decode("utf-8").strip()
     if not token:
         raise ValueError("Telegram token file is empty")
+    return token
+
+
+def _bearer_token(header: str | None) -> str | None:
+    if not header:
+        return None
+    scheme, separator, value = header.partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not value.strip():
+        return None
+    return value.strip()
+
+
+def _websocket_authorized(websocket: WebSocket, expected: str | None) -> bool:
+    if expected is None:
+        return True
+    provided = _bearer_token(websocket.headers.get("authorization"))
+    if provided is None:
+        # Browser WebSocket clients cannot set Authorization headers. The
+        # short-lived token is accepted as a query parameter for this local,
+        # single-user control plane; deployments should prefer a same-origin
+        # cookie or a reverse proxy that injects the header.
+        provided = websocket.query_params.get("access_token")
+    return provided is not None and hmac.compare_digest(provided, expected)
+
+
+def _control_token_from_environment() -> str | None:
+    direct = os.environ.get("GRAVITYCLAW_CONTROL_TOKEN")
+    secret_file = os.environ.get("GRAVITYCLAW_CONTROL_TOKEN_FILE")
+    if direct and secret_file:
+        raise ValueError(
+            "set only one of GRAVITYCLAW_CONTROL_TOKEN or "
+            "GRAVITYCLAW_CONTROL_TOKEN_FILE"
+        )
+    if not secret_file:
+        return direct
+    data = Path(secret_file).read_bytes()
+    if len(data) > 4096:
+        raise ValueError("control token file is unexpectedly large")
+    token = data.decode("utf-8").strip()
+    if not token:
+        raise ValueError("control token file is empty")
     return token

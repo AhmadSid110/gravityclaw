@@ -7,7 +7,9 @@
 - M5 — Context Management Protocol: verified
 - M6 — Heartbeat and scheduling: verified
 - M7 — Skills and MCP management: verified
-- M8 — Full dashboard and control plane
+- M8A — Authenticated control plane and durable read models: in progress
+- M8B — Premium responsive operating console: planned
+- M9 — Hardening and packaging: planned
 
 M5's deterministic selection, budgeting, provenance, compaction, invalidation,
 and crash-safety gates passed. M6 can now add proactive execution without
