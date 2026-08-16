@@ -1,7 +1,7 @@
 # Milestone 4: Durable Channel Layer
 
-Status: implementation and deterministic hard gate complete on 2026-08-16.
-Live Telegram-account verification is pending bot credentials.
+Status: verified on 2026-08-16. The deterministic forced-crash gate and the
+live Telegram production gate both passed.
 
 > Telegram transports messages; GravityClaw remains the agent.
 
@@ -91,8 +91,23 @@ Run it with:
 - Additional channel adapters
 - Dashboard and channel administration UI
 
-## Remaining live gate
+## Live Telegram production gate
 
-Configure a dedicated Telegram bot token and Ahmad's numeric Telegram user ID,
-approve one workspace alias, then verify `/workspace`, ordinary chat, streaming
-edits, `/status`, `/new`, and `/stop` against Telegram's production Bot API.
+Verified against Telegram's production Bot API with a dedicated private bot:
+
+- Authorized single-user routing and an approved server-side workspace alias.
+- `/workspace`, `/status`, `/new`, ordinary chat, and throttled streaming edits.
+- Live AGY execution completed with the expected response.
+- `/stop` durably recorded a cancellation request before worker signalling.
+- The AGY worker process/container exited, the run reached `cancelled`, and the
+  cancellation request reached `COMPLETED` after one attempt.
+- The final cancelled presentation was delivered against its existing Telegram
+  message ID; no duplicate event sequence or pending delivery remained.
+- The gateway was terminated with `SIGKILL` and restarted against the same WAL
+  database. Startup reconciliation was clean and idempotent, the Telegram
+  polling cursor was preserved, and no managed worker remained active.
+- SQLite `integrity_check` returned `ok`; no bot token was stored in SQLite or
+  committed to the repository.
+
+The live gate intentionally records no bot token, account ID, or chat ID in the
+repository.
