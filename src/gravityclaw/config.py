@@ -101,10 +101,17 @@ host = "127.0.0.1"
 port = 8787
 
 [execution]
+target = "host"
+sandbox = false
 mode = "agy"
 worker_image = "localhost/gravityclaw-agy:1.1.13"
 worker_image_digest = ""
 agy_binary = "agy"
+
+[execution.policy]
+mode = "balanced"
+allow_normal_commands = true
+require_approval_for_elevated = true
 
 [database]
 path = "{database}"
@@ -174,9 +181,20 @@ def validate_config(value: dict[str, Any], *, path: Path | None = None) -> None:
     if not 1 <= port <= 65535:
         raise ConfigurationError("server.port must be between 1 and 65535")
     execution = value.get("execution", {})
-    mode = execution.get("mode", "agy") if isinstance(execution, dict) else None
+    if not isinstance(execution, dict):
+        raise ConfigurationError("[execution] must be a table")
+    mode = execution.get("mode", "agy")
     if mode not in {"agy", "fake"}:
         raise ConfigurationError("execution.mode must be 'agy' or 'fake'")
+    target = execution.get("target", "host")
+    if target not in {"host", "container", "podman"}:
+        raise ConfigurationError("execution.target must be 'host' or 'container'")
+    policy = execution.get("policy", {})
+    if policy and not isinstance(policy, dict):
+        raise ConfigurationError("[execution.policy] must be a table")
+    policy_mode = policy.get("mode", "balanced") if isinstance(policy, dict) else "balanced"
+    if policy_mode not in {"balanced", "full", "restricted"}:
+        raise ConfigurationError("execution.policy.mode must be 'balanced', 'full', or 'restricted'")
     for section_name in ("control", "telegram"):
         section = value.get(section_name, {})
         if section and not isinstance(section, dict):

@@ -28,6 +28,7 @@ from .ops import (
     verify_backup,
 )
 from .release import activate_candidate, release_manifest, rollback, write_release_manifest
+from .server import run_gateway
 from .store import Store
 
 
@@ -57,6 +58,7 @@ def setup(args: argparse.Namespace) -> int:
     Store(layout.database).initialize()
     IdentityStore(layout.identity_dir, runtime_home=layout.data_dir).bootstrap()
     _write_service_unit(layout, config_path, load_config(config_path))
+    _enable_service_unit()
     print(json.dumps({
         "version": RELEASE_VERSION,
         "config": str(config_path),
@@ -172,8 +174,7 @@ def config_validate(args: argparse.Namespace) -> int:
     return 0
 
 
-def service(args: argparse.Namespace) -> int:
-    action = args.service_action
+def _service_action(action: str) -> int:
     if action in {"start", "stop", "restart"}:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     command = ["systemctl", "--user", action, "gravityclaw.service"]
@@ -181,6 +182,17 @@ def service(args: argparse.Namespace) -> int:
         command = ["journalctl", "--user", "-u", "gravityclaw.service", "-n", "100", "--no-pager"]
     result = subprocess.run(command, check=False)
     return result.returncode
+
+
+def service(args: argparse.Namespace) -> int:
+    return _service_action(args.service_action)
+
+
+def gateway(args: argparse.Namespace) -> int:
+    if args.config:
+        os.environ["GRAVITYCLAW_CONFIG"] = str(Path(args.config).expanduser().resolve())
+    run_gateway(host=args.host, port=args.port, log_level=args.log_level)
+    return 0
 
 
 def backup(args: argparse.Namespace) -> int:
@@ -239,6 +251,14 @@ def _service_unit_path() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user" / "gravityclaw.service"
 
 
+def _enable_service_unit() -> None:
+    """Make the generated user unit survive the next user-manager reload."""
+    if shutil.which("systemctl") is None:
+        return
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "gravityclaw.service"], check=False)
+
+
 def _write_service_unit(layout: RuntimeLayout, config_path: Path, config: dict[str, Any]) -> None:
     target = _service_unit_path()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -285,6 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
     conf_sub.add_parser("validate")
     svc = sub.add_parser("service", help="manage the user service")
     svc.add_argument("service_action", choices=("start", "stop", "restart", "status", "logs"))
+    for action in ("start", "stop", "restart", "status", "logs"):
+        sub.add_parser(action, help=f"{action} the user service")
+    gateway_parser = sub.add_parser("gateway", help="run the combined API and production Web gateway")
+    gateway_parser.add_argument("--host", default="127.0.0.1")
+    gateway_parser.add_argument("--port", type=int, default=8787)
+    gateway_parser.add_argument("--log-level", default="info")
+    gateway_parser.add_argument("--dev", action="store_true", help="run the backend for a separate Vite development server")
     bkp = sub.add_parser("backup", help="backup and restore state")
     bkp_sub = bkp.add_subparsers(dest="backup_action", required=True)
     create = bkp_sub.add_parser("create")
@@ -321,6 +348,10 @@ def main(argv: list[str] | None = None) -> int:
         return config_validate(args)
     if args.command == "service":
         return service(args)
+    if args.command in {"start", "stop", "restart", "status", "logs"}:
+        return _service_action(args.command)
+    if args.command == "gateway":
+        return gateway(args)
     if args.command == "backup":
         return backup(args)
     if args.command == "release":

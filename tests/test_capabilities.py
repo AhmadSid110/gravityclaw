@@ -144,7 +144,7 @@ class CapabilityTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            self.assertEqual(version, "9")
+            self.assertEqual(version, "17")
         self.assertTrue({"skills", "mcp_servers", "capability_bindings", "capability_manifests"} <= tables)
 
 

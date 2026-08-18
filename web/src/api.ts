@@ -1,9 +1,19 @@
-import type { Artifact, CapabilityState, ContextPreview, Conversation, ConversationDetail, ControlSnapshot, ContextManifest, IdentityDocument, JournalRecord, MemoryRecord, MemoryUsage, PersistedEvent, RunRecord, ScheduleRecord } from "./types";
+import type { Artifact, AgyQuota, AttachmentRecord, CapabilityState, ContextPreview, ContextSnapshot, ContextStatus, Conversation, ConversationDetail, ConversationEffort, ConversationModel, ConversationSearchResult, ControlSnapshot, ContextManifest, GoalEvaluation, GoalRecord, IdentityDocument, JournalRecord, MemoryRecord, MemoryUsage, ModelCatalog, PersistedEvent, RunRecord, ScheduleRecord, UsageSummary } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
+// Derive the mount point from the emitted asset URL so the console works at
+// both `/` and behind a reverse proxy such as `/gravityclaw/`.
+const assetPath = new URL(import.meta.url).pathname;
+const assetRoot = assetPath.match(/^(.*)\/assets\//)?.[1] ?? "";
+const applicationBasePath = assetRoot ? `${assetRoot}/` : "/";
+
+function applicationPath(path: string): string {
+  return `${applicationBasePath}${path.replace(/^\/+/, "")}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { credentials: "include", ...init });
+  const response = await fetch(applicationPath(path), { credentials: "include", ...init });
   if (!response.ok) {
     const detail = await response.text().catch(() => "request failed");
     throw new Error(`${response.status}: ${detail || response.statusText}`);
@@ -12,7 +22,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function requestOptional<T>(path: string): Promise<T | null> {
-  const response = await fetch(path, { credentials: "include" });
+  const response = await fetch(applicationPath(path), { credentials: "include" });
   if (response.status === 204 || response.status === 404) return null;
   if (!response.ok) {
     const detail = await response.text().catch(() => "request failed");
@@ -53,24 +63,133 @@ export async function getConversation(conversationId: string): Promise<Conversat
   return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}`);
 }
 
+export async function getModels(): Promise<ModelCatalog> {
+  return request("/api/v1/models");
+}
+
+export async function getConversationModel(conversationId: string): Promise<ConversationModel> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/model`);
+}
+
+export async function setConversationModel(conversationId: string, model: string | null): Promise<ConversationModel> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/model`, {
+    method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify({ model }),
+  });
+}
+
+export async function getConversationEffort(conversationId: string): Promise<ConversationEffort> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/effort`);
+}
+
+export async function setConversationEffort(conversationId: string, effort: string | null): Promise<ConversationEffort> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/effort`, {
+    method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify({ effort }),
+  });
+}
+
+export async function getUsage(days = 30): Promise<UsageSummary> {
+  return request(`/api/v1/usage?days=${days}`);
+}
+
+export async function getAgyQuota(): Promise<AgyQuota> {
+  return request("/api/v1/quota");
+}
+
+export async function getContextStatus(conversationId: string): Promise<ContextStatus> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/context-status`);
+}
+
 export async function getWorkspaces(): Promise<Array<{ id: string; name: string; path: string }>> {
   return request("/api/v1/workspaces");
 }
 
-export async function createConversation(workspaceId: string, title?: string): Promise<Conversation> {
-  return request("/conversations", {
+export async function createConversation(workspaceId: string, title?: string, kind: "main" | "normal" = "normal"): Promise<Conversation> {
+  return request("/api/v1/conversations", {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ workspace_id: workspaceId, channel: "web", title }),
+    body: JSON.stringify({ workspace_id: workspaceId, channel: "web", title, kind }),
   });
 }
 
-export async function submitRun(conversationId: string, prompt: string): Promise<RunRecord> {
+export async function updateConversation(conversationId: string, updates: { title?: string; model_override?: string | null }): Promise<Conversation> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "PATCH",
+    headers: jsonHeaders,
+    body: JSON.stringify(updates),
+  });
+}
+
+export async function archiveConversation(conversationId: string): Promise<void> {
+  await request(`/api/v1/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+    headers: jsonHeaders,
+  });
+}
+
+export async function deleteConversationPermanent(conversationId: string): Promise<void> {
+  await request(`/api/v1/conversations/${encodeURIComponent(conversationId)}?permanent=true`, {
+    method: "DELETE",
+    headers: jsonHeaders,
+  });
+}
+
+export async function restoreConversation(conversationId: string): Promise<Conversation> {
+  const result = await request<{ restored: boolean; conversation: Conversation }>(
+    `/api/v1/conversations/${encodeURIComponent(conversationId)}/restore`,
+    {
+      method: "POST",
+      headers: jsonHeaders,
+    }
+  );
+  return result.conversation;
+}
+
+export async function getArchivedConversations(): Promise<Conversation[]> {
+  return request("/api/v1/conversations?include_archived=true");
+}
+
+export async function searchConversations(query: string, workspaceId?: string): Promise<ConversationSearchResult[]> {
+  const params = new URLSearchParams({ q: query });
+  if (workspaceId) params.set("workspace_id", workspaceId);
+  return request(`/api/v1/conversations/search?${params.toString()}`);
+}
+
+export async function submitRun(conversationId: string, prompt: string, attachmentIds?: string[]): Promise<RunRecord> {
+  const body: Record<string, unknown> = { prompt, context_profile: "chat", allow_all: true, print_timeout: "120m" };
+  if (attachmentIds && attachmentIds.length > 0) {
+    body.attachment_ids = attachmentIds;
+  }
   return request(`/conversations/${encodeURIComponent(conversationId)}/runs`, {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ prompt, context_profile: "chat" }),
+    body: JSON.stringify(body),
   });
+}
+
+export async function uploadAttachment(conversationId: string, file: File): Promise<AttachmentRecord> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(
+    applicationPath(`/api/v1/conversations/${encodeURIComponent(conversationId)}/attachments`),
+    { method: "POST", body: formData, credentials: "include" },
+  );
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "upload failed");
+    throw new Error(`${response.status}: ${detail || response.statusText}`);
+  }
+  return response.json() as Promise<AttachmentRecord>;
+}
+
+export async function getMessageAttachments(messageId: string): Promise<AttachmentRecord[]> {
+  return request(`/api/v1/messages/${encodeURIComponent(messageId)}/attachments`);
+}
+
+export function attachmentDownloadUrl(attachmentId: string): string {
+  return applicationPath(`/api/v1/attachments/${encodeURIComponent(attachmentId)}/download`);
 }
 
 export async function cancelRun(run: RunRecord): Promise<RunRecord> {
@@ -193,6 +312,176 @@ export async function checkMcpHealth(id: string): Promise<unknown> {
 
 export function controlSocketUrl(cursor: number): string {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const base = `${protocol}//${window.location.host}/ws/control`;
+  const base = `${protocol}//${window.location.host}${applicationPath("ws/control")}`;
   return `${base}?after=${encodeURIComponent(cursor)}`;
+}
+
+
+// Goals
+export async function getGoals(conversationId?: string, status?: string): Promise<GoalRecord[]> {
+  const query = new URLSearchParams();
+  if (conversationId) query.set("conversation_id", conversationId);
+  if (status) query.set("status", status);
+  const qs = query.toString();
+  return request(`/api/v1/goals${qs ? `?${qs}` : ""}`);
+}
+
+export async function createGoal(conversationId: string, objective: string, options?: { acceptance?: GoalRecord["acceptance"]; max_turns?: number }): Promise<GoalRecord> {
+  return request("/api/v1/goals", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ conversation_id: conversationId, objective, ...options }),
+  });
+}
+
+export async function getGoal(goalId: string): Promise<GoalRecord> {
+  return request(`/api/v1/goals/${encodeURIComponent(goalId)}`);
+}
+
+export async function pauseGoal(goalId: string): Promise<GoalRecord> {
+  return request(`/api/v1/goals/${encodeURIComponent(goalId)}/pause`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function resumeGoal(goalId: string): Promise<GoalRecord> {
+  return request(`/api/v1/goals/${encodeURIComponent(goalId)}/resume`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function cancelGoal(goalId: string): Promise<GoalRecord> {
+  return request(`/api/v1/goals/${encodeURIComponent(goalId)}/cancel`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function completeGoal(goalId: string): Promise<GoalRecord> {
+  return request(`/api/v1/goals/${encodeURIComponent(goalId)}/complete`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function getGoalEvaluations(goalId: string): Promise<GoalEvaluation[]> {
+  return request(`/api/v1/goals/${encodeURIComponent(goalId)}/evaluations`);
+}
+
+
+
+// ─── Learning Studio API ─────────────────────────────────────────────────────
+
+import type { LearningOverview, LearningEvent, SkillProposal, LearnedSkill, SkillRevision, SkillRunEvent, LearningConfig, LearnResponse, JourneyGraph } from "./types";
+
+export async function getLearningOverview(): Promise<LearningOverview> {
+  return request("/api/learning/overview");
+}
+
+export async function getLearningEvents(limit = 50, after = 0): Promise<LearningEvent[]> {
+  return request(`/api/learning/events?limit=${limit}&after=${after}`);
+}
+
+export async function getLearningProposals(status?: string): Promise<SkillProposal[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  return request(`/api/learning/proposals${query}`);
+}
+
+export async function getLearningProposal(id: string): Promise<SkillProposal> {
+  return request(`/api/learning/proposals/${encodeURIComponent(id)}`);
+}
+
+export async function approveProposal(id: string, reason?: string): Promise<SkillProposal> {
+  return request(`/api/learning/proposals/${encodeURIComponent(id)}/approve`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ reason: reason ?? null }),
+  });
+}
+
+export async function rejectProposal(id: string, reason?: string): Promise<SkillProposal> {
+  return request(`/api/learning/proposals/${encodeURIComponent(id)}/reject`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ reason: reason ?? null }),
+  });
+}
+
+export async function getLearningSkills(state?: string, owner?: string): Promise<LearnedSkill[]> {
+  const query = new URLSearchParams();
+  if (state) query.set("state", state);
+  if (owner) query.set("owner", owner);
+  const qs = query.toString();
+  return request(`/api/learning/skills${qs ? `?${qs}` : ""}`);
+}
+
+export async function getLearningSkill(id: string): Promise<LearnedSkill> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}`);
+}
+
+export async function getLearningSkillRevisions(id: string): Promise<SkillRevision[]> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/revisions`);
+}
+
+export async function getLearningSkillRuns(id: string): Promise<SkillRunEvent[]> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/runs`);
+}
+
+export async function pinSkill(id: string): Promise<LearnedSkill> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/pin`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function unpinSkill(id: string): Promise<LearnedSkill> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/unpin`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function archiveSkill(id: string): Promise<LearnedSkill> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/archive`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function restoreSkill(id: string): Promise<LearnedSkill> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/restore`, { method: "POST", headers: jsonHeaders, body: "{}" });
+}
+
+export async function rollbackSkill(id: string, targetRevision: number, reason?: string): Promise<LearnedSkill> {
+  return request(`/api/learning/skills/${encodeURIComponent(id)}/rollback`, {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ target_revision: targetRevision, reason: reason ?? "" }),
+  });
+}
+
+export async function getLearningMemory(limit = 200): Promise<Array<Record<string, unknown>>> {
+  return request(`/api/learning/memory?limit=${limit}`);
+}
+
+export async function updateLearningMemory(id: string, content: string): Promise<Record<string, unknown>> {
+  return request(`/api/learning/memory/${encodeURIComponent(id)}`, {
+    method: "PATCH", headers: jsonHeaders, body: JSON.stringify({ content }),
+  });
+}
+
+export async function deleteLearningMemory(id: string): Promise<{ deleted: boolean; id: string }> {
+  return request(`/api/learning/memory/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function getLearningSettings(): Promise<LearningConfig> {
+  return request("/api/learning/settings");
+}
+
+export async function updateLearningSettings(settings: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return request("/api/learning/settings", {
+    method: "PATCH", headers: jsonHeaders, body: JSON.stringify(settings),
+  });
+}
+
+export async function submitLearn(source: string, options?: { skill_name?: string; force_new?: boolean }): Promise<LearnResponse> {
+  return request("/api/learning/learn", {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ source, ...options }),
+  });
+}
+
+// ─── Journey Graph API ───────────────────────────────────────────────────────
+
+export async function getLearningJourney(skillId?: string): Promise<JourneyGraph> {
+  const query = skillId ? `?skill_id=${encodeURIComponent(skillId)}` : "";
+  return request(`/api/learning/journey${query}`);
+}
+
+// ─── Context Transparency API (Phase 4C) ────────────────────────────────────
+
+export async function getRunContextSnapshot(runId: string): Promise<ContextSnapshot | null> {
+  return requestOptional(`/api/v1/runs/${encodeURIComponent(runId)}/context-snapshot`);
+}
+
+export async function saveRunContextSnapshot(runId: string, snapshot: Record<string, unknown>): Promise<{ status: string; run_id: string }> {
+  return request(`/api/v1/runs/${encodeURIComponent(runId)}/context-snapshot`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(snapshot),
+  });
 }

@@ -194,20 +194,63 @@ class ChannelStore:
                 outbox_id = self._message_outbox_tx(
                     connection, message, inbox_id, response, now
                 )
+            elif command == "/main":
+                result_kind = "command"
+                if binding is None:
+                    response = self._workspace_help_tx(connection)
+                else:
+                    binding, response = self._switch_main_tx(connection, binding, now)
+                    conversation_id = binding.conversation_id
+                outbox_id = self._message_outbox_tx(
+                    connection, message, inbox_id, response, now
+                )
+            elif command == "/chats":
+                result_kind = "command"
+                if binding is None:
+                    response = self._workspace_help_tx(connection)
+                else:
+                    response = self._list_chats_tx(connection, binding)
+                outbox_id = self._message_outbox_tx(
+                    connection, message, inbox_id, response, now
+                )
+            elif command == "/chat":
+                result_kind = "command"
+                if binding is None:
+                    response = self._workspace_help_tx(connection)
+                else:
+                    new_b, response = self._switch_chat_tx(connection, binding, argument, now)
+                    if new_b is not None:
+                        binding = new_b
+                        conversation_id = binding.conversation_id
+                outbox_id = self._message_outbox_tx(
+                    connection, message, inbox_id, response, now
+                )
             elif command == "/new":
                 result_kind = "command"
                 if binding is None:
                     response = self._workspace_help_tx(connection)
                 else:
-                    binding = self._new_conversation_tx(connection, message, binding, now)
+                    binding = self._new_conversation_tx(connection, message, binding, now, title=argument)
                     conversation_id = binding.conversation_id
-                    response = "Started a new conversation."
+                    conv_title = argument.strip() if argument and argument.strip() else "New chat"
+                    response = f"Started new conversation: {conv_title}"
                 outbox_id = self._message_outbox_tx(
                     connection, message, inbox_id, response, now
                 )
             elif command == "/status":
                 result_kind = "command"
                 response = self._status_text_tx(connection, binding)
+                outbox_id = self._message_outbox_tx(
+                    connection, message, inbox_id, response, now
+                )
+            elif command in {"/models", "/model"}:
+                result_kind = "command"
+                if binding is None:
+                    response = "Select a workspace first with /workspace <alias>."
+                elif command == "/models" or not argument:
+                    response = self._model_menu_tx(connection, binding)
+                else:
+                    response = self._set_model_tx(connection, binding, argument)
                 outbox_id = self._message_outbox_tx(
                     connection, message, inbox_id, response, now
                 )
@@ -236,7 +279,7 @@ class ChannelStore:
                     connection,
                     message,
                     inbox_id,
-                    "Unknown command. Use /new, /status, /stop, or /workspace.",
+                    "Unknown command. Use /main, /new, /chats, /chat, /status, /stop, /models, /model, or /workspace.",
                     now,
                 )
             elif binding is None:
@@ -546,9 +589,16 @@ class ChannelStore:
         ).fetchone()
         if row is None:
             return None
-        conversation_id = self._create_conversation_tx(
-            connection, str(row["workspace_id"]), message, now
-        )
+        main_conv = connection.execute(
+            "SELECT id FROM conversations WHERE workspace_id=? AND kind='main' AND archived_at IS NULL",
+            (str(row["workspace_id"]),),
+        ).fetchone()
+        if main_conv is not None:
+            conversation_id = str(main_conv["id"])
+        else:
+            conversation_id = self._create_conversation_tx(
+                connection, str(row["workspace_id"]), message, now, title="Main", kind="main"
+            )
         existing = self._binding_tx(connection, message)
         binding_id = existing.id if existing else str(uuid.uuid4())
         created_at = existing.created_at if existing else now
@@ -585,15 +635,131 @@ class ChannelStore:
             now,
         )
 
+    def _switch_main_tx(
+        self,
+        connection: sqlite3.Connection,
+        binding: ChannelBinding,
+        now: str,
+    ) -> tuple[ChannelBinding, str]:
+        main_conv = connection.execute(
+            "SELECT id FROM conversations WHERE workspace_id=? AND kind='main' AND archived_at IS NULL",
+            (binding.workspace_id,),
+        ).fetchone()
+        if main_conv is None:
+            conv_id = self._create_conversation_tx(
+                connection, binding.workspace_id, None, now, title="Main", kind="main"
+            )
+        else:
+            conv_id = str(main_conv["id"])
+        
+        connection.execute(
+            "UPDATE channel_bindings SET conversation_id=?, updated_at=? WHERE id=?",
+            (conv_id, now, binding.id),
+        )
+        updated_binding = ChannelBinding(
+            binding.id,
+            binding.channel,
+            binding.sender_id,
+            binding.chat_id,
+            binding.thread_key,
+            binding.workspace_id,
+            conv_id,
+            binding.created_at,
+            now,
+        )
+        return updated_binding, "Switched to Main conversation."
+
+    @staticmethod
+    def _list_chats_tx(
+        connection: sqlite3.Connection,
+        binding: ChannelBinding,
+    ) -> str:
+        rows = connection.execute(
+            """SELECT id, title, kind FROM conversations
+               WHERE workspace_id=? AND archived_at IS NULL
+               ORDER BY CASE WHEN kind='main' THEN 0 ELSE 1 END, updated_at DESC
+               LIMIT 10""",
+            (binding.workspace_id,),
+        ).fetchall()
+        if not rows:
+            return "No conversations found in current workspace."
+        lines = ["Your conversations:"]
+        for idx, row in enumerate(rows, start=1):
+            is_active = (row["id"] == binding.conversation_id)
+            marker = " (active)" if is_active else ""
+            prefix = "★ " if row["kind"] == "main" else ""
+            title = row["title"] or "Untitled conversation"
+            lines.append(f"{idx}. {prefix}{title}{marker}")
+        lines.append("\nUse /chat <number> to switch.")
+        return "\n".join(lines)
+
+    def _switch_chat_tx(
+        self,
+        connection: sqlite3.Connection,
+        binding: ChannelBinding,
+        arg: str,
+        now: str,
+    ) -> tuple[ChannelBinding | None, str]:
+        target_arg = arg.strip()
+        if not target_arg:
+            return None, "Please specify a chat number or ID. Use /chats to view."
+        target_id: str | None = None
+        target_title: str = ""
+        try:
+            num = int(target_arg)
+            rows = connection.execute(
+                """SELECT id, title, kind FROM conversations
+                   WHERE workspace_id=? AND archived_at IS NULL
+                   ORDER BY CASE WHEN kind='main' THEN 0 ELSE 1 END, updated_at DESC
+                   LIMIT 10""",
+                (binding.workspace_id,),
+            ).fetchall()
+            if 1 <= num <= len(rows):
+                target_id = str(rows[num - 1]["id"])
+                target_title = str(rows[num - 1]["title"] or "Conversation")
+        except ValueError:
+            pass
+
+        if target_id is None:
+            row = connection.execute(
+                "SELECT id, title FROM conversations WHERE (id=? OR title=?) AND workspace_id=? AND archived_at IS NULL",
+                (target_arg, target_arg, binding.workspace_id),
+            ).fetchone()
+            if row is not None:
+                target_id = str(row["id"])
+                target_title = str(row["title"] or "Conversation")
+
+        if target_id is None:
+            return None, f"Could not find conversation '{target_arg}'. Use /chats to see the numbered list."
+
+        connection.execute(
+            "UPDATE channel_bindings SET conversation_id=?, updated_at=? WHERE id=?",
+            (target_id, now, binding.id),
+        )
+        updated_binding = ChannelBinding(
+            binding.id,
+            binding.channel,
+            binding.sender_id,
+            binding.chat_id,
+            binding.thread_key,
+            binding.workspace_id,
+            target_id,
+            binding.created_at,
+            now,
+        )
+        return updated_binding, f"Switched to: {target_title}"
+
     def _new_conversation_tx(
         self,
         connection: sqlite3.Connection,
         message: InboundMessage,
         binding: ChannelBinding,
         now: str,
+        title: str | None = None,
     ) -> ChannelBinding:
+        effective_title = title.strip() if title and title.strip() else f"{message.channel} chat"
         conversation_id = self._create_conversation_tx(
-            connection, binding.workspace_id, message, now
+            connection, binding.workspace_id, message, now, title=effective_title, kind="normal"
         )
         connection.execute(
             "UPDATE channel_bindings SET conversation_id=?, updated_at=? WHERE id=?",
@@ -615,24 +781,31 @@ class ChannelStore:
     def _create_conversation_tx(
         connection: sqlite3.Connection,
         workspace_id: str,
-        message: InboundMessage,
+        message: InboundMessage | None,
         now: str,
+        title: str = "New chat",
+        kind: str = "normal",
     ) -> str:
         conversation_id = str(uuid.uuid4())
-        channel_key = (
-            f"{message.channel}:{message.sender_id}:{message.chat_id}:"
-            f"{message.thread_key}:{conversation_id}"
-        )
+        channel = message.channel if message else "system"
+        if message:
+            channel_key = (
+                f"{message.channel}:{message.sender_id}:{message.chat_id}:"
+                f"{message.thread_key}:{conversation_id}"
+            )
+        else:
+            channel_key = f"system:{kind}:{workspace_id}:{conversation_id}"
         connection.execute(
             """INSERT INTO conversations(
-                id, workspace_id, channel, channel_key, title, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                id, workspace_id, channel, channel_key, title, kind, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 conversation_id,
                 workspace_id,
-                message.channel,
+                channel,
                 channel_key,
-                f"{message.channel} chat",
+                title,
+                kind,
                 now,
                 now,
             ),
@@ -648,7 +821,9 @@ class ChannelStore:
         now: str,
     ) -> str:
         run_id = str(uuid.uuid4())
-        request = {"prompt": prompt, "channel_inbox_id": inbox_id}
+        request = self.store._snapshot_model_request_tx(
+            connection, conversation_id, {"prompt": prompt, "channel_inbox_id": inbox_id}
+        )
         connection.execute(
             """INSERT INTO runs(
                 id, conversation_id, status, backend, request_json, created_at, version
@@ -743,6 +918,60 @@ class ChannelStore:
         from .store import _run
 
         return _run(row)
+
+    @staticmethod
+    def _model_menu_tx(
+        connection: sqlite3.Connection, binding: ChannelBinding
+    ) -> str:
+        conversation = connection.execute(
+            "SELECT model_override FROM conversations WHERE id=?", (binding.conversation_id,)
+        ).fetchone()
+        default_row = connection.execute(
+            "SELECT value FROM metadata WHERE key='model_default'"
+        ).fetchone()
+        catalog_row = connection.execute(
+            "SELECT value FROM metadata WHERE key='model_catalog'"
+        ).fetchone()
+        catalog = json.loads(catalog_row["value"]) if catalog_row else {"models": []}
+        override = conversation["model_override"] if conversation else None
+        default = default_row["value"] if default_row and default_row["value"] else None
+        current = override or default or "AGY runtime default"
+        lines = [f"Current model: {current}"]
+        for index, item in enumerate(catalog.get("models", []), start=1):
+            if not isinstance(item, dict):
+                continue
+            marker = " ✓" if item.get("id") == (override or default) else ""
+            lines.append(f"[{index}] {item.get('label') or item.get('id')}{marker}")
+        lines.append("[0] Default" if override else "[0] Default ✓")
+        lines.append("Use /model <number>. Changes apply to the next message.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _set_model_tx(
+        connection: sqlite3.Connection, binding: ChannelBinding, argument: str
+    ) -> str:
+        catalog_row = connection.execute(
+            "SELECT value FROM metadata WHERE key='model_catalog'"
+        ).fetchone()
+        catalog = json.loads(catalog_row["value"]) if catalog_row else {"models": []}
+        models = [item for item in catalog.get("models", []) if isinstance(item, dict)]
+        value = argument.strip()
+        if value.casefold() in {"default", "0"}:
+            selected = None
+        else:
+            try:
+                index = int(value)
+            except ValueError:
+                index = -1
+            if index < 1 or index > len(models):
+                return "Unknown model choice. Use /models to see the numbered choices."
+            selected = str(models[index - 1].get("id", "")).strip() or None
+        connection.execute(
+            "UPDATE conversations SET model_override=?, updated_at=? WHERE id=?",
+            (selected, utc_now(), binding.conversation_id),
+        )
+        current = selected or catalog.get("default_model") or "AGY runtime default"
+        return f"Model changed to {current}. Applies to the next message; any current run continues unchanged."
 
     @staticmethod
     def _status_text_tx(

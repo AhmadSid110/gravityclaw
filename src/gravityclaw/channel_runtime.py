@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import os
 
+from .attachments import AttachmentService
 from .channel_store import ChannelStore, OutboxRecord
 from .channels import (
     AmbiguousDeliveryError,
@@ -31,6 +34,7 @@ class ChannelRuntime:
         *,
         authorized_sender_id: str,
         default_workspace_alias: str | None = None,
+        attachment_service: AttachmentService | None = None,
         poll_timeout: int = 20,
         delivery_interval: float = 0.2,
         presentation_interval: float = 0.25,
@@ -40,6 +44,7 @@ class ChannelRuntime:
         self.adapter = adapter
         self.authorized_sender_id = authorized_sender_id
         self.default_workspace_alias = default_workspace_alias
+        self.attachment_service = attachment_service
         self.poll_timeout = poll_timeout
         self.delivery_interval = delivery_interval
         self.presentation_interval = presentation_interval
@@ -78,6 +83,8 @@ class ChannelRuntime:
             message, default_workspace_alias=self.default_workspace_alias
         )
         if outcome.run_id and not outcome.duplicate:
+            # Download and ingest Telegram attachments
+            await self._ingest_telegram_attachments(message, outcome)
             await self.manager.activate(outcome.run_id)
 
     async def deliver_once(self) -> int:
@@ -121,6 +128,54 @@ class ChannelRuntime:
                 self.channel_store.finish_cancellation(request.id, str(exc))
             handled += 1
         return handled
+
+    async def _ingest_telegram_attachments(self, message: InboundMessage, outcome: "Any") -> None:
+        """Download Telegram attachments and link them to the run's user message."""
+        if self.attachment_service is None:
+            return
+        attachments_meta = message.payload.get("attachments")
+        if not attachments_meta or not isinstance(attachments_meta, list):
+            return
+        # Need the run_id to find the user message
+        run_id = outcome.run_id
+        if not run_id:
+            return
+        # Get the user message ID for this run
+        user_msg_id = self.manager.store.get_run_message_id(run_id, "user")
+        if not user_msg_id:
+            return
+        # Resolve workspace_id from the conversation
+        try:
+            run = self.manager.store.get_run(run_id)
+            conversation = self.manager.store.get_conversation(run.conversation_id)
+        except KeyError:
+            return
+        # Download each attachment from Telegram
+        for att_meta in attachments_meta:
+            file_id = att_meta.get("file_id")
+            if not file_id:
+                continue
+            try:
+                # Download file from Telegram
+                data, file_path = await self.adapter.download_file(file_id)
+                # Determine filename
+                filename = att_meta.get("file_name") or os.path.basename(file_path)
+                mime_hint = att_meta.get("mime_type")
+                # Ingest through the standard pipeline
+                self.attachment_service.ingest(
+                    workspace_id=conversation.workspace_id,
+                    conversation_id=conversation.id,
+                    filename=filename,
+                    data=io.BytesIO(data),
+                    source="telegram",
+                    message_id=user_msg_id,
+                    mime_type_hint=mime_hint,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "failed to ingest Telegram attachment file_id=%s: %s",
+                    file_id, exc,
+                )
 
     async def _poll_loop(self) -> None:
         while not self._stopping:

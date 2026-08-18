@@ -30,18 +30,42 @@ development installations do not need an immediate migration.
 
 ## Install and first run
 
-From a reviewed release artifact:
+From a reviewed release artifact that includes the built `web/dist` bundle:
 
 ```bash
+npm --prefix web run build     # release preparation, not a production service
 packaging/install.sh
 gravityclaw doctor --json
 ```
 
-`setup` creates the database, identity templates, secure directories, control
-credential, and a user service unit. It never reads, copies, or automates AGY
-authentication. Run the official `agy` login flow separately, then run doctor
-again. Telegram remains disabled until its token file and allowed user ID are
-configured.
+The wheel packages that bundle as `gravityclaw/web_dist`; the installer refuses
+an artifact without `web/dist/index.html`. `setup` creates the database, identity
+templates, secure directories, control credential, and a user service unit. The
+unit starts one `gravityclaw.server` gateway process. That process serves the
+React UI, `/api/*`, and `/ws/*` from `127.0.0.1:8787`; no Node or Vite process is
+needed in production. It never reads, copies, or automates AGY authentication.
+Run the official `agy` login flow separately, then run doctor again. Telegram
+remains disabled until its token file and allowed user ID are configured.
+
+For development, run the same backend directly and use Vite only for HMR:
+
+```bash
+gravityclaw gateway --dev
+cd web && npm run dev
+```
+
+Vite proxies `/api`, `/auth`, `/health`, and `/ws` to the backend. In production,
+use only the combined gateway:
+
+```bash
+gravityclaw start
+gravityclaw status
+gravityclaw logs
+gravityclaw restart
+gravityclaw stop
+```
+
+The older `gravityclaw service <action>` spelling remains supported.
 
 If the worker image is not supplied as part of the reviewed artifact, build it
 from that artifact before starting the service:
@@ -85,14 +109,21 @@ AGY version, worker image reference/ID, and frontend digest without secrets.
 The final M10 gate must run on a fresh Debian/Ubuntu user account with no source
 checkout or existing GravityClaw data:
 
-1. Install only the documented artifact.
+1. Install only the reviewed artifact, including its packaged `web/dist` bundle.
 2. Run setup and doctor.
 3. Authenticate official AGY and verify a tool/subagent run.
-4. Start the user service and verify Web plus Telegram.
-5. Verify memory, context, schedules, backup, and restore.
-6. Install a newer candidate and verify migration plus rollback.
-7. Restore onto a second clean account; re-provision secrets and AGY auth.
-8. Re-run the critical M2–M9 gates and inspect for secret leakage.
+4. Run `gravityclaw start`; verify exactly one GravityClaw user service/process,
+   no Node/Vite development server, and `GET /` returns the React shell.
+5. Verify a history route such as `/conversations/123` returns the same shell,
+   while an unknown `/api/*` path remains an API 404.
+6. Verify the same `:8787` gateway serves API and WebSocket traffic, starts
+   Telegram polling and the scheduler, and records startup reconciliation.
+7. Verify `gravityclaw stop` shuts the gateway down cleanly and a user-service
+   restart/reboot brings the single service back.
+8. Verify memory, context, schedules, backup, and restore.
+9. Install a newer candidate and verify migration plus rollback.
+10. Restore onto a second clean account; re-provision secrets and AGY auth.
+11. Re-run the critical M2–M9 gates and inspect for secret leakage.
 
 The automated repository test suite validates the filesystem/config/backup/release
 parts. Real AGY authentication and Telegram delivery remain explicit operator

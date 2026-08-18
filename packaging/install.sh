@@ -8,6 +8,11 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_ROOT="${GRAVITYCLAW_INSTALL_DIR:-${HOME}/.local/lib/gravityclaw}"
 PYTHON="${PYTHON:-python3}"
 
+if [[ ! -f "${SOURCE_DIR}/web/dist/index.html" ]]; then
+  echo "Frontend build missing: run 'npm --prefix web run build' before packaging/installing GravityClaw." >&2
+  exit 1
+fi
+
 "${PYTHON}" -c 'import sys; sys.exit("Python 3.12+ required") if sys.version_info < (3, 12) else None'
 mkdir -p "${INSTALL_ROOT}"
 "${PYTHON}" -m venv "${INSTALL_ROOT}/venv"

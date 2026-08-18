@@ -8,3 +8,8 @@ dist/
 build/
 web/node_modules/
 web/dist/
+.runtime/
+tmp*/
+*.log
+scratch/
+visual-test*

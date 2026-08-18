@@ -15,11 +15,20 @@ export interface RunRecord {
   backend_conversation_id: string | null;
   worker_id: string | null;
   request: { prompt?: string; context_profile?: string; [key: string]: unknown };
+  requested_model?: string | null;
+  resolved_model?: string | null;
+  agy_version?: string | null;
   error: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
   version: number;
+}
+
+export interface ConversationModelPolicy {
+  mode: "default" | "explicit";
+  model: string | null;
+  global_default: string | null;
 }
 
 export interface Conversation {
@@ -28,9 +37,23 @@ export interface Conversation {
   channel: string;
   channel_key: string | null;
   title: string | null;
+  kind?: "main" | "normal";
+  archived_at?: string | null;
   agy_conversation_id: string | null;
+  model_override?: string | null;
+  model_policy?: ConversationModelPolicy;
   created_at: string;
   updated_at: string;
+}
+
+export interface ConversationSearchResult {
+  conversation_id: string;
+  title: string;
+  kind: string;
+  message_id: string;
+  role: string;
+  content: string;
+  created_at: string;
 }
 
 export interface Message {
@@ -40,12 +63,51 @@ export interface Message {
   content: string;
   created_at: string;
   source_run_id: string | null;
+  attachments?: AttachmentRecord[];
+}
+
+export interface AttachmentRecord {
+  id: string;
+  workspace_id: string;
+  conversation_id: string;
+  message_id: string | null;
+  filename: string;
+  mime_type: string;
+  kind: "image" | "audio" | "video" | "document" | "archive" | "other";
+  size_bytes: number;
+  sha256: string;
+  source: "web" | "telegram" | "api" | "agent";
+  width: number | null;
+  height: number | null;
+  duration_ms: number | null;
+  state: "queued" | "ready" | "failed";
+  created_at: string;
 }
 
 export interface ConversationDetail {
   conversation: Conversation;
   messages: Message[];
   runs: RunRecord[];
+}
+
+export type ActivityKind = "command" | "file" | "edit" | "search" | "subagent" | "other";
+
+export interface NormalizedActivity {
+  id: string;
+  kind: ActivityKind;
+  tool: string;
+  state: "queued" | "running" | "finished" | "failed" | "cancelled" | "soft-denied";
+  title: string;
+  detail: string;
+  command?: string;
+  cwd?: string;
+  path?: string;
+  lines?: string;
+  query?: string;
+  output?: string;
+  error?: string;
+  durationSeconds?: number;
+  sequence: number;
 }
 
 export interface ToolActivity {
@@ -64,7 +126,10 @@ export interface PresentationState {
   assistantText: string;
   currentTool: ToolActivity | null;
   completedTools: ToolActivity[];
+  currentActivity: NormalizedActivity | null;
+  completedActivities: NormalizedActivity[];
   subagents: string[];
+  currentTaskSummary?: string;
 }
 
 export interface Artifact {
@@ -200,6 +265,110 @@ export interface ContextPreview {
   prompt_characters: number;
 }
 
+export interface ModelCapability {
+  id: string;
+  label: string;
+}
+
+export interface ModelCatalog {
+  models: ModelCapability[];
+  default_model: string | null;
+  agy_version: string;
+  binary?: string;
+  source?: string;
+  effort_levels?: string[];
+}
+
+export interface ConversationEffort {
+  conversation_id: string;
+  effort: string | null;
+}
+
+export interface UsageSummary {
+  period_days: number;
+  total_runs: number;
+  completed_runs: number;
+  total_tokens_used: number;
+  total_budget_tokens: number;
+  models: Array<{ model: string; runs: number; tokens: number }>;
+}
+
+export interface AgyQuotaPool {
+  pool: string;
+  remaining_fraction: number | null;
+  remaining_percent: number | null;
+  reset_time: string | null;
+  models: Array<{ id: string; label: string }>;
+}
+
+export interface AgyQuotaPlan {
+  name: string;
+  tier_id: string | null;
+  available_prompt_credits: number | null;
+  available_flow_credits: number | null;
+}
+
+export interface AgyQuota {
+  available: boolean;
+  error?: string;
+  plan?: AgyQuotaPlan;
+  pools?: AgyQuotaPool[];
+  models?: Array<{
+    id: string;
+    label: string;
+    remaining_fraction: number | null;
+    remaining_percent: number | null;
+    reset_time: string | null;
+  }>;
+  window?: string;
+  note?: string;
+}
+
+export interface ConversationModel {
+  conversation_id: string;
+  model_policy: "default" | "explicit";
+  requested_model: string | null;
+  resolved_model: string | null;
+  global_default_model: string | null;
+}
+
+export interface ContextStatus {
+  run_id: string | null;
+  state: "current" | "last" | "none";
+  status?: RunStatus;
+  model?: string | null;
+  context_profile?: string | null;
+  used_tokens: number;
+  budget_tokens: number;
+  percent: number;
+  generation_reserve: number;
+  last_compaction: string | null;
+  messages_compacted: number;
+  compactions_count?: number;
+  conversation_total_tokens?: number;
+  breakdown: Record<string, number>;
+  conversation: { total?: number; summary?: number; recent?: number };
+  conversation_turns?: {
+    total: number;
+    summary_range: [number, number] | null;
+    recent_range: [number, number] | null;
+    watermark_turn: number;
+  } | null;
+  watermark_turn?: number | null;
+  memory_items: Array<{ label: string; tokens: number; confidence: number | null; included: boolean }>;
+  memory_excluded?: number;
+  recent: Array<{
+    run_id: string;
+    status: RunStatus;
+    state: "current" | "last";
+    used_tokens: number;
+    budget_tokens: number;
+    percent: number;
+    created_at: string;
+  }>;
+  manifest?: ContextManifest;
+}
+
 export type TriggerState = "PENDING" | "CLAIMED" | "DISPATCHED" | "RUNNING" | "COMPLETED" | "SKIPPED" | "MISSED" | "FAILED" | "CANCELLED";
 
 export interface TriggerRecord {
@@ -298,4 +467,299 @@ export interface CapabilityState {
   mcp: MCPRecord[];
   bindings: Array<Record<string, unknown>>;
   snapshots: CapabilitySnapshotRecord[];
+}
+
+
+// ─── Learning Studio types ──────────────────────────────────────────────────
+
+export interface LearningOverview {
+  enabled: boolean;
+  trust_mode: string;
+  stats: {
+    memories: number;
+    skills: number;
+    pending_proposals: number;
+    success_rate: number | null;
+    corrections: number;
+  };
+  curator: {
+    enabled: boolean;
+    schedule: string;
+    timezone: string;
+    last_run_at: string | null;
+    last_report: Record<string, unknown> | null;
+  };
+}
+
+export interface LearningEvent {
+  id: number;
+  actor: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface SkillProposal {
+  id: string;
+  skill_id: string | null;
+  skill_name: string;
+  operation: string;
+  description: string;
+  reason: string;
+  confidence: number;
+  content: string;
+  before: string | null;
+  base_revision: number | null;
+  source_run_id: string | null;
+  review_model: string | null;
+  status: "pending" | "approved" | "rejected" | "expired" | "conflict";
+  status_reason: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface LearnedSkill {
+  skill_id: string;
+  name: string;
+  description: string;
+  path: string;
+  owner: "user" | "agent" | "bundled";
+  state: "active" | "stale" | "archived";
+  trust: "unreviewed" | "approved";
+  revision: number;
+  pinned: boolean;
+  created_at: string;
+  updated_at: string;
+  content?: string;
+  stats?: {
+    matched: number;
+    selected: number;
+    loaded: number;
+    executed: number;
+    successful: number;
+    failed: number;
+    corrected: number;
+    success_rate: number | null;
+  };
+}
+
+export interface SkillRevision {
+  id: string;
+  skill_id: string;
+  revision: number;
+  parent_revision: number | null;
+  operation: string;
+  source_run_id: string | null;
+  proposal_id: string | null;
+  model: string | null;
+  reason: string;
+  created_at: string;
+}
+
+export interface SkillRunEvent {
+  run_id: string;
+  event: string;
+  created_at: string;
+}
+
+export interface LearningConfig {
+  enabled: boolean;
+  memory_approval_required: boolean;
+  reviewer: {
+    enabled: boolean;
+    provider: string;
+    model: string;
+    fallback_to_primary: boolean;
+    max_input_tokens: number;
+    max_output_tokens: number;
+    max_retries: number;
+  };
+  skills: {
+    trust_mode: string;
+    min_confidence: number;
+    create_approval_required: boolean;
+    modify_approval_required: boolean;
+  };
+  ingestion: {
+    small_source_token_limit: number;
+    chunk_tokens: number;
+    max_chunks: number;
+  };
+  curator: {
+    enabled: boolean;
+    schedule: string;
+    timezone: string;
+    min_idle_hours: number;
+    stale_after_days: number;
+    archive_after_days: number;
+    minimum_invocations: number;
+    utility_stale_threshold: number;
+    utility_archive_threshold: number;
+  };
+  notifications: {
+    mode: string;
+  };
+}
+
+export interface LearnResponse {
+  request_id: string;
+  status: "success" | "duplicate" | "failed" | "pending_approval" | "disabled";
+  message: string;
+  proposal_id?: string;
+  skill_name?: string;
+  source_type?: string;
+  chunks_processed?: number;
+  warnings?: string[];
+}
+
+// ─── Journey Graph types ────────────────────────────────────────────────────
+
+export type JourneyNodeKind = "skill" | "revision" | "proposal" | "run";
+
+export type JourneyEdgeRelation =
+  | "produces"
+  | "evolves_to"
+  | "triggers_creation"
+  | "triggers_improvement"
+  | "approved_as"
+  | "generates_proposal"
+  | "targets"
+  | "used_in"
+  | "validates"
+  | "fails_with"
+  | "corrects"
+  | "proposes_change";
+
+export interface JourneyNode {
+  id: string;
+  kind: JourneyNodeKind;
+  label: string;
+  // Common metadata
+  created_at?: string;
+  // Skill-specific
+  description?: string;
+  state?: string;
+  revision?: number;
+  trust?: string;
+  owner?: string;
+  // Revision-specific
+  skill_id?: string;
+  parent_revision?: number | null;
+  operation?: string;
+  reason?: string;
+  // Proposal-specific
+  skill_name?: string;
+  status?: string;
+  confidence?: number;
+  resolved_at?: string | null;
+  // Run-specific
+  run_id?: string;
+}
+
+export interface JourneyEdge {
+  source: string;
+  target: string;
+  relation: JourneyEdgeRelation;
+}
+
+export interface JourneyGraph {
+  nodes: JourneyNode[];
+  edges: JourneyEdge[];
+  stats: {
+    total_nodes: number;
+    total_edges: number;
+    by_kind: Record<string, number>;
+  };
+}
+
+export type GoalStatus = "active" | "paused" | "completed" | "cancelled" | "failed";
+export type GoalVerdict = "continue" | "done" | "failed" | "paused";
+
+export interface AcceptanceCriterion {
+  type: "command" | "file_exists" | "test";
+  description?: string;
+  command?: string;
+  path?: string;
+  passed?: boolean;
+  detail?: string;
+}
+
+export interface GoalRecord {
+  id: string;
+  conversation_id: string;
+  objective: string;
+  acceptance: AcceptanceCriterion[];
+  status: GoalStatus;
+  max_turns: number;
+  turns_used: number;
+  current_step: string | null;
+  last_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GoalEvaluation {
+  id: string;
+  goal_id: string;
+  run_id: string | null;
+  turn_number: number;
+  verdict: GoalVerdict;
+  reason: string | null;
+  acceptance_state: AcceptanceCriterion[];
+  created_at: string;
+}
+
+// ─── Context Transparency types (Phase 4C) ──────────────────────────────────
+
+export type TokenSource = "provider" | "tokenizer" | "estimated";
+
+export interface ContextSegment {
+  kind: string;
+  tokens: number;
+}
+
+export interface ContextSkillEntry {
+  skill_id: string;
+  name: string;
+  revision?: number;
+  tokens: number;
+  sha256?: string;
+}
+
+export interface ContextMemoryEntry {
+  id: string;
+  namespace: string;
+  tokens: number;
+  label?: string;
+  confidence?: number | null;
+}
+
+export interface ContextTransformation {
+  label: string;
+  tokens_before: number;
+  tokens_after: number;
+}
+
+export interface ContextSnapshot {
+  run_id: string;
+  model: string;
+  context_limit: number;
+  input_tokens: number;
+  output_tokens: number | null;
+  token_source: TokenSource;
+  segments: ContextSegment[];
+  skills: ContextSkillEntry[];
+  memories: ContextMemoryEntry[];
+  transformations: ContextTransformation[] | null;
+  conversation_tokens: number | null;
+  last_invocation_tokens: number | null;
+  created_at: string;
+  // Computed enrichments
+  usage_ratio: number;
+  remaining_tokens: number;
+  run_status: RunStatus;
+  is_final: boolean;
+  is_estimated: boolean;
 }

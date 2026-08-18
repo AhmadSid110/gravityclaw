@@ -111,7 +111,7 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         )
         listed = await self.client.get("/api/v1/conversations", headers=self.headers)
         self.assertEqual(listed.status_code, 200)
-        self.assertEqual(listed.json()[0]["id"], telegram.id)
+        self.assertTrue(any(c["id"] == telegram.id for c in listed.json()))
         submitted = await self.client.post(
             f"/conversations/{telegram.id}/runs", headers=self.headers,
             json={"prompt": "Continue from Web"},

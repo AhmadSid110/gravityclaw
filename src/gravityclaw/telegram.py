@@ -54,26 +54,126 @@ class TelegramAdapter:
                 sender = message.get("from")
                 chat = message.get("chat")
                 text = message.get("text")
-                if isinstance(sender, dict) and isinstance(chat, dict) and isinstance(text, str):
-                    normalized = InboundMessage(
-                        channel=self.name,
-                        provider_update_id=update_id,
-                        sender_id=str(sender.get("id", "")),
-                        chat_id=str(chat.get("id", "")),
-                        text=text,
-                        provider_message_id=str(message.get("message_id", "")) or None,
-                        thread_id=(
-                            str(message["message_thread_id"])
-                            if message.get("message_thread_id") is not None
-                            else None
-                        ),
-                        payload={
+                caption = message.get("caption")
+                # Accept text messages, photo messages, and document messages
+                has_content = isinstance(text, str) or message.get("photo") or message.get("document")
+                if isinstance(sender, dict) and isinstance(chat, dict) and has_content:
+                    # Build attachment metadata from photo/document
+                    attachments: list[dict[str, Any]] = []
+                    if message.get("photo"):
+                        # Telegram sends array of sizes; take the largest
+                        photos = message["photo"]
+                        if isinstance(photos, list) and photos:
+                            best = photos[-1]
+                            attachments.append({
+                                "type": "photo",
+                                "file_id": best.get("file_id"),
+                                "file_unique_id": best.get("file_unique_id"),
+                                "width": best.get("width"),
+                                "height": best.get("height"),
+                                "file_size": best.get("file_size"),
+                            })
+                    if message.get("document"):
+                        doc = message["document"]
+                        if isinstance(doc, dict):
+                            attachments.append({
+                                "type": "document",
+                                "file_id": doc.get("file_id"),
+                                "file_unique_id": doc.get("file_unique_id"),
+                                "file_name": doc.get("file_name"),
+                                "mime_type": doc.get("mime_type"),
+                                "file_size": doc.get("file_size"),
+                            })
+                    if message.get("audio"):
+                        audio = message["audio"]
+                        if isinstance(audio, dict):
+                            attachments.append({
+                                "type": "audio",
+                                "file_id": audio.get("file_id"),
+                                "file_unique_id": audio.get("file_unique_id"),
+                                "file_name": audio.get("file_name"),
+                                "mime_type": audio.get("mime_type"),
+                                "file_size": audio.get("file_size"),
+                                "duration": audio.get("duration"),
+                            })
+                    if message.get("voice"):
+                        voice = message["voice"]
+                        if isinstance(voice, dict):
+                            attachments.append({
+                                "type": "voice",
+                                "file_id": voice.get("file_id"),
+                                "file_unique_id": voice.get("file_unique_id"),
+                                "mime_type": voice.get("mime_type"),
+                                "file_size": voice.get("file_size"),
+                                "duration": voice.get("duration"),
+                            })
+                    if message.get("video"):
+                        video = message["video"]
+                        if isinstance(video, dict):
+                            attachments.append({
+                                "type": "video",
+                                "file_id": video.get("file_id"),
+                                "file_unique_id": video.get("file_unique_id"),
+                                "file_name": video.get("file_name"),
+                                "mime_type": video.get("mime_type"),
+                                "file_size": video.get("file_size"),
+                                "width": video.get("width"),
+                                "height": video.get("height"),
+                                "duration": video.get("duration"),
+                            })
+                    # Use text or caption as the message content
+                    effective_text = text if isinstance(text, str) else (caption or "")
+                    # Only create a message if there's text or attachments
+                    if effective_text or attachments:
+                        payload_data: dict[str, Any] = {
                             "date": message.get("date"),
                             "chat_type": chat.get("type"),
-                        },
-                    )
+                        }
+                        if attachments:
+                            payload_data["attachments"] = attachments
+                        normalized = InboundMessage(
+                            channel=self.name,
+                            provider_update_id=update_id,
+                            sender_id=str(sender.get("id", "")),
+                            chat_id=str(chat.get("id", "")),
+                            text=effective_text,
+                            provider_message_id=str(message.get("message_id", "")) or None,
+                            thread_id=(
+                                str(message["message_thread_id"])
+                                if message.get("message_thread_id") is not None
+                                else None
+                            ),
+                            payload=payload_data,
+                        )
             updates.append(PolledUpdate(update_id, normalized))
         return updates
+
+    async def get_file_url(self, file_id: str) -> str:
+        """Get the download URL for a Telegram file."""
+        result = await self._call("getFile", {"file_id": file_id}, ambiguous=False)
+        if not isinstance(result, dict) or not result.get("file_path"):
+            raise ChannelDeliveryError("Telegram returned no file path", retryable=True)
+        file_path = result["file_path"]
+        return f"{self._base_url.rsplit('/bot', 1)[0]}/file/bot{self._base_url.rsplit('/bot', 1)[1]}/{file_path}"
+
+    async def download_file(self, file_id: str) -> tuple[bytes, str]:
+        """Download a file from Telegram. Returns (data, file_path)."""
+        result = await self._call("getFile", {"file_id": file_id}, ambiguous=False)
+        if not isinstance(result, dict) or not result.get("file_path"):
+            raise ChannelDeliveryError("Telegram returned no file path", retryable=True)
+        file_path = str(result["file_path"])
+        # Extract token from base_url for file download
+        token_part = self._base_url.rsplit("/bot", 1)[1] if "/bot" in self._base_url else ""
+        api_root = self._base_url.rsplit("/bot", 1)[0] if "/bot" in self._base_url else self._base_url
+        download_url = f"{api_root}/file/bot{token_part}/{file_path}"
+        try:
+            response = await self._client.get(download_url, timeout=60)
+            response.raise_for_status()
+            return response.content, file_path
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            raise ChannelDeliveryError(
+                f"Failed to download Telegram file: {exc}", retryable=True
+            ) from exc
 
     async def send_message(
         self, chat_id: str, text: str, *, thread_id: str | None = None

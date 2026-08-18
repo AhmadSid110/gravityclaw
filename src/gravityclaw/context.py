@@ -6,11 +6,20 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Iterable, Mapping, Protocol, Sequence
 
 from .identity import IdentityDocument, IdentityStore
 from .memory import MemoryService
 from .store import Artifact, Conversation, Message, RunRecord, Store
+
+
+if TYPE_CHECKING:
+    from .harness import HarnessContext
+
+
+class HarnessCompilerProtocol(Protocol):
+    """Structural protocol for the harness compiler — avoids circular imports."""
+    def compile(self, ctx: "HarnessContext") -> str: ...
 
 
 CONTEXT_PROTOCOL_VERSION = 2
@@ -41,10 +50,10 @@ class ContextProfile:
 
 
 PROFILES: Mapping[str, ContextProfile] = {
-    "chat": ContextProfile("chat", 16_000, 48_000, 5_000, 4_000, 4_000, 2_000, 1_000),
-    "coding": ContextProfile("coding", 24_000, 72_000, 5_000, 5_000, 5_000, 3_000, 6_000),
-    "heartbeat": ContextProfile("heartbeat", 10_000, 30_000, 4_000, 3_000, 1_500, 1_000, 500),
-    "scheduled": ContextProfile("scheduled", 12_000, 36_000, 3_500, 4_000, 1_500, 1_500, 1_500),
+    "chat": ContextProfile("chat", 128_000, 768_000, 16_000, 64_000, 96_000, 16_000, 16_000),
+    "coding": ContextProfile("coding", 128_000, 768_000, 16_000, 64_000, 96_000, 16_000, 16_000),
+    "heartbeat": ContextProfile("heartbeat", 128_000, 384_000, 8_000, 64_000, 60_000, 12_000, 12_000),
+    "scheduled": ContextProfile("scheduled", 128_000, 768_000, 12_000, 64_000, 60_000, 12_000, 12_000),
 }
 
 
@@ -52,14 +61,14 @@ PROFILES: Mapping[str, ContextProfile] = {
 class ContextBudget:
     """Compatibility/configuration surface retained from M3."""
 
-    total_characters: int = 48_000
-    identity_characters: int = 16_000
-    curated_memory_characters: int = 6_000
-    retrieved_memory_characters: int = 6_000
-    history_characters: int = 6_000
-    task_characters: int = 12_000
-    retrieval_limit: int = 8
-    history_limit: int = 20
+    total_characters: int = 6_000_000
+    identity_characters: int = 48_000
+    curated_memory_characters: int = 60_000
+    retrieved_memory_characters: int = 60_000
+    history_characters: int = 2_400_000
+    task_characters: int = 2_000_000
+    retrieval_limit: int = 12
+    history_limit: int = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +116,7 @@ class CompiledContext:
     sources: tuple[ContextSource, ...]
     resumed_backend_conversation: bool
     profile: str = "chat"
-    budget_tokens: int = 16_000
+    budget_tokens: int = 1_000_000
     identity_fingerprint: str = ""
     context_fingerprint: str = ""
     last_message_id: str | None = None
@@ -399,11 +408,13 @@ class RunContextCompiler:
     """Resolve persisted candidates and invoke the pure compiler at dispatch time."""
 
     def __init__(self, store: Store, identity: IdentityStore, memory: MemoryService,
-                 builder: ContextBuilder | None = None) -> None:
+                 builder: ContextBuilder | None = None,
+                 harness_compiler: "HarnessCompilerProtocol | None" = None) -> None:
         self.store = store
         self.identity = identity
         self.memory = memory
         self.builder = builder or ContextBuilder()
+        self.harness_compiler = harness_compiler
 
     def compile(self, run: RunRecord, conversation: Conversation) -> CompiledContext:
         task = str(run.request.get("prompt", ""))
@@ -420,9 +431,50 @@ class RunContextCompiler:
             after_message_id=(str(prior_summary["last_message_id"]) if prior_summary else None),
             exclude_run_id=run.id,
         )
+
+        # Resolve attachments for this run if present
+        attachment_lines: list[str] = []
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                """SELECT a.* FROM attachments a
+                   JOIN messages m ON a.message_id = m.id
+                   WHERE m.source_run_id = ? AND m.role = 'user'
+                   ORDER BY a.created_at""",
+                (run.id,),
+            ).fetchall()
+            for row in rows:
+                storage_path = row["storage_path"]
+                abs_path = (self.store.path.parent / storage_path).resolve()
+                filename = row["filename"]
+                mime_type = row["mime_type"]
+                kind = row["kind"]
+                size_bytes = row["size_bytes"]
+                size_kb = round(size_bytes / 1024, 1)
+                attachment_lines.append(
+                    f"- **{kind.capitalize()}**: `{filename}`\n"
+                    f"  - **File Path**: `{abs_path}`\n"
+                    f"  - **MIME Type**: {mime_type} ({size_kb} KB)\n"
+                    f"  - **Instructions**: Use the `view_file` tool on the exact **File Path** above to view and inspect this {kind}."
+                )
+
+        if attachment_lines:
+            attachment_section = (
+                "\n\n## User Attached Files & Media\n"
+                "The user attached the following file(s) to this request. You MUST use `view_file` on the local file path to view images, inspect screenshots, or read files:\n"
+                + "\n".join(attachment_lines)
+            )
+            task = f"{task}{attachment_section}"
+
+        # Build identity list — harness prompt first if available
+        identity_docs = list(self.identity.load_execution_identity())
+        if self.harness_compiler is not None:
+            harness_doc = self._compile_harness(run, conversation)
+            if harness_doc is not None:
+                identity_docs.insert(0, harness_doc)
+
         return self.builder.compile(
             task=task,
-            identity=self.identity.load_execution_identity(),
+            identity=identity_docs,
             curated_memory=self.identity.load_curated_memory(),
             memories=self.memory.retrieve(task, limit=policy.retrieval_limit),
             history=history,
@@ -438,6 +490,187 @@ class RunContextCompiler:
                 if profile == "heartbeat" else None
             ),
         )
+
+    def _compile_harness(
+        self, run: RunRecord, conversation: Conversation,
+    ) -> IdentityDocument | None:
+        """Build a synthetic identity document from the harness compiler."""
+        from .harness import (
+            CapabilityResolver,
+            HarnessContext,
+            SkillSummary,
+            ToolPolicy,
+            RuntimeServices,
+            detect_adapter,
+        )
+
+        model = str(run.request.get("resolved_model", "unknown"))
+        channel = conversation.channel or "web"
+        workspace = self.store.get_workspace(conversation.workspace_id)
+        adapter_name = detect_adapter(model)
+
+        # Derive provider from adapter name
+        provider_map = {
+            "openai": "OpenAI",
+            "anthropic": "Anthropic",
+            "gemini": "Google",
+            "generic": "Unknown",
+        }
+        provider = provider_map.get(adapter_name, "Unknown")
+
+        # Determine trust mode
+        trust_mode = "strict"
+        learning_enabled = self._learning_enabled()
+        try:
+            from .learning_config import LearningConfig
+            config = LearningConfig.from_environment()
+            trust_mode = config.skills.trust_mode
+        except Exception:
+            pass
+
+        # ── Tool Parity Invariant ──────────────────────────────────────
+        # Compute visible_tools from the SAME manifest that apply_to_spec
+        # uses to mount tools into the container. This guarantees tool
+        # capabilities in the harness prompt match actual tool availability.
+        policy = ToolPolicy()
+        manifest = run.request.get("capability_manifest")
+
+        runtime_services = RuntimeServices(
+            learning_enabled=learning_enabled,
+            trust_mode=trust_mode,
+            memory_enabled=True,
+            scheduler_enabled=True,
+            delegation_enabled=False,
+            channel=channel,
+            network_available=True,
+        )
+
+        if manifest and isinstance(manifest, dict):
+            # Canonical path: derive from the real manifest
+            visible_tools = policy.filter(
+                manifest=manifest,
+                container_capabilities={
+                    "shell": True,
+                    "files": True,
+                    "network": True,
+                    "web_search": True,
+                    "web_fetch": True,
+                },
+                runtime_services=runtime_services,
+            )
+        else:
+            # Pre-manifest path (first compilation before prepare_run):
+            # use runtime flags, will be consistent because the same flags
+            # determine what prepare_run selects.
+            visible_tools = policy.from_runtime_snapshot(
+                has_shell=True,
+                has_files=True,
+                has_network=True,
+                has_web_search=True,
+                has_web_fetch=True,
+                has_memory=True,
+                has_scheduler=True,
+                has_delegation=False,
+                has_learning=learning_enabled,
+                trust_mode=trust_mode,
+                channel=channel,
+            )
+
+        # Derive capabilities from the visible tool set (single path)
+        resolver = CapabilityResolver()
+        capabilities = resolver.from_visible_tools(visible_tools)
+
+        # Build skill summaries from discovery (if available)
+        skills: tuple[SkillSummary, ...] = ()
+        task = str(run.request.get("prompt", ""))
+        if task and learning_enabled:
+            skills = self._discover_skills(task, run.id)
+
+        import getpass
+        current_user = getpass.getuser()
+        sandbox_enabled = bool(run.request.get("sandbox", False))
+        execution_target = str(run.request.get("target", "host"))
+
+        ctx = HarnessContext(
+            model=model,
+            provider=provider,
+            channel=channel,
+            workspace=str(workspace.path),
+            host_user=current_user,
+            host_name="GravityClaw VPS",
+            sandbox_enabled=sandbox_enabled,
+            execution_target=execution_target,
+            learning_enabled=learning_enabled,
+            trust_mode=trust_mode,
+            capabilities=capabilities,
+            skills=skills,
+            visible_tools=visible_tools,
+            memory_available=True,
+            scheduler_available=True,
+            delegation_available=False,
+            adapter=adapter_name,
+        )
+
+        prompt = self.harness_compiler.compile(ctx)
+        sha = hashlib.sha256(prompt.encode()).hexdigest()
+        return IdentityDocument(
+            name="HARNESS",
+            path=workspace.path / ".gravityclaw-harness",
+            content=prompt,
+            sha256=sha,
+        )
+
+    def _learning_enabled(self) -> bool:
+        """Check if learning mode is enabled from environment."""
+        import os
+        env = os.environ.get("GRAVITYCLAW_LEARNING_ENABLED", "true")
+        return env.lower() in {"1", "true", "yes"}
+
+    def _discover_skills(
+        self, task: str, run_id: str,
+    ) -> "tuple[SkillSummary, ...]":
+        """Search for relevant skills using FTS, if the skill tables exist."""
+        from .harness import SkillSummary
+
+        try:
+            with self.store._connect() as conn:
+                # Check if skills_fts table exists
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='skills_fts'"
+                ).fetchone()
+                if row is None:
+                    return ()
+            # Use the store's FTS directly (lightweight, no service dependency)
+            import re
+            terms = re.findall(r"[^\W_]+", task, flags=re.UNICODE)
+            if not terms:
+                return ()
+            fts_expr = " OR ".join(
+                f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:10]
+            )
+            with self.store._connect() as conn:
+                rows = conn.execute(
+                    """SELECT s.id, s.name, s.description, s.trust, bm25(skills_fts) AS rank
+                       FROM skills_fts f
+                       JOIN learned_skills s ON s.name = f.name
+                       WHERE skills_fts MATCH ?
+                       AND s.state = 'active'
+                       ORDER BY rank
+                       LIMIT 5""",
+                    (fts_expr,),
+                ).fetchall()
+            return tuple(
+                SkillSummary(
+                    skill_id=row["id"],
+                    name=row["name"],
+                    description=row["description"],
+                    trust=row["trust"],
+                    relevance_score=abs(row["rank"]),
+                )
+                for row in rows
+            )
+        except Exception:
+            return ()
 
     def preview(self, *, task: str, profile: str = "chat",
                 conversation_id: str | None = None) -> CompiledContext:

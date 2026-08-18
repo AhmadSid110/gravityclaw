@@ -6,15 +6,18 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from .agy import _normalize_event
+from .attachments import AttachmentResolver, AttachmentStorage, AttachmentStore
 from .capabilities import CapabilityManager
 from .context import RunContextCompiler
 from .event_bus import EventBus
 from .events import AgentEvent
 from .execution import (
+    ContainerSpec,
     MANAGED_LABEL,
     RUN_LABEL,
     WORKSPACE_LABEL,
@@ -23,7 +26,9 @@ from .execution import (
     WorkerEnvelope,
     WorkerSnapshot,
 )
-from .store import RunRecord, Store, TERMINAL_RUN_STATUSES
+from .goals import GoalEvaluator, build_continuation_prompt
+from .learning import LearningEngine
+from .store import GoalRecord, RunRecord, Store, TERMINAL_RUN_STATUSES
 
 
 LOGGER = logging.getLogger(__name__)
@@ -48,6 +53,11 @@ class RunManager:
         poll_interval: float = 0.2,
         context_compiler: RunContextCompiler | None = None,
         capability_manager: CapabilityManager | None = None,
+        goal_evaluator: GoalEvaluator | None = None,
+        learning_engine: LearningEngine | None = None,
+        attachment_store: AttachmentStore | None = None,
+        attachment_resolver: AttachmentResolver | None = None,
+        attachment_storage: AttachmentStorage | None = None,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -56,6 +66,11 @@ class RunManager:
         self.poll_interval = poll_interval
         self.context_compiler = context_compiler
         self.capability_manager = capability_manager
+        self.goal_evaluator = goal_evaluator
+        self.learning_engine = learning_engine
+        self.attachment_store = attachment_store
+        self.attachment_resolver = attachment_resolver or AttachmentResolver()
+        self.attachment_storage = attachment_storage
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._conversation_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -76,6 +91,8 @@ class RunManager:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._dispatch_tasks.clear()
+        if self.learning_engine is not None:
+            await self.learning_engine.close()
 
     async def submit(self, conversation_id: str, request: dict[str, Any]) -> RunRecord:
         prompt = str(request.get("prompt", "")).strip()
@@ -271,6 +288,8 @@ class RunManager:
                 spec = self.spec_factory.build(claimed, conversation, workspace)
                 if self.capability_manager is not None:
                     spec = self.capability_manager.apply_to_spec(spec, claimed)
+                # Mount run attachments read-only into the container
+                spec = self._apply_attachments(spec, claimed)
                 LOGGER.debug("starting worker for run %s", claimed.id)
                 snapshot = await self.backend.start(spec)
                 LOGGER.debug(
@@ -308,6 +327,25 @@ class RunManager:
                 )
                 await self.event_bus.notify(claimed.id)
                 self._schedule_dispatch(conversation_id)
+
+    def _apply_attachments(self, spec: "ContainerSpec", run: RunRecord) -> "ContainerSpec":
+        """Mount run attachments read-only into the worker container."""
+        if self.attachment_store is None or self.attachment_storage is None:
+            return spec
+        attachments = self.attachment_store.list_for_run(run.id)
+        if not attachments:
+            return spec
+        mounts = list(spec.mounts)
+        model_id = str(run.request.get("resolved_model") or run.request.get("requested_model") or "")
+        resolved = self.attachment_resolver.resolve(attachments, model_id)
+        for item in resolved:
+            if item.strategy == "file_mount" and item.mount_path:
+                source = self.attachment_storage.read(item.record.storage_path)
+                if source.is_file():
+                    mounts.append((source, item.mount_path, "ro"))
+        if mounts != list(spec.mounts):
+            return replace(spec, mounts=tuple(mounts))
+        return spec
 
     def _schedule_dispatch(self, conversation_id: str) -> None:
         task = asyncio.create_task(
@@ -484,11 +522,17 @@ class RunManager:
             ),
             None,
         )
-        assistant_response = (
-            str(terminal.payload.get("response", ""))
-            if status == "completed" and terminal is not None
-            else None
-        )
+        response_text = ""
+        if terminal is not None and terminal.payload.get("response"):
+            response_text = str(terminal.payload.get("response", "")).strip()
+        if not response_text:
+            deltas = [
+                str(e.payload.get("text_delta") or e.payload.get("content") or "")
+                for e in events
+                if e.event_type in {"message.delta", "agent.message"}
+            ]
+            response_text = "".join(deltas).strip()
+        assistant_response = response_text if response_text else None
         self.store.transition_run(
             run.id,
             status,
@@ -500,3 +544,69 @@ class RunManager:
         if run.worker_id:
             self.store.update_worker_state(run.worker_id, "exited")
         await self.event_bus.notify(run.id)
+
+        # Goal continuation: if the completed run belongs to an active goal,
+        # evaluate and potentially enqueue a follow-up run.
+        if status in ("completed", "failed") and self.goal_evaluator is not None:
+            await self._evaluate_goal(run, status)
+
+        # Learning: if the completed run is eligible, enqueue a background
+        # learning job for async review. This is non-blocking and never
+        # affects the user-facing conversation.
+        if status == "completed" and self.learning_engine is not None:
+            try:
+                finalized_run = self.store.get_run(run.id)
+                await self.learning_engine.process_run(finalized_run)
+            except Exception:
+                LOGGER.exception("learning engine failed for run %s", run.id)
+
+
+    async def _evaluate_goal(self, run: RunRecord, status: str) -> None:
+        """Check goal progress after a run completes; enqueue continuation if needed."""
+        try:
+            goal = self.store.get_active_goal(run.conversation_id)
+            if goal is None:
+                return
+
+            # Increment the turn counter
+            goal = self.store.increment_goal_turn(goal.id, run.id)
+
+            # Evaluate acceptance
+            evaluation = self.goal_evaluator.evaluate(goal, run)
+
+            # Record the evaluation
+            self.store.record_goal_evaluation(
+                goal_id=goal.id,
+                run_id=run.id,
+                turn_number=goal.turns_used,
+                verdict=evaluation.verdict,
+                reason=evaluation.reason,
+                acceptance_state=evaluation.acceptance_state,
+            )
+
+            if evaluation.verdict == "done":
+                self.store.update_goal(goal.id, status="completed")
+                LOGGER.info("goal %s completed after %d turns", goal.id, goal.turns_used)
+            elif evaluation.verdict == "failed":
+                self.store.update_goal(goal.id, status="failed")
+                LOGGER.info("goal %s failed: %s", goal.id, evaluation.reason)
+            elif evaluation.verdict == "paused":
+                self.store.update_goal(goal.id, status="paused")
+                LOGGER.info("goal %s paused: %s", goal.id, evaluation.reason)
+            elif evaluation.verdict == "continue":
+                # Enqueue a continuation run
+                prompt = build_continuation_prompt(goal, evaluation)
+                request = {
+                    "prompt": prompt,
+                    "context_profile": "chat",
+                    "goal_id": goal.id,
+                    "goal_continuation": True,
+                }
+                continuation = await self.submit(run.conversation_id, request)
+                self.store.update_goal(goal.id, current_step=f"continuation run {continuation.id[:8]}")
+                LOGGER.info(
+                    "goal %s: enqueued continuation run %s (turn %d/%d)",
+                    goal.id, continuation.id, goal.turns_used, goal.max_turns,
+                )
+        except Exception:
+            LOGGER.exception("goal evaluation failed for run %s", run.id)

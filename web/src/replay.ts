@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { controlSocketUrl, getHome } from "./api";
-import type { ControlSnapshot, ControlState, PersistedEvent, PresentationState, RunRecord, ToolActivity } from "./types";
+import type { ActivityKind, ControlSnapshot, ControlState, NormalizedActivity, PersistedEvent, PresentationState, RunRecord, ToolActivity } from "./types";
 
 const MAX_ACTIVITY = 120;
 
@@ -29,26 +29,147 @@ function initialState(): ControlState {
   };
 }
 
+export function normalizeToolActivity(event: PersistedEvent): NormalizedActivity {
+  const payload = event.payload ?? {};
+  const toolName = String(payload.tool_name ?? payload.tool ?? "tool");
+  const toolInfo = (typeof payload.tool_info === "object" && payload.tool_info !== null) ? payload.tool_info as Record<string, unknown> : {};
+  const params = (typeof toolInfo.parameters === "object" && toolInfo.parameters !== null) ? toolInfo.parameters as Record<string, unknown> : {};
+  const output = typeof toolInfo.output === "string" ? toolInfo.output : typeof payload.output === "string" ? payload.output : undefined;
+  const errorObj = toolInfo.error ?? payload.error;
+  const error = typeof errorObj === "string" ? errorObj : typeof errorObj === "object" && errorObj !== null ? String((errorObj as Record<string, unknown>).message ?? JSON.stringify(errorObj)) : undefined;
+  const durationSeconds = typeof payload.duration_seconds === "number" ? payload.duration_seconds : undefined;
+  const state: NormalizedActivity["state"] = event.event_type === "tool.started" ? "running" : event.event_type === "tool.finished" ? "finished" : "failed";
+
+  let kind: ActivityKind = "other";
+  const explicitTitle = params.toolAction ? String(params.toolAction) : params.toolSummary ? String(params.toolSummary) : undefined;
+  let title = explicitTitle || toolName;
+  let detail = "";
+  let command: string | undefined;
+  let cwd: string | undefined;
+  let path: string | undefined;
+  let lines: string | undefined;
+  let query: string | undefined;
+
+  if (toolName === "run_command") {
+    kind = "command";
+    command = String(params.CommandLine ?? "");
+    cwd = params.Cwd ? String(params.Cwd) : undefined;
+    if (!explicitTitle) {
+      const trimmed = command.trim();
+      const firstWord = trimmed.split(/\s+/)[0] || "";
+      if (trimmed.startsWith("find ") || trimmed.includes("find /")) {
+        title = "Searching filesystem";
+      } else if (trimmed.startsWith("pytest") || trimmed.includes("pytest")) {
+        title = "Running backend test suite";
+      } else if (trimmed.startsWith("npm ") || trimmed.includes("vite")) {
+        title = "Building frontend assets";
+      } else if (trimmed.startsWith("curl ") || trimmed.startsWith("wget ")) {
+        title = "Testing network endpoint";
+      } else if (trimmed.startsWith("systemctl ") || trimmed.startsWith("service ")) {
+        title = "Managing system service";
+      } else if (trimmed.startsWith("git ")) {
+        title = `Git ${trimmed.split(/\s+/)[1] || "operation"}`;
+      } else {
+        title = `Execute ${firstWord || "command"}`;
+      }
+    }
+    detail = command;
+  } else if (toolName === "view_file" || toolName === "read_file" || toolName === "read_url_content") {
+    kind = "file";
+    path = String(params.AbsolutePath ?? params.Url ?? params.TargetFile ?? "");
+    const startLine = params.StartLine;
+    const endLine = params.EndLine;
+    lines = (startLine !== undefined && endLine !== undefined) ? `Lines ${startLine}–${endLine}` : undefined;
+    const fileName = path.split("/").pop() || path;
+    if (!explicitTitle) {
+      title = `Read ${fileName}`;
+    }
+    detail = `${path}${lines ? ` (${lines})` : ""}`;
+  } else if (toolName === "replace_file_content" || toolName === "write_to_file" || toolName === "edit_file") {
+    kind = "edit";
+    path = String(params.TargetFile ?? params.AbsolutePath ?? "");
+    const fileName = path.split("/").pop() || path;
+    const actionDesc = String(params.Description || params.Instruction || (toolName === "write_to_file" ? "Created file" : "Modified file"));
+    if (!explicitTitle) {
+      title = `${toolName === "write_to_file" ? "Create" : "Update"} ${fileName}`;
+    }
+    detail = `${path} · ${actionDesc}`;
+  } else if (toolName === "grep_search" || toolName === "find_by_name" || toolName === "search_web") {
+    kind = "search";
+    query = String(params.Query ?? params.Pattern ?? params.query ?? "");
+    if (!explicitTitle) {
+      title = query ? `Search "${query.length > 28 ? query.slice(0, 28) + "…" : query}"` : "Search repository";
+    }
+    detail = params.SearchPath ? `in ${String(params.SearchPath)}` : query;
+  } else if (toolName === "invoke_subagent" || toolName === "send_message") {
+    kind = "subagent";
+    if (!explicitTitle) {
+      title = params.Role ? String(params.Role) : "Subagent task";
+    }
+    detail = String(params.Prompt ?? params.Message ?? "");
+  } else {
+    const firstParam = Object.entries(params).find(([k]) => !["toolAction", "toolSummary"].includes(k));
+    detail = firstParam ? `${firstParam[0]}: ${String(firstParam[1])}` : title;
+  }
+
+  return {
+    id: `${event.run_id}:${event.sequence}`,
+    kind,
+    tool: toolName,
+    state,
+    title,
+    detail,
+    command,
+    cwd,
+    path,
+    lines,
+    query,
+    output,
+    error,
+    durationSeconds,
+    sequence: event.sequence,
+  };
+}
+
 export function presentationForRun(run: RunRecord, events: PersistedEvent[]): PresentationState {
   const presentation: PresentationState = {
-    runId: run.id, status: run.status, assistantText: "", currentTool: null,
-    completedTools: [], subagents: [],
+    runId: run.id,
+    status: run.status,
+    assistantText: "",
+    currentTool: null,
+    completedTools: [],
+    currentActivity: null,
+    completedActivities: [],
+    subagents: [],
+    currentTaskSummary: typeof run.request?.prompt === "string" ? run.request.prompt : undefined,
   };
+
   for (const event of events.slice().sort((left, right) => left.sequence - right.sequence)) {
-    const payload = event.payload;
+    const payload = event.payload ?? {};
     if (event.event_type === "message.delta") {
       presentation.assistantText += typeof payload.text_delta === "string" ? payload.text_delta : "";
     } else if (event.event_type === "tool.started" || event.event_type === "tool.finished" || event.event_type === "tool.failed") {
-      const tool: ToolActivity = {
-        id: `${run.id}:${event.sequence}`,
-        name: String(payload.tool_name ?? payload.tool ?? "Tool activity"),
-        state: event.event_type === "tool.started" ? "running" : event.event_type === "tool.finished" ? "finished" : "failed",
-        detail: String(payload.tool_info ?? payload.command ?? "Observable tool execution"),
+      const normalized = normalizeToolActivity(event);
+      const legacyTool: ToolActivity = {
+        id: normalized.id,
+        name: normalized.tool,
+        state: normalized.state,
+        detail: normalized.detail || normalized.title,
+        output: normalized.output,
+        durationMs: normalized.durationSeconds ? Math.round(normalized.durationSeconds * 1000) : undefined,
+        sequence: normalized.sequence,
       };
-      if (tool.state === "running") presentation.currentTool = tool;
-      else {
-        presentation.completedTools = [...presentation.completedTools, tool];
-        if (presentation.currentTool?.name === tool.name) presentation.currentTool = null;
+
+      if (normalized.state === "running") {
+        presentation.currentTool = legacyTool;
+        presentation.currentActivity = normalized;
+      } else {
+        presentation.completedTools = [...presentation.completedTools.filter(t => t.id !== legacyTool.id), legacyTool];
+        presentation.completedActivities = [...presentation.completedActivities.filter(a => a.id !== normalized.id), normalized];
+        if (presentation.currentTool?.name === legacyTool.name || presentation.currentActivity?.id === normalized.id) {
+          presentation.currentTool = null;
+          presentation.currentActivity = null;
+        }
       }
     } else if (event.event_type === "subagent.updated") {
       const info = payload.subagent_info;

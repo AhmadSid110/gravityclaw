@@ -1,10 +1,38 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="midnight" data-font="modern" data-density="comfortable">
   <head>
     <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <meta name="theme-color" content="#0b0d12" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <script>
+      // Zero-flash pre-React theme, font, and density initialization
+      (() => {
+        try {
+          const theme = localStorage.getItem("gravityclaw-theme") || "midnight";
+          const font = localStorage.getItem("gravityclaw-font") || "modern";
+          const density = localStorage.getItem("gravityclaw-density") || "comfortable";
+          const root = document.documentElement;
+          root.dataset.theme = theme;
+          root.dataset.font = font;
+          root.dataset.density = density;
+        } catch (e) {}
+      })();
+    </script>
+    <script>
+      // Resolve relative production assets correctly when the console is opened
+      // at a reverse-proxy path without a trailing slash (for example /gravityclaw).
+      const base = document.createElement("base");
+      const pathname = window.location.pathname;
+      base.href = pathname.endsWith("/") ? pathname : `${pathname}/`;
+      document.head.appendChild(base);
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Lora:ital,wght@0,500;0,600;1,400&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#0a0d14" />
     <title>GravityClaw · Control Center</title>
   </head>
   <body>

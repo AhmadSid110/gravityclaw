@@ -348,13 +348,20 @@ class CapabilityManager:
             for ref in server.get("secret_refs", []):
                 name = str(ref).split(":", 1)[1]
                 environment[_secret_env_name(str(ref))] = self.resolve_secret(str(ref))
-        mounts = list(spec.mounts)
         skills = root / "skills"
+        command = list(spec.command)
+        if spec.image == "host":
+            if skills.is_dir() and manifest.get("skills") and command and Path(command[0]).name in {"agy", "antigravity"}:
+                command.extend(["--add-dir", str(skills)])
+            if manifest.get("mcp"):
+                environment["ANTIGRAVITY_MCP_CONFIG"] = str(root / "mcp_config.json")
+            return replace(spec, command=tuple(command), environment=environment)
+
+        mounts = list(spec.mounts)
         if skills.is_dir() and manifest.get("skills"):
             mounts.append((skills, "/gravityclaw/capabilities/skills", "ro"))
         if manifest.get("mcp"):
             mounts.append((root / "mcp_config.json", "/home/worker/.gemini/config/mcp_config.json", "ro"))
-        command = list(spec.command)
         if manifest.get("skills") and command and Path(command[0]).name in {"agy", "antigravity"}:
             command.extend(["--add-dir", "/gravityclaw/capabilities/skills"])
         return replace(spec, command=tuple(command), mounts=tuple(mounts), environment=environment)

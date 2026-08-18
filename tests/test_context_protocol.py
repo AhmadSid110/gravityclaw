@@ -178,7 +178,7 @@ class ContextProtocolTests(unittest.TestCase):
     def test_compiler_failure_has_no_partial_context_or_summary_mutation(self) -> None:
         for i in range(10):
             self.store.append_message(self.conversation.id, "system", f"history {i}")
-        run = self.store.submit_run(self.conversation.id, {"prompt": "x" * 20_000})
+        run = self.store.submit_run(self.conversation.id, {"prompt": "x" * 7_000_000})
         compiler = RunContextCompiler(self.store, self.identity, self.memory)
         with self.assertRaises(ValueError):
             compiler.compile(run, self.conversation)
@@ -204,7 +204,7 @@ class ContextSchemaMigrationTests(unittest.TestCase):
                 tables = {row[0] for row in connection.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )}
-            self.assertEqual(version, "9")
+            self.assertEqual(version, "17")
             self.assertTrue({"context_manifests", "context_watermarks", "conversation_summaries", "artifacts"} <= tables)
 
 

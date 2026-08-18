@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import uuid
@@ -21,7 +22,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .events import AgentEvent
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 17
 RUN_STATUSES = (
     "queued",
     "running",
@@ -68,8 +69,12 @@ class Conversation:
     channel_key: str | None
     title: str | None
     agy_conversation_id: str | None
+    model_override: str | None
+    effort_override: str | None
     created_at: str
     updated_at: str
+    kind: str = "normal"
+    archived_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +219,37 @@ class TriggerRecord:
     updated_at: str
 
 
+GOAL_STATUSES = ("active", "paused", "completed", "cancelled", "failed")
+GOAL_VERDICTS = ("continue", "done", "failed", "paused")
+
+
+@dataclass(frozen=True, slots=True)
+class GoalRecord:
+    id: str
+    conversation_id: str
+    objective: str
+    acceptance: list[dict[str, Any]]
+    status: str
+    max_turns: int
+    turns_used: int
+    current_step: str | None
+    last_run_id: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class GoalEvaluationRecord:
+    id: str
+    goal_id: str
+    run_id: str | None
+    turn_number: int
+    verdict: str
+    reason: str | None
+    acceptance_state: list[dict[str, Any]]
+    created_at: str
+
+
 class Store:
     """Small synchronous repository with one connection per transaction."""
 
@@ -241,6 +277,11 @@ class Store:
                 connection.executescript(_CAPABILITY_SCHEMA)
                 connection.executescript(_CONTROL_SCHEMA)
                 connection.executescript(_IDENTITY_SCHEMA)
+                connection.executescript(_GOAL_SCHEMA)
+                connection.executescript(_LEARNING_SCHEMA)
+                connection.executescript(_SKILLS_SCHEMA)
+                connection.executescript(_CONTEXT_SNAPSHOT_SCHEMA)
+                connection.executescript(_ATTACHMENT_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -305,6 +346,63 @@ class Store:
             if version == 8:
                 connection.executescript(_IDENTITY_SCHEMA)
                 self._set_schema_version(connection, 9)
+                version = 9
+            if version == 9:
+                columns = {
+                    str(item["name"])
+                    for item in connection.execute("PRAGMA table_info(conversations)").fetchall()
+                }
+                if "model_override" not in columns:
+                    connection.execute(
+                        "ALTER TABLE conversations ADD COLUMN model_override TEXT"
+                    )
+                self._set_schema_version(connection, 10)
+                version = 10
+            if version == 10:
+                columns = {
+                    str(item["name"])
+                    for item in connection.execute("PRAGMA table_info(conversations)").fetchall()
+                }
+                if "effort_override" not in columns:
+                    connection.execute(
+                        "ALTER TABLE conversations ADD COLUMN effort_override TEXT"
+                    )
+                self._set_schema_version(connection, 11)
+                version = 11
+            if version == 11:
+                connection.executescript(_GOAL_SCHEMA)
+                self._set_schema_version(connection, 12)
+                version = 12
+            if version == 12:
+                connection.executescript(_LEARNING_SCHEMA)
+                self._set_schema_version(connection, 13)
+                version = 13
+            if version == 13:
+                connection.executescript(_SKILLS_SCHEMA)
+                self._set_schema_version(connection, 14)
+                version = 14
+            if version == 14:
+                connection.executescript(_CONTEXT_SNAPSHOT_SCHEMA)
+                self._set_schema_version(connection, 15)
+                version = 15
+            if version == 15:
+                connection.executescript(_ATTACHMENT_SCHEMA)
+                self._set_schema_version(connection, 16)
+                version = 16
+            if version == 16:
+                columns = {
+                    str(item["name"])
+                    for item in connection.execute("PRAGMA table_info(conversations)").fetchall()
+                }
+                if "kind" not in columns:
+                    connection.execute(
+                        "ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'"
+                    )
+                if "archived_at" not in columns:
+                    connection.execute(
+                        "ALTER TABLE conversations ADD COLUMN archived_at TEXT"
+                    )
+                self._set_schema_version(connection, 17)
             connection.executescript(_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
             connection.executescript(_CONTEXT_SCHEMA)
@@ -312,7 +410,14 @@ class Store:
             connection.executescript(_CAPABILITY_SCHEMA)
             connection.executescript(_CONTROL_SCHEMA)
             connection.executescript(_IDENTITY_SCHEMA)
+            connection.executescript(_GOAL_SCHEMA)
+            connection.executescript(_LEARNING_SCHEMA)
+            connection.executescript(_SKILLS_SCHEMA)
+            connection.executescript(_CONTEXT_SNAPSHOT_SCHEMA)
+            connection.executescript(_ATTACHMENT_SCHEMA)
             self._ensure_message_index(connection)
+            for ws_row in connection.execute("SELECT id FROM workspaces").fetchall():
+                self._ensure_main_conversation_tx(connection, str(ws_row["id"]))
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -348,6 +453,37 @@ class Store:
         finally:
             connection.close()
 
+    @staticmethod
+    def _ensure_main_conversation_tx(connection: sqlite3.Connection, workspace_id: str) -> None:
+        row = connection.execute(
+            "SELECT id FROM conversations WHERE workspace_id=? AND kind='main' AND archived_at IS NULL",
+            (workspace_id,),
+        ).fetchone()
+        if row is None:
+            now = utc_now()
+            main_id = f"conv_main_{workspace_id[:8]}" if workspace_id != "default" else "conv_main"
+            existing = connection.execute("SELECT id FROM conversations WHERE id=?", (main_id,)).fetchone()
+            if existing is not None:
+                main_id = f"conv_main_{uuid.uuid4().hex[:8]}"
+            connection.execute(
+                """INSERT INTO conversations(
+                    id, workspace_id, channel, channel_key, title, kind,
+                    model_override, effort_override, created_at, updated_at
+                ) VALUES(?, ?, 'system', ?, 'Main', 'main', NULL, NULL, ?, ?)""",
+                (main_id, workspace_id, f"system:main:{workspace_id}", now, now),
+            )
+
+    def ensure_main_conversation(self, workspace_id: str) -> Conversation:
+        with self._connect() as connection:
+            self._ensure_main_conversation_tx(connection, workspace_id)
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE workspace_id=? AND kind='main' AND archived_at IS NULL",
+                (workspace_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"main conversation not found for workspace {workspace_id}")
+        return _conversation(row)
+
     def create_workspace(self, name: str, path: Path) -> Workspace:
         resolved = path.resolve()
         resolved.mkdir(parents=True, exist_ok=True)
@@ -358,6 +494,7 @@ class Store:
                 "INSERT INTO workspaces(id, name, path, created_at) VALUES(?, ?, ?, ?)",
                 (record.id, record.name, str(record.path), record.created_at),
             )
+            self._ensure_main_conversation_tx(connection, record.id)
         return record
 
     def get_workspace(self, workspace_id: str) -> Workspace:
@@ -384,27 +521,161 @@ class Store:
         channel: str = "web",
         channel_key: str | None = None,
         title: str | None = None,
+        kind: str = "normal",
+        model_override: str | None = None,
     ) -> Conversation:
         now = utc_now()
         record = Conversation(
-            str(uuid.uuid4()), workspace_id, channel, channel_key, title, None, now, now
+            str(uuid.uuid4()),
+            workspace_id,
+            channel,
+            channel_key,
+            title or ("Main" if kind == "main" else "New chat"),
+            None,
+            model_override,
+            None,
+            now,
+            now,
+            kind,
+            None,
         )
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO conversations(
-                    id, workspace_id, channel, channel_key, title, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                    id, workspace_id, channel, channel_key, title, kind, model_override,
+                    effort_override, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.id,
                     workspace_id,
                     channel,
                     channel_key,
-                    title,
+                    record.title,
+                    kind,
+                    model_override,
+                    None,
                     now,
                     now,
                 ),
             )
         return record
+
+    def archive_conversation(self, conversation_id: str) -> Conversation:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"conversation not found: {conversation_id}")
+            if row["kind"] == "main":
+                raise ValueError("Main conversation cannot be archived")
+            now = utc_now()
+            connection.execute(
+                "UPDATE conversations SET archived_at=?, updated_at=? WHERE id=?",
+                (now, now, conversation_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return _conversation(updated)
+
+    def update_conversation(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        model_override: str | None = None,
+    ) -> Conversation:
+        now = utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"conversation not found: {conversation_id}")
+            new_title = title if title is not None else row["title"]
+            new_model = model_override if model_override is not None else row["model_override"]
+            connection.execute(
+                "UPDATE conversations SET title=?, model_override=?, updated_at=? WHERE id=?",
+                (new_title, new_model, now, conversation_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return _conversation(updated)
+
+    def restore_conversation(self, conversation_id: str) -> Conversation:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"conversation not found: {conversation_id}")
+            now = utc_now()
+            connection.execute(
+                "UPDATE conversations SET archived_at=NULL, updated_at=? WHERE id=?",
+                (now, conversation_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return _conversation(updated)
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"conversation not found: {conversation_id}")
+            if row["kind"] == "main":
+                raise ValueError("Main conversation cannot be deleted")
+            connection.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+            connection.execute("DELETE FROM conversation_summaries WHERE conversation_id=?", (conversation_id,))
+            connection.execute("DELETE FROM attachments WHERE conversation_id=?", (conversation_id,))
+            connection.execute("DELETE FROM channel_bindings WHERE conversation_id=?", (conversation_id,))
+            connection.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+
+    def search_conversations(
+        self,
+        query: str,
+        *,
+        workspace_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        clean = query.strip()
+        if not clean:
+            return []
+        like_pattern = f"%{clean}%"
+        params: list[Any] = [like_pattern, like_pattern]
+        ws_clause = ""
+        if workspace_id:
+            ws_clause = " AND c.workspace_id = ?"
+            params.append(workspace_id)
+        params.append(limit)
+        
+        sql = f"""
+            SELECT c.id as conversation_id, c.title, c.kind, m.id as message_id, m.role, m.content, m.created_at
+            FROM messages m
+            JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.archived_at IS NULL AND (m.content LIKE ? OR c.title LIKE ?) {ws_clause}
+            ORDER BY m.created_at DESC
+            LIMIT ?
+        """
+        with self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [
+            {
+                "conversation_id": row["conversation_id"],
+                "title": row["title"],
+                "kind": row["kind"],
+                "message_id": row["message_id"],
+                "role": row["role"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def get_conversation(self, conversation_id: str) -> Conversation:
         with self._connect() as connection:
@@ -424,6 +695,96 @@ class Store:
                 (channel, channel_key),
             ).fetchone()
         return _conversation(row) if row is not None else None
+
+    def get_model_default(self) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='model_default'"
+            ).fetchone()
+        return str(row["value"]) if row is not None and row["value"] else None
+
+    def ensure_model_default(self, model: str | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES('model_default', ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (model or "",),
+            )
+
+    def set_model_default(self, model: str | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES('model_default', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (model or "",),
+            )
+
+    def set_model_catalog(self, catalog: Mapping[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES('model_catalog', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(dict(catalog), ensure_ascii=False, separators=(",", ":")),),
+            )
+
+    def get_model_catalog(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='model_catalog'"
+            ).fetchone()
+        if row is None:
+            return {"models": [], "default_model": self.get_model_default(), "agy_version": "unknown", "source": "server"}
+        return json.loads(row["value"])
+
+    def _snapshot_model_request_tx(
+        self, connection: sqlite3.Connection, conversation_id: str,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        conversation = connection.execute(
+            "SELECT model_override, effort_override FROM conversations WHERE id=?", (conversation_id,)
+        ).fetchone()
+        if conversation is None:
+            raise KeyError(f"conversation not found: {conversation_id}")
+        default_row = connection.execute(
+            "SELECT value FROM metadata WHERE key='model_default'"
+        ).fetchone()
+        version_row = connection.execute(
+            "SELECT value FROM metadata WHERE key='agy_version'"
+        ).fetchone()
+        requested = str(conversation["model_override"]).strip() if conversation["model_override"] else None
+        resolved = requested or (str(default_row["value"]).strip() if default_row and default_row["value"] else None)
+        effort = str(conversation["effort_override"]).strip() if conversation["effort_override"] else None
+        snapshot = dict(request)
+        snapshot["requested_model"] = requested
+        snapshot["resolved_model"] = resolved
+        snapshot["model_policy"] = "explicit" if requested else "default"
+        snapshot["effort"] = effort
+        snapshot["agy_version"] = str(request.get("agy_version") or (version_row["value"] if version_row else "unknown"))
+        return snapshot
+
+    def set_conversation_model(self, conversation_id: str, model: str | None) -> Conversation:
+        value = model.strip() if model else None
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET model_override=?, updated_at=? WHERE id=?",
+                (value, utc_now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"conversation not found: {conversation_id}")
+        return self.get_conversation(conversation_id)
+
+    def set_conversation_effort(self, conversation_id: str, effort: str | None) -> Conversation:
+        if effort and effort not in ("low", "medium", "high"):
+            raise ValueError("effort must be low, medium, or high")
+        value = effort.strip() if effort else None
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET effort_override=?, updated_at=? WHERE id=?",
+                (value, utc_now(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"conversation not found: {conversation_id}")
+        return self.get_conversation(conversation_id)
 
     def bind_backend_conversation(self, conversation_id: str, backend_id: str) -> None:
         if not backend_id:
@@ -572,8 +933,9 @@ class Store:
         now = utc_now()
         run_id = str(uuid.uuid4())
         message_id = str(uuid.uuid4())
-        request_json = json.dumps(dict(request), ensure_ascii=False, separators=(",", ":"))
         with self._connect() as connection:
+            request_snapshot = self._snapshot_model_request_tx(connection, conversation_id, request)
+            request_json = json.dumps(request_snapshot, ensure_ascii=False, separators=(",", ":"))
             connection.execute(
                 """INSERT INTO runs(
                     id, conversation_id, status, backend, request_json, created_at, version
@@ -586,6 +948,14 @@ class Store:
                 ) VALUES(?, ?, 'user', ?, ?, ?)""",
                 (message_id, conversation_id, prompt, now, run_id),
             )
+            attachment_ids = request.get("attachment_ids") or []
+            if isinstance(attachment_ids, (list, tuple)):
+                for att_id in attachment_ids:
+                    if isinstance(att_id, str) and att_id.strip():
+                        connection.execute(
+                            "UPDATE attachments SET message_id=? WHERE id=?",
+                            (message_id, att_id.strip()),
+                        )
             connection.execute(
                 "UPDATE conversations SET updated_at=? WHERE id=?", (now, conversation_id)
             )
@@ -603,8 +973,9 @@ class Store:
     ) -> RunRecord:
         now = utc_now()
         run_id = str(uuid.uuid4())
-        request_json = json.dumps(dict(request), ensure_ascii=False, separators=(",", ":"))
         with self._connect() as connection:
+            request_snapshot = self._snapshot_model_request_tx(connection, conversation_id, request)
+            request_json = json.dumps(request_snapshot, ensure_ascii=False, separators=(",", ":"))
             connection.execute(
                 """INSERT INTO runs(
                     id, conversation_id, status, backend, request_json, created_at, version
@@ -1040,7 +1411,7 @@ class Store:
                 None,
                 None,
             )
-            if status == "completed" and assistant_response and assistant_response.strip():
+            if assistant_response and assistant_response.strip():
                 conversation_id = connection.execute(
                     "SELECT conversation_id FROM runs WHERE id=?", (run_id,)
                 ).fetchone()["conversation_id"]
@@ -1112,8 +1483,53 @@ class Store:
             ).fetchall()
         return [_run(row) for row in rows]
 
+    def get_usage_summary(self, *, days: int = 30) -> dict[str, Any]:
+        """Aggregate run counts and token usage over recent days."""
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        with self._connect() as connection:
+            total_runs = connection.execute(
+                "SELECT COUNT(*) AS cnt FROM runs WHERE created_at >= ?", (cutoff,)
+            ).fetchone()["cnt"]
+            completed_runs = connection.execute(
+                "SELECT COUNT(*) AS cnt FROM runs WHERE status='completed' AND created_at >= ?", (cutoff,)
+            ).fetchone()["cnt"]
+            token_row = connection.execute(
+                """SELECT COALESCE(SUM(cm.used_tokens), 0) AS total_tokens,
+                          COALESCE(SUM(cm.budget_tokens), 0) AS total_budget
+                   FROM context_manifests cm
+                   JOIN runs r ON r.id = cm.run_id
+                   WHERE r.created_at >= ?""",
+                (cutoff,),
+            ).fetchone()
+            model_breakdown = connection.execute(
+                """SELECT json_extract(r.request_json, '$.resolved_model') AS model,
+                          COUNT(*) AS runs,
+                          COALESCE(SUM(cm.used_tokens), 0) AS tokens
+                   FROM runs r
+                   LEFT JOIN context_manifests cm ON cm.run_id = r.id
+                   WHERE r.created_at >= ?
+                   GROUP BY model
+                   ORDER BY runs DESC""",
+                (cutoff,),
+            ).fetchall()
+        return {
+            "period_days": days,
+            "total_runs": total_runs,
+            "completed_runs": completed_runs,
+            "total_tokens_used": token_row["total_tokens"],
+            "total_budget_tokens": token_row["total_budget"],
+            "models": [
+                {"model": row["model"] or "unknown", "runs": row["runs"], "tokens": row["tokens"]}
+                for row in model_breakdown
+            ],
+        }
+
     def list_conversations(
-        self, *, workspace_id: str | None = None, channel: str | None = None,
+        self,
+        *,
+        workspace_id: str | None = None,
+        channel: str | None = None,
+        include_archived: bool = False,
         limit: int = 200,
     ) -> list[Conversation]:
         clauses: list[str] = []
@@ -1124,12 +1540,15 @@ class Store:
         if channel is not None:
             clauses.append("channel=?")
             parameters.append(channel)
+        if not include_archived:
+            clauses.append("archived_at IS NULL")
         parameters.append(limit)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM conversations" + where +
-                " ORDER BY updated_at DESC LIMIT ?", parameters
+                " ORDER BY CASE WHEN kind='main' THEN 0 ELSE 1 END, updated_at DESC LIMIT ?",
+                parameters,
             ).fetchall()
         return [_conversation(row) for row in rows]
 
@@ -1843,6 +2262,24 @@ class Store:
             raise KeyError(f"memory not found: {memory_id}")
         return dict(row)
 
+    def update_memory(self, memory_id: str, *, content: str) -> None:
+        """Update a memory record's content."""
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE memories SET content=?, updated_at=? WHERE id=?",
+                (content, now, memory_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"memory not found: {memory_id}")
+
+    def delete_memory(self, memory_id: str) -> None:
+        """Delete a memory record."""
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+            if cursor.rowcount == 0:
+                raise KeyError(f"memory not found: {memory_id}")
+
     def memory_usage(self, memory_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         label = f"memory:{memory_id}"
         with self._connect() as connection:
@@ -1970,6 +2407,180 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def conversation_context_status(self, conversation_id: str, *, limit: int = 5, profile_budgets: dict[str, int] | None = None) -> dict[str, Any]:
+        self.get_conversation(conversation_id)
+        runs = self.list_runs(conversation_id=conversation_id)
+        messages = self.list_messages(conversation_id, limit=10000)
+        total_turns = len(messages)
+        conversation_total_tokens = sum(math.ceil(len(m.content.encode("utf-8")) / 3) for m in messages)
+        summaries = self.list_conversation_summaries(conversation_id)
+        compactions_count = len(summaries)
+        latest_summary = summaries[-1] if summaries else None
+        compacted_count = int(latest_summary.get("message_count", 0)) if latest_summary else 0
+
+        manifests: list[tuple[RunRecord, dict[str, Any]]] = []
+        for run in runs:
+            try:
+                manifests.append((run, self.get_context_manifest(run.id)))
+            except KeyError:
+                continue
+        active = next((item for item in reversed(manifests) if item[0].status in {"running", "queued"}), None)
+        selected = active or (manifests[-1] if manifests else None)
+
+        default_budget = 128_000
+        if profile_budgets:
+            default_budget = profile_budgets.get("chat", 128_000)
+
+        def _resolve_budget(manifest: dict[str, Any]) -> int:
+            """Use the current profile budget if available, otherwise fall back to stored value."""
+            if profile_budgets:
+                profile_name = str(manifest.get("profile", "chat"))
+                return profile_budgets.get(profile_name, 128_000)
+            return int(manifest.get("budget_tokens", 0) or 0) or default_budget
+
+        recent: list[dict[str, Any]] = []
+        for run, manifest in reversed(manifests[-limit:]):
+            budget_for_run = _resolve_budget(manifest)
+            used = int(manifest.get("estimated_tokens", manifest.get("used_tokens", 0)) or 0)
+            recent.append({
+                "run_id": run.id,
+                "status": run.status,
+                "state": "current" if active and run.id == active[0].id else "last",
+                "used_tokens": used,
+                "budget_tokens": budget_for_run,
+                "percent": round((used / budget_for_run) * 100, 1) if budget_for_run else 0,
+                "created_at": run.created_at,
+            })
+        if selected is None:
+            identity_tokens = 1200
+            memory_tokens = 50
+            operational_tokens = 20
+            conv_tokens = conversation_total_tokens
+            estimated_used = identity_tokens + memory_tokens + operational_tokens + conv_tokens
+            return {
+                "run_id": None, "state": "none", "used_tokens": estimated_used, "budget_tokens": default_budget,
+                "percent": round((estimated_used / default_budget) * 100, 1) if default_budget else 0,
+                "generation_reserve": max(0, default_budget - estimated_used),
+                "last_compaction": None,
+                "messages_compacted": 0,
+                "compactions_count": 0,
+                "conversation_total_tokens": conversation_total_tokens,
+                "breakdown": {
+                    "identity": identity_tokens,
+                    "conversation": conv_tokens,
+                    "memory": memory_tokens,
+                    "operational": operational_tokens,
+                    "artifacts": 0,
+                },
+                "conversation": {
+                    "total": conv_tokens,
+                    "summary": 0,
+                    "recent": conv_tokens,
+                },
+                "memory_items": [], "memory_excluded": 0, "recent": recent,
+                "model": None, "context_profile": "chat",
+                "conversation_turns": {
+                    "total": total_turns,
+                    "summary_range": None,
+                    "recent_range": [1, total_turns] if total_turns > 0 else None,
+                    "watermark_turn": total_turns,
+                },
+                "watermark_turn": total_turns,
+            }
+        run, manifest = selected
+        all_sources = [item for item in manifest.get("sources", []) if isinstance(item, dict)]
+        sources = [item for item in all_sources if item.get("included")]
+        breakdown = {"identity": 0, "conversation": 0, "memory": 0, "operational": 0, "artifacts": 0}
+        conversation_breakdown = {"summary": 0, "recent": 0}
+        memory_items: list[dict[str, Any]] = []
+        memory_excluded = 0
+        recent_turn_count = 0
+        summary_turn_range: dict[str, int | None] = {"first": None, "last": None}
+        for source in all_sources:
+            tokens = int(source.get("estimated_tokens", 0) or 0)
+            category = str(source.get("category", "operational"))
+            included = source.get("included", False)
+            if category in {"curated_memory", "retrieved_memory"}:
+                if included:
+                    memory_items.append({"label": source.get("label"), "tokens": tokens, "confidence": source.get("confidence"), "included": True})
+                else:
+                    memory_excluded += 1
+            if not included:
+                continue
+            if category == "identity":
+                bucket = "identity"
+            elif category in {"history", "conversation_summary"}:
+                bucket = "conversation"
+                if category == "conversation_summary":
+                    conversation_breakdown["summary"] += tokens
+                else:
+                    conversation_breakdown["recent"] += tokens
+                    recent_turn_count += 1
+            elif category in {"curated_memory", "retrieved_memory"}:
+                bucket = "memory"
+            elif category == "artifact":
+                bucket = "artifacts"
+            else:
+                bucket = "operational"
+            breakdown[bucket] += tokens
+
+        summary_first = 1
+        summary_last = compacted_count if compacted_count else None
+        recent_first = (compacted_count + 1) if compacted_count else 1
+        recent_last = total_turns
+
+        # Model from the run request
+        model = run.request.get("model") or run.request.get("resolved_model")
+        context_profile = str(manifest.get("profile", "chat"))
+
+        budget = _resolve_budget(manifest)
+
+        if breakdown["conversation"] == 0 and conversation_total_tokens > 0:
+            breakdown["conversation"] = conversation_total_tokens
+            conversation_breakdown["recent"] = conversation_total_tokens
+
+        total_active_used = (
+            breakdown["identity"]
+            + breakdown["conversation"]
+            + breakdown["memory"]
+            + breakdown["operational"]
+            + breakdown["artifacts"]
+        )
+        used = max(int(manifest.get("estimated_tokens", manifest.get("used_tokens", 0)) or 0), total_active_used)
+
+        return {
+            "run_id": run.id,
+            "state": "current" if active and run.id == active[0].id else "last",
+            "status": run.status,
+            "model": model,
+            "context_profile": context_profile,
+            "used_tokens": used,
+            "budget_tokens": budget,
+            "percent": round((used / budget) * 100, 1) if budget else 0,
+            "generation_reserve": max(0, budget - used),
+            "last_compaction": latest_summary.get("created_at") if latest_summary else None,
+            "messages_compacted": compacted_count,
+            "compactions_count": compactions_count,
+            "conversation_total_tokens": conversation_total_tokens,
+            "breakdown": breakdown,
+            "conversation": {
+                "total": breakdown["conversation"],
+                "summary": conversation_breakdown["summary"],
+                "recent": conversation_breakdown["recent"],
+            },
+            "conversation_turns": {
+                "total": total_turns,
+                "summary_range": [summary_first, summary_last] if summary_last else None,
+                "recent_range": [recent_first, recent_last] if recent_last >= recent_first else None,
+                "watermark_turn": total_turns,
+            },
+            "watermark_turn": total_turns,
+            "memory_items": memory_items,
+            "memory_excluded": memory_excluded,
+            "recent": recent,
+            "manifest": manifest,
+        }
+
     def add_artifact(
         self,
         run_id: str,
@@ -2053,8 +2664,563 @@ class Store:
             int(row["characters"]), 0, row["created_at"],
         )
 
+    # ──────────────────────────────────────────────────────────────────
+    # Goals
+    # ──────────────────────────────────────────────────────────────────
+
+    def create_goal(
+        self,
+        conversation_id: str,
+        objective: str,
+        *,
+        acceptance: list[dict[str, Any]] | None = None,
+        max_turns: int = 12,
+        goal_id: str | None = None,
+    ) -> GoalRecord:
+        if not objective.strip():
+            raise ValueError("objective must not be empty")
+        if max_turns < 1:
+            raise ValueError("max_turns must be at least 1")
+        now = utc_now()
+        record = GoalRecord(
+            id=goal_id or str(uuid.uuid4()),
+            conversation_id=conversation_id,
+            objective=objective.strip(),
+            acceptance=acceptance or [],
+            status="active",
+            max_turns=max_turns,
+            turns_used=0,
+            current_step=None,
+            last_run_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone() is None:
+                raise KeyError(f"conversation not found: {conversation_id}")
+            # Only one active/paused goal per conversation (enforced by unique index too).
+            existing = connection.execute(
+                "SELECT id FROM goals WHERE conversation_id=? AND status IN ('active','paused')",
+                (conversation_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(
+                    f"conversation already has an active goal: {existing['id']}"
+                )
+            connection.execute(
+                """INSERT INTO goals(
+                    id, conversation_id, objective, acceptance_json, status,
+                    max_turns, turns_used, current_step, last_run_id,
+                    created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.id, record.conversation_id, record.objective,
+                    json.dumps(record.acceptance), record.status, record.max_turns,
+                    record.turns_used, record.current_step, record.last_run_id,
+                    record.created_at, record.updated_at,
+                ),
+            )
+        return record
+
+    def get_goal(self, goal_id: str) -> GoalRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"goal not found: {goal_id}")
+        return _goal(row)
+
+    def get_active_goal(self, conversation_id: str) -> GoalRecord | None:
+        """Return the active/paused goal for a conversation, or None."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM goals WHERE conversation_id=? AND status IN ('active','paused') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+        return _goal(row) if row else None
+
+    def list_goals(
+        self,
+        conversation_id: str | None = None,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        limit: int = 50,
+    ) -> list[GoalRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conversation_id:
+            clauses.append("conversation_id=?")
+            params.append(conversation_id)
+        if statuses:
+            placeholders = ",".join("?" * len(statuses))
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM goals{where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_goal(row) for row in rows]
+
+    def update_goal(
+        self,
+        goal_id: str,
+        *,
+        status: str | None = None,
+        current_step: str | None = ...,  # type: ignore[assignment]
+        last_run_id: str | None = ...,  # type: ignore[assignment]
+        turns_used: int | None = None,
+        acceptance: list[dict[str, Any]] | None = None,
+    ) -> GoalRecord:
+        now = utc_now()
+        sets: list[str] = ["updated_at=?"]
+        params: list[Any] = [now]
+        if status is not None:
+            if status not in GOAL_STATUSES:
+                raise ValueError(f"invalid goal status: {status}")
+            sets.append("status=?")
+            params.append(status)
+        if current_step is not ...:
+            sets.append("current_step=?")
+            params.append(current_step)
+        if last_run_id is not ...:
+            sets.append("last_run_id=?")
+            params.append(last_run_id)
+        if turns_used is not None:
+            sets.append("turns_used=?")
+            params.append(turns_used)
+        if acceptance is not None:
+            sets.append("acceptance_json=?")
+            params.append(json.dumps(acceptance))
+        params.append(goal_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE goals SET {', '.join(sets)} WHERE id=?",
+                params,
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"goal not found: {goal_id}")
+            row = connection.execute(
+                "SELECT * FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+        return _goal(row)
+
+    def increment_goal_turn(self, goal_id: str, run_id: str) -> GoalRecord:
+        """Atomically increment turns_used and link the latest run."""
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE goals SET turns_used=turns_used+1, last_run_id=?, updated_at=? WHERE id=?",
+                (run_id, now, goal_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"goal not found: {goal_id}")
+            row = connection.execute(
+                "SELECT * FROM goals WHERE id=?", (goal_id,)
+            ).fetchone()
+        return _goal(row)
+
+    def record_goal_evaluation(
+        self,
+        goal_id: str,
+        run_id: str | None,
+        turn_number: int,
+        verdict: str,
+        reason: str | None = None,
+        acceptance_state: list[dict[str, Any]] | None = None,
+    ) -> GoalEvaluationRecord:
+        if verdict not in GOAL_VERDICTS:
+            raise ValueError(f"invalid verdict: {verdict}")
+        now = utc_now()
+        record = GoalEvaluationRecord(
+            id=str(uuid.uuid4()),
+            goal_id=goal_id,
+            run_id=run_id,
+            turn_number=turn_number,
+            verdict=verdict,
+            reason=reason,
+            acceptance_state=acceptance_state or [],
+            created_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO goal_evaluations(
+                    id, goal_id, run_id, turn_number, verdict, reason,
+                    acceptance_state_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.id, record.goal_id, record.run_id, record.turn_number,
+                    record.verdict, record.reason, json.dumps(record.acceptance_state),
+                    record.created_at,
+                ),
+            )
+        return record
+
+    def list_goal_evaluations(
+        self, goal_id: str, *, limit: int = 50
+    ) -> list[GoalEvaluationRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM goal_evaluations WHERE goal_id=? ORDER BY turn_number DESC LIMIT ?",
+                (goal_id, limit),
+            ).fetchall()
+        return [_goal_evaluation(row) for row in rows]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Learning
+    # ──────────────────────────────────────────────────────────────────
+
+    def create_learning_job(
+        self,
+        run_id: str,
+        conversation_id: str,
+        gate_score: float,
+        gate_signals: list[str],
+        context: dict[str, Any],
+        *,
+        job_id: str | None = None,
+    ) -> "LearningJob":
+        from .learning import LearningJob
+        now = utc_now()
+        record_id = job_id or str(uuid.uuid4())
+        context_json = json.dumps(context)
+        signals_json = json.dumps(gate_signals)
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO learning_jobs(
+                    id, run_id, conversation_id, state, gate_score,
+                    gate_signals_json, context_json, result_json,
+                    attempts, created_at, started_at, completed_at
+                ) VALUES(?, ?, ?, 'pending', ?, ?, ?, NULL, 0, ?, NULL, NULL)""",
+                (record_id, run_id, conversation_id, gate_score,
+                 signals_json, context_json, now),
+            )
+        return LearningJob(
+            id=record_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            state="pending",
+            gate_score=gate_score,
+            gate_signals=tuple(gate_signals),
+            context_json=context_json,
+            result_json=None,
+            attempts=0,
+            created_at=now,
+            started_at=None,
+            completed_at=None,
+        )
+
+    def update_learning_job(
+        self,
+        job_id: str,
+        *,
+        state: str | None = None,
+        result: dict[str, Any] | None = None,
+        attempts: int | None = None,
+    ) -> None:
+        from .learning import LEARNING_JOB_STATES
+        now = utc_now()
+        sets: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            if state not in LEARNING_JOB_STATES:
+                raise ValueError(f"invalid learning job state: {state}")
+            sets.append("state=?")
+            params.append(state)
+            if state == "running":
+                sets.append("started_at=?")
+                params.append(now)
+            elif state in ("completed", "failed", "expired"):
+                sets.append("completed_at=?")
+                params.append(now)
+        if result is not None:
+            sets.append("result_json=?")
+            params.append(json.dumps(result))
+        if attempts is not None:
+            sets.append("attempts=?")
+            params.append(attempts)
+        if not sets:
+            return
+        params.append(job_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE learning_jobs SET {', '.join(sets)} WHERE id=?",
+                params,
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"learning job not found: {job_id}")
+
+    def get_learning_job(self, job_id: str) -> "LearningJob":
+        from .learning import LearningJob
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM learning_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"learning job not found: {job_id}")
+        return _learning_job(row)
+
+    def list_learning_jobs(
+        self,
+        *,
+        conversation_id: str | None = None,
+        states: tuple[str, ...] | None = None,
+        limit: int = 50,
+    ) -> list["LearningJob"]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conversation_id:
+            clauses.append("conversation_id=?")
+            params.append(conversation_id)
+        if states:
+            placeholders = ",".join("?" * len(states))
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM learning_jobs{where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_learning_job(row) for row in rows]
+
+    def record_learning_event(
+        self,
+        run_id: str,
+        conversation_id: str,
+        event_type: str,
+        target: str,
+        status: str,
+        summary: str,
+        reviewer_model: str,
+        *,
+        event_id: str | None = None,
+    ) -> "LearningEvent":
+        from .learning import LearningEvent
+        now = utc_now()
+        record_id = event_id or str(uuid.uuid4())
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO learning_events(
+                    id, run_id, conversation_id, event_type, target,
+                    status, summary, reviewer_model, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record_id, run_id, conversation_id, event_type, target,
+                 status, summary, reviewer_model, now),
+            )
+        return LearningEvent(
+            id=record_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            event_type=event_type,
+            target=target,
+            status=status,
+            summary=summary,
+            reviewer_model=reviewer_model,
+            created_at=now,
+        )
+
+    def list_learning_events(
+        self,
+        *,
+        conversation_id: str | None = None,
+        run_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+    ) -> list["LearningEvent"]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conversation_id:
+            clauses.append("conversation_id=?")
+            params.append(conversation_id)
+        if run_id:
+            clauses.append("run_id=?")
+            params.append(run_id)
+        if event_type:
+            clauses.append("event_type=?")
+            params.append(event_type)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM learning_events{where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_learning_event(row) for row in rows]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Run Skill Context
+    # ──────────────────────────────────────────────────────────────────
+
+    def save_run_skill_context(self, run_id: str, context_json: str) -> None:
+        """Persist the RunSkillContext for a run."""
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO run_skill_context(run_id, context_json, created_at)
+                   VALUES(?, ?, ?)""",
+                (run_id, context_json, now),
+            )
+
+    def get_run_skill_context(self, run_id: str) -> str | None:
+        """Load the RunSkillContext JSON for a run."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT context_json FROM run_skill_context WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        return row["context_json"] if row else None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Context Snapshots (Phase 4C)
+    # ──────────────────────────────────────────────────────────────────
+
+    def save_context_snapshot(
+        self,
+        run_id: str,
+        *,
+        model: str,
+        context_limit: int,
+        input_tokens: int,
+        output_tokens: int | None = None,
+        token_source: str = "estimated",
+        segments: Sequence[Mapping[str, Any]] | None = None,
+        skills: Sequence[Mapping[str, Any]] | None = None,
+        memories: Sequence[Mapping[str, Any]] | None = None,
+        transformations: Sequence[Mapping[str, Any]] | None = None,
+        conversation_tokens: int | None = None,
+        last_invocation_tokens: int | None = None,
+    ) -> None:
+        """Persist a compact context snapshot for a run.
+
+        Called once per run—either when the context is compiled (estimated)
+        or when the provider returns authoritative token usage.
+        """
+        if token_source not in ("provider", "tokenizer", "estimated"):
+            raise ValueError(f"invalid token_source: {token_source}")
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO run_context_snapshots(
+                    run_id, model, context_limit, input_tokens, output_tokens,
+                    token_source, segments_json, skills_json, memory_json,
+                    transformations_json, conversation_tokens,
+                    last_invocation_tokens, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    model,
+                    context_limit,
+                    input_tokens,
+                    output_tokens,
+                    token_source,
+                    json.dumps(segments or [], ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(skills or [], ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(memories or [], ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(transformations, ensure_ascii=False, separators=(",", ":")) if transformations else None,
+                    conversation_tokens,
+                    last_invocation_tokens,
+                    now,
+                ),
+            )
+
+    def get_context_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        """Load the context snapshot for a run, returning a structured dict or None."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM run_context_snapshots WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "model": row["model"],
+            "context_limit": row["context_limit"],
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "token_source": row["token_source"],
+            "segments": json.loads(row["segments_json"]),
+            "skills": json.loads(row["skills_json"]),
+            "memories": json.loads(row["memory_json"]),
+            "transformations": json.loads(row["transformations_json"]) if row["transformations_json"] else None,
+            "conversation_tokens": row["conversation_tokens"],
+            "last_invocation_tokens": row["last_invocation_tokens"],
+            "created_at": row["created_at"],
+        }
+
+    def update_context_snapshot_tokens(
+        self,
+        run_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int | None = None,
+        token_source: str = "provider",
+    ) -> bool:
+        """Update token counts when provider returns authoritative usage.
+
+        Returns True if the snapshot was updated, False if no snapshot exists.
+        """
+        if token_source not in ("provider", "tokenizer", "estimated"):
+            raise ValueError(f"invalid token_source: {token_source}")
+        with self._connect() as connection:
+            result = connection.execute(
+                """UPDATE run_context_snapshots
+                   SET input_tokens=?, output_tokens=?, token_source=?
+                   WHERE run_id=?""",
+                (input_tokens, output_tokens, token_source, run_id),
+            )
+        return result.rowcount > 0
+
+    # ──────────────────────────────────────────────────────────────────
+    # Skills FTS Sync
+    # ──────────────────────────────────────────────────────────────────
+
+    def sync_skills_fts(self) -> None:
+        """Rebuild the skills_fts index from learned_skills.
+
+        Called after schema initialization and after bulk skill registration.
+        Safe to call multiple times (delete + re-insert).
+        """
+        with self._connect() as connection:
+            connection.execute("DELETE FROM skills_fts")
+            connection.execute(
+                """INSERT INTO skills_fts(name, description)
+                   SELECT name, description FROM learned_skills
+                   WHERE state = 'active'"""
+            )
+
+    def upsert_skill_fts(self, skill_name: str) -> None:
+        """Update the FTS entry for a single skill after mutation."""
+        with self._connect() as connection:
+            # Remove old entry (if exists) — use name-based lookup
+            connection.execute(
+                "DELETE FROM skills_fts WHERE name=?", (skill_name,),
+            )
+            # Get the current skill state
+            row = connection.execute(
+                "SELECT name, description, state FROM learned_skills WHERE name=?",
+                (skill_name,),
+            ).fetchone()
+            if row is None:
+                return
+            # Insert if active
+            if row["state"] == "active":
+                connection.execute(
+                    "INSERT INTO skills_fts(name, description) VALUES(?, ?)",
+                    (row["name"], row["description"]),
+                )
+
 
 def _conversation(row: sqlite3.Row) -> Conversation:
+    keys = set(row.keys())
     return Conversation(
         row["id"],
         row["workspace_id"],
@@ -2062,8 +3228,12 @@ def _conversation(row: sqlite3.Row) -> Conversation:
         row["channel_key"],
         row["title"],
         row["agy_conversation_id"],
+        row["model_override"],
+        row["effort_override"],
         row["created_at"],
         row["updated_at"],
+        row["kind"] if "kind" in keys else "normal",
+        row["archived_at"] if "archived_at" in keys else None,
     )
 
 
@@ -2157,6 +3327,68 @@ def _trigger(row: sqlite3.Row) -> TriggerRecord:
     )
 
 
+def _goal(row: sqlite3.Row) -> GoalRecord:
+    return GoalRecord(
+        id=str(row["id"]),
+        conversation_id=str(row["conversation_id"]),
+        objective=str(row["objective"]),
+        acceptance=json.loads(row["acceptance_json"]),
+        status=str(row["status"]),
+        max_turns=int(row["max_turns"]),
+        turns_used=int(row["turns_used"]),
+        current_step=row["current_step"],
+        last_run_id=row["last_run_id"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _goal_evaluation(row: sqlite3.Row) -> GoalEvaluationRecord:
+    return GoalEvaluationRecord(
+        id=str(row["id"]),
+        goal_id=str(row["goal_id"]),
+        run_id=row["run_id"],
+        turn_number=int(row["turn_number"]),
+        verdict=str(row["verdict"]),
+        reason=row["reason"],
+        acceptance_state=json.loads(row["acceptance_state_json"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _learning_job(row: sqlite3.Row) -> "LearningJob":
+    from .learning import LearningJob
+    return LearningJob(
+        id=str(row["id"]),
+        run_id=str(row["run_id"]),
+        conversation_id=str(row["conversation_id"]),
+        state=str(row["state"]),
+        gate_score=float(row["gate_score"]),
+        gate_signals=tuple(json.loads(row["gate_signals_json"])),
+        context_json=str(row["context_json"]),
+        result_json=row["result_json"],
+        attempts=int(row["attempts"]),
+        created_at=str(row["created_at"]),
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _learning_event(row: sqlite3.Row) -> "LearningEvent":
+    from .learning import LearningEvent
+    return LearningEvent(
+        id=str(row["id"]),
+        run_id=str(row["run_id"]),
+        conversation_id=str(row["conversation_id"]),
+        event_type=str(row["event_type"]),
+        target=str(row["target"]),
+        status=str(row["status"]),
+        summary=str(row["summary"]),
+        reviewer_model=str(row["reviewer_model"]),
+        created_at=str(row["created_at"]),
+    )
+
+
 def _add_seconds(value: str, seconds: int) -> str:
     return (datetime.fromisoformat(value).astimezone(UTC) +
             timedelta(seconds=seconds)).isoformat()
@@ -2194,10 +3426,16 @@ CREATE TABLE IF NOT EXISTS conversations (
     channel_key TEXT,
     title TEXT,
     agy_conversation_id TEXT UNIQUE,
+    model_override TEXT,
+    effort_override TEXT,
+    kind TEXT NOT NULL DEFAULT 'normal' CHECK(kind IN ('main', 'normal')),
+    archived_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(channel, channel_key)
 );
+CREATE INDEX IF NOT EXISTS conversations_archived_updated
+    ON conversations(archived_at, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -2635,4 +3873,200 @@ CREATE TABLE IF NOT EXISTS identity_revisions (
 );
 CREATE INDEX IF NOT EXISTS identity_revisions_latest
     ON identity_revisions(name, version DESC);
+"""
+
+_GOAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS goals (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    objective TEXT NOT NULL,
+    acceptance_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL CHECK(status IN ('active','paused','completed','cancelled','failed')),
+    max_turns INTEGER NOT NULL DEFAULT 12,
+    turns_used INTEGER NOT NULL DEFAULT 0,
+    current_step TEXT,
+    last_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goals_conversation ON goals(conversation_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_goal_per_conversation
+    ON goals(conversation_id) WHERE status IN ('active','paused');
+
+CREATE TABLE IF NOT EXISTS goal_evaluations (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    turn_number INTEGER NOT NULL,
+    verdict TEXT NOT NULL CHECK(verdict IN ('continue','done','failed','paused')),
+    reason TEXT,
+    acceptance_state_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_evaluations_goal ON goal_evaluations(goal_id, turn_number);
+"""
+
+_LEARNING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS learning_jobs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK(state IN ('pending','running','completed','failed','expired')),
+    gate_score REAL NOT NULL,
+    gate_signals_json TEXT NOT NULL DEFAULT '[]',
+    context_json TEXT NOT NULL,
+    result_json TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS learning_jobs_state ON learning_jobs(state, created_at);
+CREATE INDEX IF NOT EXISTS learning_jobs_run ON learning_jobs(run_id);
+CREATE INDEX IF NOT EXISTS learning_jobs_conversation ON learning_jobs(conversation_id);
+
+CREATE TABLE IF NOT EXISTS learning_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL CHECK(event_type IN (
+        'memory_upsert','memory_remove','skill_candidate','review_skipped'
+    )),
+    target TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('applied','pending_approval','rejected','failed')),
+    summary TEXT NOT NULL DEFAULT '',
+    reviewer_model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS learning_events_run ON learning_events(run_id);
+CREATE INDEX IF NOT EXISTS learning_events_conversation ON learning_events(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS learning_events_type ON learning_events(event_type, status);
+"""
+
+_SKILLS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS learned_skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
+    owner TEXT NOT NULL CHECK(owner IN ('user','agent','bundled')),
+    state TEXT NOT NULL CHECK(state IN ('active','stale','archived')),
+    trust TEXT NOT NULL CHECK(trust IN ('unreviewed','approved')),
+    revision INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS learned_skills_name ON learned_skills(name);
+CREATE INDEX IF NOT EXISTS learned_skills_state ON learned_skills(state);
+CREATE INDEX IF NOT EXISTS learned_skills_owner ON learned_skills(owner);
+
+CREATE TABLE IF NOT EXISTS skill_proposals (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT REFERENCES learned_skills(id) ON DELETE SET NULL,
+    skill_name TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('create','patch','archive')),
+    description TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.0,
+    content TEXT NOT NULL DEFAULT '',
+    before TEXT,
+    base_revision INTEGER,
+    source_run_id TEXT,
+    review_model TEXT,
+    status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','expired','conflict')),
+    status_reason TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS skill_proposals_status ON skill_proposals(status);
+CREATE INDEX IF NOT EXISTS skill_proposals_skill ON skill_proposals(skill_id);
+CREATE INDEX IF NOT EXISTS skill_proposals_name ON skill_proposals(skill_name);
+
+CREATE TABLE IF NOT EXISTS skill_revisions (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES learned_skills(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    parent_revision INTEGER,
+    operation TEXT NOT NULL CHECK(operation IN ('create','patch','rollback','archive')),
+    source_run_id TEXT,
+    proposal_id TEXT REFERENCES skill_proposals(id) ON DELETE SET NULL,
+    model TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skill_revisions_skill ON skill_revisions(skill_id, revision);
+
+CREATE TABLE IF NOT EXISTS skill_usage (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES learned_skills(id) ON DELETE CASCADE,
+    run_id TEXT,
+    event TEXT NOT NULL CHECK(event IN (
+        'discovered','selected','loaded','executed',
+        'successful','failed','corrected','proposal_generated',
+        'matched','presented'
+    )),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS skill_usage_skill ON skill_usage(skill_id, event);
+CREATE INDEX IF NOT EXISTS skill_usage_run ON skill_usage(run_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+    name, description
+);
+
+CREATE TABLE IF NOT EXISTS run_skill_context (
+    run_id TEXT PRIMARY KEY,
+    context_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+_CONTEXT_SNAPSHOT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_context_snapshots (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    context_limit INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER,
+    token_source TEXT NOT NULL CHECK(token_source IN ('provider', 'tokenizer', 'estimated')),
+    segments_json TEXT NOT NULL DEFAULT '[]',
+    skills_json TEXT NOT NULL DEFAULT '[]',
+    memory_json TEXT NOT NULL DEFAULT '[]',
+    transformations_json TEXT,
+    conversation_tokens INTEGER,
+    last_invocation_tokens INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_context_snapshots_created
+    ON run_context_snapshots(created_at);
+"""
+
+
+_ATTACHMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('image', 'audio', 'video', 'document', 'archive', 'other')),
+    size_bytes INTEGER NOT NULL,
+    storage_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('web', 'telegram', 'api', 'agent')),
+    width INTEGER,
+    height INTEGER,
+    duration_ms INTEGER,
+    metadata_json TEXT,
+    state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('queued', 'ready', 'failed')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attachments_message
+    ON attachments(message_id) WHERE message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS attachments_conversation
+    ON attachments(conversation_id);
+CREATE INDEX IF NOT EXISTS attachments_workspace
+    ON attachments(workspace_id);
 """
