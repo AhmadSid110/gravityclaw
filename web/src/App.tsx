@@ -90,7 +90,355 @@ function Login({ onSuccess, error, setError }: { onSuccess: () => void; error: s
   </main>;
 }
 
-function Console({ onLogout }: { onLogout: () => Promise<void> }) {
+function formatSessionTitle(title?: string | null, id?: string): string {
+  if (title && title.trim()) {
+    let t = title.trim();
+    if (t.startsWith("agent:main:") || t.startsWith("agent:") || t.startsWith("conv_")) {
+      t = t
+        .replace(/^agent:[^:]+:/, "")
+        .replace(/^agent:/, "")
+        .replace(/^conv_/, "")
+        .replace(/[-_]/g, " ");
+      return t.charAt(0).toUpperCase() + t.slice(1);
+    }
+    return t;
+  }
+  if (id) {
+    if (id.includes("agent:") || id.startsWith("conv_")) {
+      const t = id
+        .replace(/^agent:[^:]+:/, "")
+        .replace(/^conv_/, "")
+        .replace(/[-_]/g, " ");
+      return t.charAt(0).toUpperCase() + t.slice(1);
+    }
+    return `Session ${id.slice(0, 8)}`;
+  }
+  return "New session";
+}
+
+function AppSidebar({
+  view,
+  setView,
+  conversations,
+  selectedConvId,
+  onSelectConv,
+  onNewSession,
+  onOpenAllSessions,
+  pinnedIds,
+  onTogglePin,
+  activeRuns,
+  connection,
+  mobileOpen,
+  onCloseMobile,
+}: {
+  view: View;
+  setView: (v: View) => void;
+  conversations: Conversation[];
+  selectedConvId: string | null;
+  onSelectConv: (id: string) => void;
+  onNewSession: () => void;
+  onOpenAllSessions: () => void;
+  pinnedIds: string[];
+  onTogglePin: (id: string, e?: React.MouseEvent) => void;
+  activeRuns: RunRecord[];
+  connection: string;
+  mobileOpen: boolean;
+  onCloseMobile: () => void;
+}) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+
+  const pinned = conversations.filter((c) => pinnedIds.includes(c.id));
+  const recent = conversations.filter((c) => !pinnedIds.includes(c.id));
+
+  const handleSelect = (id: string) => {
+    onSelectConv(id);
+    setView("conversations");
+    onCloseMobile();
+  };
+
+  const renderSessionRow = (conv: Conversation, isPinned: boolean) => {
+    const isSelected = view === "conversations" && selectedConvId === conv.id;
+    const isRunning = activeRuns.some((r) => r.conversation_id === conv.id && r.status === "running");
+    const menuOpen = activeMenuId === conv.id;
+
+    return (
+      <div key={conv.id} className={`sidebar-session-item ${isSelected ? "active" : ""}`}>
+        <button
+          type="button"
+          className="sidebar-session-btn"
+          onClick={() => handleSelect(conv.id)}
+          title={conv.title || conv.id}
+        >
+          <span className="sidebar-session-title">
+            {formatSessionTitle(conv.title, conv.id)}
+          </span>
+          {isRunning && <span className="status-dot blue pulsing" />}
+        </button>
+
+        <div className="sidebar-session-actions">
+          {isPinned && <span className="sidebar-pin-icon" title="Pinned session">📌</span>}
+          <button
+            type="button"
+            className="sidebar-dots-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              setActiveMenuId(menuOpen ? null : conv.id);
+            }}
+            title="Session options"
+            aria-label="Session options"
+          >
+            ⋯
+          </button>
+
+          {menuOpen && (
+            <div className="sidebar-popover-menu" onClick={(e) => e.stopPropagation()}>
+              <button
+                type="button"
+                onClick={(e) => {
+                  onTogglePin(conv.id, e);
+                  setActiveMenuId(null);
+                }}
+              >
+                <span>📌</span> {isPinned ? "Unpin session" : "Pin session"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveMenuId(null);
+                  window.dispatchEvent(new CustomEvent("gravityclaw:rename-chat", { detail: conv }));
+                }}
+              >
+                <span>✎</span> Rename
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveMenuId(null);
+                  window.dispatchEvent(new CustomEvent("gravityclaw:archive-chat", { detail: conv.id }));
+                }}
+              >
+                <span>📦</span> Archive
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => {
+                  setActiveMenuId(null);
+                  window.dispatchEvent(new CustomEvent("gravityclaw:delete-chat", { detail: conv }));
+                }}
+              >
+                <span>🗑</span> Delete
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveMenuId(null);
+                  void navigator.clipboard.writeText(conv.id);
+                }}
+              >
+                <span>📋</span> Copy ID
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <aside className={`sidebar ${mobileOpen ? "open" : ""}`}>
+      {/* Brand */}
+      <div className="sidebar-brand-row">
+        <div className="brand-mark">✦</div>
+        <strong>GravityClaw</strong>
+      </div>
+
+      {/* Overview Button */}
+      <button
+        type="button"
+        className={`sidebar-nav-entry ${view === "home" ? "active" : ""}`}
+        onClick={() => { setView("home"); onCloseMobile(); }}
+      >
+        <span className="sidebar-entry-icon">⌁</span>
+        <span>Overview</span>
+      </button>
+
+      <div className="sidebar-divider" />
+
+      {/* Collapsible MORE Accordion */}
+      <div className="sidebar-more-section">
+        <button
+          type="button"
+          className={`sidebar-more-toggle ${moreOpen ? "open" : ""}`}
+          onClick={() => setMoreOpen(!moreOpen)}
+          aria-expanded={moreOpen}
+        >
+          <span>MORE</span>
+          <span className="more-arrow">{moreOpen ? "⌄" : "›"}</span>
+        </button>
+
+        {moreOpen && (
+          <div className="sidebar-more-list fade-in">
+            <button className={`sidebar-sub-entry ${view === "automations" ? "active" : ""}`} onClick={() => { setView("automations"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">⚡</span>
+              <span>Automations</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "memory" ? "active" : ""}`} onClick={() => { setView("memory"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">🧠</span>
+              <span>Memory</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "capabilities" ? "active" : ""}`} onClick={() => { setView("capabilities"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">◇</span>
+              <span>Skills</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "learning" ? "active" : ""}`} onClick={() => { setView("learning"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">✦</span>
+              <span>Learning</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "capabilities" ? "active" : ""}`} onClick={() => { setView("capabilities"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">⌘</span>
+              <span>Capabilities</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "context" ? "active" : ""}`} onClick={() => { setView("context"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">🔌</span>
+              <span>Integrations</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "workspaces" ? "active" : ""}`} onClick={() => { setView("workspaces"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">◫</span>
+              <span>Workspaces</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "runs" ? "active" : ""}`} onClick={() => { setView("runs"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">◎</span>
+              <span>Models</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "channels" ? "active" : ""}`} onClick={() => { setView("channels"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">◉</span>
+              <span>Channels</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "runs" ? "active" : ""}`} onClick={() => { setView("runs"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">▤</span>
+              <span>Logs</span>
+            </button>
+            <button className={`sidebar-sub-entry ${view === "settings" ? "active" : ""}`} onClick={() => { setView("settings"); onCloseMobile(); }}>
+              <span className="sidebar-entry-icon">⚙</span>
+              <span>Settings</span>
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Prominent New Session Button */}
+      <button
+        type="button"
+        className="sidebar-new-session-action"
+        onClick={() => {
+          onNewSession();
+          onCloseMobile();
+        }}
+      >
+        <span className="plus">＋</span>
+        <span>New session</span>
+      </button>
+
+      {/* SESSIONS Area (Dominates visible area) */}
+      <div className="sidebar-sessions-container">
+        <div className="sidebar-sessions-bar">
+          <span className="sessions-heading">SESSIONS</span>
+          <div className="sessions-bar-right">
+            <span className="workspace-pill">Main ▾</span>
+            <button
+              type="button"
+              className="sessions-icon-btn"
+              onClick={() => {
+                onOpenAllSessions();
+                onCloseMobile();
+              }}
+              title="All sessions"
+              aria-label="All sessions"
+            >
+              ≡
+            </button>
+          </div>
+        </div>
+
+        <div className="sidebar-sessions-scroll">
+          {pinned.length > 0 && (
+            <div className="sidebar-session-subgroup">
+              {pinned.map((conv) => renderSessionRow(conv, true))}
+            </div>
+          )}
+
+          <div className="sidebar-session-subgroup">
+            {recent.map((conv) => renderSessionRow(conv, false))}
+          </div>
+
+          {conversations.length === 0 && (
+            <div className="sidebar-empty-sessions">No active sessions</div>
+          )}
+        </div>
+
+        <button
+          type="button"
+          className="sidebar-all-sessions-footer-btn"
+          onClick={() => {
+            onOpenAllSessions();
+            onCloseMobile();
+          }}
+        >
+          <span>All sessions</span>
+          <span className="chevron-right">›</span>
+        </button>
+      </div>
+
+      <div className="sidebar-divider" />
+
+      {/* Sidebar Footer */}
+      <div className="sidebar-bottom-bar">
+        <div className="sidebar-conn-pill">
+          <span className={`status-dot ${connection === "connected" ? "green" : "amber"}`} />
+          <span>{connection === "connected" ? "Connected" : connection}</span>
+        </div>
+        <div className="sidebar-bottom-actions">
+          <button
+            type="button"
+            className="sidebar-action-icon-btn"
+            onClick={() => { setView("settings"); onCloseMobile(); }}
+            title="Settings"
+            aria-label="Settings"
+          >
+            ⚙
+          </button>
+          <button
+            type="button"
+            className="sidebar-action-icon-btn"
+            onClick={() => { setView("workspaces"); onCloseMobile(); }}
+            title="Workspaces"
+            aria-label="Workspaces"
+          >
+            ◫
+          </button>
+          <button
+            type="button"
+            className="sidebar-action-icon-btn"
+            onClick={() => {
+              const curr = document.documentElement.getAttribute("data-density") || "compact";
+              const next = curr === "compact" ? "comfortable" : "compact";
+              document.documentElement.setAttribute("data-density", next);
+              localStorage.setItem("gravityclaw:density", next);
+            }}
+            title="Toggle Layout"
+            aria-label="Toggle Layout"
+          >
+            ◧
+          </button>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
   const [view, setView] = useState<View>(() => {
     const hash = window.location.hash.replace(/^#/, "");
     return (hash && navItems.some(([id]) => id === hash)) ? (hash as View) : "conversations";
@@ -98,77 +446,116 @@ function Console({ onLogout }: { onLogout: () => Promise<void> }) {
   const [mobileNav, setMobileNav] = useState(false);
   const [selectedRun, setSelectedRun] = useState<RunRecord | null>(null);
   const [contextInspectorRunId, setContextInspectorRunId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
+  const [pinnedIds, setPinnedIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("gravityclaw:pinned-sessions");
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
   const state = useControlReplay();
   useAppearance(); // Reactively syncs theme, font, and density with localStorage and data attributes
   const title = navItems.find(([id]) => id === view)?.[2] ?? (view === "usage" ? "Usage" : view === "settings" ? "Settings" : "Home");
+
+  // Sync conversations list
+  useEffect(() => {
+    let cancelled = false;
+    void getArchivedConversations().then((all) => {
+      if (cancelled) return;
+      const active = all.filter((c) => !c.archived_at);
+      setConversations(active);
+      if (active.length > 0 && !selectedConvId) {
+        setSelectedConvId(active[0].id);
+      }
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const handleConversationsUpdated = (e: any) => {
+      if (e.detail && Array.isArray(e.detail)) {
+        setConversations(e.detail);
+      }
+    };
+    window.addEventListener("gravityclaw:conversations-updated" as any, handleConversationsUpdated);
+    return () => window.removeEventListener("gravityclaw:conversations-updated" as any, handleConversationsUpdated);
+  }, []);
+
+  const togglePin = (convId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setPinnedIds((prev) => {
+      const next = prev.includes(convId) ? prev.filter((id) => id !== convId) : [...prev, convId];
+      try {
+        localStorage.setItem("gravityclaw:pinned-sessions", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const handleOpenAllSessions = () => {
+    setView("conversations");
+    window.dispatchEvent(new CustomEvent("gravityclaw:search-chats"));
+  };
+
+  const handleNewSession = () => {
+    setView("conversations");
+    window.dispatchEvent(new CustomEvent("gravityclaw:new-chat"));
+  };
 
   // Compute the latest active run for the context circle
   const latestActiveRun = state.activeRuns.find((r) => r.status === "running") ?? state.activeRuns[0] ?? null;
   const contextRatio = latestActiveRun ? 0.42 : 0;
 
   return <div className="app">
-    <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
-      <div className="brand-lockup sidebar-brand"><div className="brand-mark">✦</div><div><strong>GravityClaw</strong><span>Control Center</span></div></div>
-      <div className="workspace-switcher"><div className="workspace-icon">G</div><div><strong>GravityClaw</strong><span>Personal agent</span></div><span className="chevron">⌄</span></div>
-      <nav className="primary-nav" aria-label="Primary navigation">
-        {navItems.map(([id, icon, label]) => (
-          <div key={id} className="nav-item-group">
-            <button
-              className={`nav-item ${view === id ? "active" : ""}`}
-              onClick={() => { setView(id); setMobileNav(false); }}
-            >
-              <span className="nav-icon">{icon}</span>
-              <span>{label}</span>
-              {id === "runs" && state.activeRuns.length > 0 && <em>{state.activeRuns.length}</em>}
-            </button>
-            {id === "conversations" && (
-              <button
-                className="nav-sub-new-chat"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setView("conversations");
-                  setMobileNav(false);
-                  window.dispatchEvent(new CustomEvent("gravityclaw:new-chat"));
-                }}
-                title="Create new chat"
-              >
-                <span className="plus-icon">＋</span>
-                <span>New chat</span>
-              </button>
-            )}
-          </div>
-        ))}
-      </nav>
-      <div className="nav-divider" />
-      <div className="section-label">SYSTEM</div>
-      <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={() => { setView("settings"); setMobileNav(false); }}><span className="nav-icon">⚙</span><span>Settings</span></button>
-      <div className="sidebar-bottom"><div className="connection-line"><span className={`status-dot ${state.connection === "connected" ? "green" : "amber"}`} />{state.connection === "connected" ? "Live" : state.connection}</div><button className="user-chip" onClick={() => void onLogout()}><span className="avatar">A</span><span>Ahmad</span><span>⌄</span></button></div>
-    </aside>
+    <AppSidebar
+      view={view}
+      setView={setView}
+      conversations={conversations}
+      selectedConvId={selectedConvId}
+      onSelectConv={(id) => {
+        setSelectedConvId(id);
+        window.dispatchEvent(new CustomEvent("gravityclaw:select-chat", { detail: { id } }));
+      }}
+      onNewSession={handleNewSession}
+      onOpenAllSessions={handleOpenAllSessions}
+      pinnedIds={pinnedIds}
+      onTogglePin={togglePin}
+      activeRuns={state.activeRuns}
+      connection={state.connection}
+      mobileOpen={mobileNav}
+      onCloseMobile={() => setMobileNav(false)}
+    />
     {mobileNav && <button className="scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
     <main className="main-shell">
-      <header className="topbar">
-        <button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation">☰</button>
-        <div className="breadcrumb"><span>GravityClaw</span><span className="crumb-separator">/</span><strong>{title}</strong></div>
-        <div className="topbar-actions">
-          {latestActiveRun && <ContextCircle ratio={contextRatio} running={latestActiveRun.status === "running"} onClick={() => setContextInspectorRunId(latestActiveRun.id)} />}
-          <span className="system-health" role="status">
-            <span className={`status-dot ${state.connection === "connected" ? "green" : "amber"}`} />
-            {state.connection === "connected" ? "Connected" : state.connection}
-          </span>
-          <button
-            className={`icon-button ${view === "settings" ? "active" : ""}`}
-            onClick={() => setView("settings")}
-            title="Settings & Appearance"
-            aria-label="Open settings"
-          >
-            ⚙
-          </button>
-        </div>
-      </header>
+      {view !== "conversations" && (
+        <header className="topbar">
+          <button className="mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation">☰</button>
+          <div className="breadcrumb"><span>GravityClaw</span><span className="crumb-separator">/</span><strong>{title}</strong></div>
+          <div className="topbar-actions">
+            {latestActiveRun && <ContextCircle ratio={contextRatio} running={latestActiveRun.status === "running"} onClick={() => setContextInspectorRunId(latestActiveRun.id)} />}
+            <span className="system-health" role="status">
+              <span className={`status-dot ${state.connection === "connected" ? "green" : "amber"}`} />
+              {state.connection === "connected" ? "Connected" : state.connection}
+            </span>
+            <button
+              className={`icon-button ${view === "settings" ? "active" : ""}`}
+              onClick={() => setView("settings")}
+              title="Settings & Appearance"
+              aria-label="Open settings"
+            >
+              ⚙
+            </button>
+          </div>
+        </header>
+      )}
       {state.connection !== "connected" && <div className="connection-banner" role="status" aria-live="polite">{state.connection === "reconnecting" ? "Connection interrupted. GravityClaw is still running on the server. Reconnecting…" : state.connection === "offline" ? "Control plane unavailable. Retrying…" : "Connecting to GravityClaw…"}</div>}
-      <div className="content-shell">
+      <div className={`content-shell ${view === "conversations" ? "chat-fullscreen" : ""}`}>
         {view === "home" && <Home state={state} onRunSelect={setSelectedRun} onOpenRuns={() => setView("runs")} />}
-        {view === "conversations" && <ConversationWorkspace state={state} onRunSelect={setSelectedRun} />}
+        {view === "conversations" && <ConversationWorkspace state={state} onRunSelect={setSelectedRun} onOpenMobileNav={() => setMobileNav(true)} />}
         {view === "runs" && <Runs state={state} onRunSelect={setSelectedRun} />}
         {view === "memory" && <MemoryStudio />}
         {view === "context" && <ContextStudio />}
@@ -255,9 +642,11 @@ function groupConversations(conversations: Conversation[]) {
 function ConversationWorkspace({
   state,
   onRunSelect,
+  onOpenMobileNav,
 }: {
   state: ControlState;
   onRunSelect: (run: RunRecord) => void;
+  onOpenMobileNav?: () => void;
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [archivedList, setArchivedList] = useState<Conversation[]>([]);
@@ -327,6 +716,7 @@ function ConversationWorkspace({
       const archived = all.filter((c) => !!c.archived_at);
       setConversations(active);
       setArchivedList(archived);
+      window.dispatchEvent(new CustomEvent("gravityclaw:conversations-updated", { detail: active }));
       return active;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to load conversations");
@@ -338,8 +728,43 @@ function ConversationWorkspace({
     const handleNewChatEvent = () => {
       void newConversation();
     };
+    const handleSelectChat = (e: any) => {
+      if (e.detail?.id) {
+        setSelectedId(e.detail.id);
+      }
+    };
+    const handleSearchChats = () => {
+      setSearchOpen(true);
+    };
+    const handleRenameChat = (e: any) => {
+      if (e.detail) {
+        startRename(e.detail);
+      }
+    };
+    const handleArchiveChat = (e: any) => {
+      if (e.detail) {
+        void handleArchive(e.detail);
+      }
+    };
+    const handleDeleteChat = (e: any) => {
+      if (e.detail) {
+        setDeleteConfirmConv(e.detail);
+      }
+    };
     window.addEventListener("gravityclaw:new-chat", handleNewChatEvent);
-    return () => window.removeEventListener("gravityclaw:new-chat", handleNewChatEvent);
+    window.addEventListener("gravityclaw:select-chat" as any, handleSelectChat);
+    window.addEventListener("gravityclaw:search-chats" as any, handleSearchChats);
+    window.addEventListener("gravityclaw:rename-chat" as any, handleRenameChat);
+    window.addEventListener("gravityclaw:archive-chat" as any, handleArchiveChat);
+    window.addEventListener("gravityclaw:delete-chat" as any, handleDeleteChat);
+    return () => {
+      window.removeEventListener("gravityclaw:new-chat", handleNewChatEvent);
+      window.removeEventListener("gravityclaw:select-chat" as any, handleSelectChat);
+      window.removeEventListener("gravityclaw:search-chats" as any, handleSearchChats);
+      window.removeEventListener("gravityclaw:rename-chat" as any, handleRenameChat);
+      window.removeEventListener("gravityclaw:archive-chat" as any, handleArchiveChat);
+      window.removeEventListener("gravityclaw:delete-chat" as any, handleDeleteChat);
+    };
   }, [conversations]);
 
   useEffect(() => {
@@ -925,8 +1350,14 @@ function ConversationWorkspace({
             <div className="header-left">
               <button
                 className="drawer-toggle-button"
-                onClick={() => setDrawerOpen(!drawerOpen)}
-                aria-label="Toggle chats drawer"
+                onClick={() => {
+                  if (onOpenMobileNav) {
+                    onOpenMobileNav();
+                  } else {
+                    setDrawerOpen(!drawerOpen);
+                  }
+                }}
+                aria-label="Toggle navigation"
               >
                 ☰
               </button>
