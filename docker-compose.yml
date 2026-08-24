@@ -17,11 +17,11 @@ services:
     container_name: gravityclaw-server
     restart: unless-stopped
     ports:
-      - "${GRAVITYCLAW_PORT:-8787}:8787"
+      - "127.0.0.1:${GRAVITYCLAW_PORT:-8787}:8787"
     environment:
       - GRAVITYCLAW_HOME=/data
       - GRAVITYCLAW_MODE=${GRAVITYCLAW_MODE:-agy}
-      - GRAVITYCLAW_EXECUTION_TARGET=${GRAVITYCLAW_EXECUTION_TARGET:-host}
+      - GRAVITYCLAW_EXECUTION_TARGET=${GRAVITYCLAW_EXECUTION_TARGET:-container}
       - GRAVITYCLAW_AGY_BINARY=/usr/local/bin/agy
       - GRAVITYCLAW_WORKER_IMAGE=${GRAVITYCLAW_WORKER_IMAGE:-localhost/gravityclaw-agy:1.1.13}
       - GRAVITYCLAW_COOKIE_SECURE=${GRAVITYCLAW_COOKIE_SECURE:-1}

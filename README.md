@@ -1,4 +1,5 @@
 <p align="center">
+  <img src="https://github.com/AhmadSid110/gravityclaw/actions/workflows/ci.yml/badge.svg" alt="CI">
   <img src="https://img.shields.io/badge/version-0.10.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/python-%E2%89%A53.12-3776AB?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
@@ -80,7 +81,7 @@ Most agent frameworks give you a stateless loop: prompt in, response out, amnesi
 - **Channel integrations** — Telegram today, extensible to any messaging platform
 - **Token auth** — bearer-token control plane with cookie-based web sessions (tokens never hit browser storage)
 - **One-command deploy** — install script, Docker Compose, or manual setup — your choice
-- **No vendor lock-in** — your data, your machine, your rules. Migrate anytime.
+- **Data portability** — your data and orchestration state are portable. Migrate anytime.
 
 ---
 
@@ -206,10 +207,10 @@ openssl rand -base64 36 > ~/.config/gravityclaw/secrets/control-token
 
 ## Privacy & Data Sovereignty
 
-GravityClaw keeps everything local. Nothing phones home.
+GravityClaw keeps your orchestration data local. The platform itself sends no telemetry.
 
-- **No telemetry** — we don't collect usage data, crash reports, or analytics
-- **No cloud dependencies** — runs entirely on your hardware (or your VPS)
+- **No GravityClaw-hosted cloud backend** — runs entirely on your hardware (or your VPS). Model-provider connectivity is still required for reasoning.
+- **GravityClaw itself sends no telemetry** — we don't collect usage data, crash reports, or analytics. The configured reasoning provider (Google) receives model requests as part of normal AGY operation.
 - **No account required** — no sign-up, no SaaS backend, no "free tier" upsell
 - **Memory stays on-disk** — SQLite database under your control, your backups, your encryption
 - **Credentials never leave your machine** — AGY auth is bind-mounted read-only, never copied or transmitted
@@ -222,13 +223,40 @@ Your conversations, memories, tasks, and identity files belong to you. Full stop
 
 Self-hosted means you own your data. GravityClaw takes that seriously:
 
-- Worker processes run in **rootless Podman containers** by default
+- Worker processes run in **rootless Podman containers** by default (explicit opt-in required for host execution)
 - AGY credentials are **bind-mounted read-only** — never copied or exported
 - Systemd unit runs with `NoNewPrivileges=true` and `PrivateTmp=true`
 - All secrets stored as files with `0600` permissions
-- Port 8787 should **never** be exposed directly — use the included Caddy profile or your own reverse proxy
+- Port 8787 binds to **127.0.0.1 only** by default — use the included Caddy profile or your own reverse proxy for public access
 - Identity and memory files are protected from model-execution overwrites
 - No network egress from the orchestration layer — only the AGY binary talks to Google
+
+### Container Trust Boundary
+
+```
+┌───────────────────────────────────────────────────┐
+│          Trusted GravityClaw Gateway              │
+│  (FastAPI server — controls scheduling, memory,   │
+│   identity, channels, and worker lifecycle)       │
+│                                                    │
+│         ┌──────────────┐                          │
+│         │ Podman Socket│ ← only the gateway has   │
+│         └──────┬───────┘   access to this socket  │
+│                │                                   │
+└────────────────┼──────────────────────────────────┘
+                 │ creates / destroys
+    ┌────────────▼────────────────────────┐
+    │    Untrusted AGY Worker Containers  │
+    │                                      │
+    │  • No access to Podman socket        │
+    │  • No access to host network         │
+    │  • Read-only credential mount        │
+    │  • Ephemeral filesystem              │
+    │  • Cannot escalate to gateway        │
+    └─────────────────────────────────────┘
+```
+
+Only the trusted GravityClaw gateway may control the rootless Podman socket. AGY worker containers never receive it — they are disposable, sandboxed execution units with no ability to spawn siblings, access host resources, or modify the orchestration layer.
 
 ---
 

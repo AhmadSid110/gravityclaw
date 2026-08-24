@@ -269,7 +269,7 @@ main() {
     echo
     echo "Next steps:"
     echo "  1. Authenticate AGY (the reasoning engine):"
-    echo "     See: https://github.com/google/anthropic-model-spec (official flow)"
+    echo "     See: https://ai.google.dev/antigravity/docs/install (official install & auth guide)"
     echo
     echo "  2. Verify installation:"
     echo "     gravityclaw doctor"
