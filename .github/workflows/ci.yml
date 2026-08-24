@@ -27,6 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          mkdir -p web/dist && touch web/dist/.gitkeep
           pip install -e '.[dev]'
 
       - name: Run tests
@@ -114,6 +115,7 @@ jobs:
       - name: pip-audit
         run: |
           pip install pip-audit
+          mkdir -p web/dist && touch web/dist/.gitkeep
           pip install -e .
           pip-audit
 
