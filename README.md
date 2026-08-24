@@ -1,176 +1,165 @@
 # GravityClaw
 
-> **No product-layer feature should compensate for an unreliable execution core.**
+Persistent personal-agent orchestration platform powered by the official [Antigravity CLI](https://antigravity.dev).
 
-GravityClaw is a persistent personal-agent platform whose first execution
-backend is Google's official Antigravity CLI (`agy`). GravityClaw owns identity,
-memory, sessions, scheduling, channels, and orchestration; `agy` owns reasoning
-and tool execution.
+GravityClaw owns identity, memory, sessions, scheduling, channels, and orchestration. Google's Antigravity CLI (`agy`) handles reasoning and tool execution inside an isolated worker.
 
-Phase 1, the authenticated AGY feasibility spike, has a `VALIDATED` verdict.
-Milestone 2, the reliable container-backed core, passes its forced-gateway-crash
-gate. Milestone 3 adds GravityClaw-owned identity, explicit episodic memory,
-SQLite FTS retrieval, bounded context compilation, and durable channel history.
-See the [spike report](spikes/001-authenticated-agy/README.md),
-[Milestone 2 report](docs/milestone-2.md), and
-[Milestone 3 report](docs/milestone-3.md). Milestone 4 adds the durable channel
-layer and Telegram adapter; both deterministic and live Telegram gates pass.
-Milestone 5 adds the Context Management Protocol, profiles, manifests,
-watermarks, summaries, artifact references, and hash invalidation. See the
-[Milestone 4 report](docs/milestone-4.md) and
-[Milestone 5 report](docs/milestone-5.md). Milestone 6 adds durable one-shot,
-interval, cron, and heartbeat scheduling with leases, misfire policies,
-timezone-aware recurrence, and crash-safe trigger/run linking. See the
-[Milestone 6 report](docs/milestone-6.md).
-Milestone 7 adds workspace-scoped native AGY skills and MCP governance with
-immutable per-run capability snapshots, secret references, health state, and
-atomic configuration publication. See the
-[Milestone 7 report](docs/milestone-7.md).
-Milestone 8A adds the authenticated control-plane contract, durable read
-models, global event replay, optimistic schedule mutations, and redacted audit
-records. See [the M8A report](docs/milestone-8a.md).
-The M8B foundation adds the React/Vite responsive shell, browser-safe session
-bridge, centralized control replay client, Home, Runs, and initial run inspector.
-See [the M8B foundation report](docs/milestone-8b-foundation.md).
-M8B.3 adds the durable Conversation Workspace with Web/Telegram convergence,
-queued follow-ups, live activity reduction, and Focus/Inspect modes. See
-[the M8B.3 report](docs/milestone-8b3.md).
-M8B.4 adds the shared live/historical Run Inspector with tool cards, subagent
-activity, lazy artifacts, immutable manifests, and redacted raw events. See
-[the M8B.4 report](docs/milestone-8b4.md).
-M8B.5 adds Context + Memory Studio with versioned identity editing, journal and
-FTS memory views, run provenance, immutable context inspection, and read-only
-context simulation. See [the M8B.5 report](docs/milestone-8b5.md).
-M8B.6 adds durable Automations and workspace-scoped Capabilities studios with
-idempotent run-now triggers, occurrence history, health, isolation, and immutable
-run snapshots. See [the M8B.6 report](docs/milestone-8b6.md).
-M8B.7 freezes features and polishes the existing console with shared status and
-error states, responsive behavior, keyboard focus, reduced-motion support, and
-streaming-oriented render safeguards. See [the M8B.7 report](docs/milestone-8b7.md).
-M8B.8 completes the browser torture, reconnect, crash-recovery, redaction, and
-10k-event performance gate. Timeline history is cursor-paginated so large runs
-remain navigable without flooding the DOM. See [the M8B.8 report](docs/milestone-8b8.md).
-M9 hardens worker boundaries, secret lifecycles, authenticated operational
-surfaces, and backup/restore. See [the M9 report](docs/milestone-9.md).
-M10 adds the canonical XDG installation layout, secure TOML configuration,
-`gravityclaw setup`/`doctor`, user-service scaffolding, release provenance,
-atomic release switching, and layout-aware backup/restore. See [the M10
-deployment guide](docs/milestone-10.md).
+## Features
 
-## Core server
+- **Durable agent sessions** — conversations with full context management, watermarks, summaries, and artifact references
+- **Episodic memory** — SQLite FTS5-backed memory with bounded context compilation and curation
+- **Scheduling** — one-shot, interval, cron, and heartbeat job types with misfire policies
+- **Telegram channel** — interact with your agent from Telegram with authorized sender enforcement
+- **Web console** — React/Vite dashboard with run inspection, memory studio, context inspector, capability management, and TaskFlow orchestration
+- **Execution isolation** — rootless Podman containment for worker processes
+- **Skill & MCP governance** — workspace-scoped skills and Model Context Protocol server management with trust policies
+- **TaskFlow** — durable multi-step task orchestration with dependency graphs, retry, and progress tracking
+- **Learning engine** — extracts reusable knowledge from agent runs with curator-driven lifecycle
+- **Token-based auth** — control-plane protected by a bearer token; the web console has a login screen that establishes a secure session (never stored in browser local storage)
+
+## Quick Start
+
+### One-liner (Ubuntu 22+, Debian 12+, Fedora 39+)
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-podman build -f worker/Containerfile.agy \
-  -t localhost/gravityclaw-agy:1.1.13 .
-GRAVITYCLAW_HOME="$PWD/.runtime" \
-  .venv/bin/python -m gravityclaw.server
-```
-
-The server binds `127.0.0.1:8787` by default. Do not expose it publicly; channel
-authentication belongs to the channel layer, and the control plane should also
-be configured with `GRAVITYCLAW_CONTROL_TOKEN_FILE` before remote access.
-
-For the canonical user installation, use the reviewed artifact installer:
-
-```bash
-packaging/install.sh
+curl -sSL https://raw.githubusercontent.com/AhmadSid110/gravityclaw/main/deploy/install.sh | bash
 gravityclaw doctor
+gravityclaw start
+# → http://localhost:8787
 ```
 
-This creates XDG-owned config/data/state/runtime directories and a systemd user
-unit. AGY authentication remains an explicit official CLI step; GravityClaw
-never copies or exports those credentials. `GRAVITYCLAW_HOME` remains supported
-for development and backwards compatibility.
-
-## Local protocol probe
-
-The official binary is intentionally not committed. Point the probe at an
-installed, authenticated `agy` binary:
+### Docker Compose
 
 ```bash
-PYTHONPATH=src python -m gravityclaw.probe \
-  --agy /path/to/agy \
-  --workspace /path/to/safe/workspace \
-  "Reply with one short sentence."
+git clone https://github.com/AhmadSid110/gravityclaw.git
+cd gravityclaw
+cp .env.example .env
+# Edit .env — set your control token and (optional) Telegram token
+mkdir -p secrets
+openssl rand -base64 36 > secrets/control-token
+
+docker compose up -d
+# → http://localhost:8787
 ```
 
-The probe prints GravityClaw's normalized NDJSON event stream. It never reads
-or exports AGY credentials.
-
-## Tests
-
-The tests use a deterministic fake executable and require no Google account:
+With automatic HTTPS via Caddy:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+echo "GRAVITYCLAW_DOMAIN=gc.yourdomain.com" >> .env
+docker compose --profile with-proxy up -d
 ```
 
-The live Milestone 3 gate uses the authenticated private AGY worker volume but
-does not enable allow-all or invoke tools:
+### Manual Install
 
 ```bash
-.venv/bin/python acceptance/m3_live_context.py
+git clone https://github.com/AhmadSid110/gravityclaw.git
+cd gravityclaw
+python3.12 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+
+# Build web console
+cd web && npm install && npm run build && cd ..
+
+# Build worker image (optional, for container execution)
+podman build -f worker/Containerfile.agy -t localhost/gravityclaw-agy:1.1.13 .
+
+# Setup (creates config, DB, identity files, systemd unit)
+.venv/bin/gravityclaw setup
+.venv/bin/gravityclaw doctor
+.venv/bin/gravityclaw start
 ```
 
-The deterministic Milestone 4 Telegram crash gate uses a local Bot API
-simulator and does not require a real bot token:
+## Authentication
+
+GravityClaw protects its control plane with a bearer token. On first access, the web console presents a login screen where you paste the control token. The session is cookie-based and the token is never persisted in browser storage.
 
 ```bash
-.venv/bin/python acceptance/m4_channel_crash.py --skip-build
+# Generate a control token
+openssl rand -base64 36 > ~/.config/gravityclaw/secrets/control-token
+
+# Or set via environment
+export GRAVITYCLAW_CONTROL_TOKEN_FILE=/path/to/control-token
 ```
 
-## Identity and memory
-
-On first start GravityClaw creates human-editable files under
-`GRAVITYCLAW_HOME`: `SOUL.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`,
-`HEARTBEAT.md`, `MEMORY.md`, and `memory/`. Ordinary executions load the first
-four as authoritative identity. `HEARTBEAT.md` is reserved for the later
-scheduler milestone, and `MEMORY.md` is always labeled as data.
-
-Episodic memory writes are explicit through `POST /memories`; model execution
-cannot overwrite identity or curated memory files. Retrieval uses SQLite FTS5.
-Context is compiled immediately before dispatch, persisted with a provenance
-manifest, and bounded by deterministic token estimates plus a hard character
-ceiling. A resumed AGY conversation does not receive duplicated channel
-history. Inspect a run with `GET /runs/{id}/context`.
-
-## Telegram channel
-
-Approve workspaces through server-side aliases; Telegram never accepts paths:
-
-```bash
-curl -X POST http://127.0.0.1:8787/workspace-aliases \
-  -H 'content-type: application/json' \
-  -d '{"alias":"gravityclaw","workspace_id":"<workspace-id>"}'
+API clients authenticate with:
+```
+Authorization: Bearer <your-control-token>
 ```
 
-Configure the single-user adapter:
+The `/health` endpoint is always public. All other endpoints require authentication when a control token is configured.
 
-```text
-GRAVITYCLAW_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/gravityclaw-telegram-token
-GRAVITYCLAW_TELEGRAM_USER_ID=<numeric-user-id>
-GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE=gravityclaw
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Web Console                        │
+│            React / Vite / TypeScript                 │
+└────────────────────────┬────────────────────────────┘
+                         │ HTTP / WebSocket
+┌────────────────────────▼────────────────────────────┐
+│               GravityClaw Core                       │
+│  FastAPI control plane (Python ≥3.12)               │
+│                                                      │
+│  • Identity & Memory    • Scheduler                  │
+│  • Context Compiler     • Channels (Telegram)        │
+│  • Run Manager          • Learning Engine            │
+│  • Capability Manager   • TaskFlow Orchestration     │
+│  • Skill & MCP Registry • Curator                    │
+└────────────────────────┬────────────────────────────┘
+                         │ subprocess / Podman
+┌────────────────────────▼────────────────────────────┐
+│              AGY Worker                              │
+│  Antigravity CLI in rootless container or host       │
+│  (reasoning, tool execution, sandbox)                │
+└─────────────────────────────────────────────────────┘
 ```
 
-`GRAVITYCLAW_TELEGRAM_BOT_TOKEN` is also supported, but the secret-file form is
-preferred. Commands are `/new`, `/status`, `/stop`, and `/workspace <alias>`.
-The polling cursor, inbox dedupe, cancellation requests, presentation state,
-provider message IDs, retries, and delivery acknowledgements are all durable.
+## Configuration
 
-## Scheduling
+After `gravityclaw setup`, edit `~/.config/gravityclaw/gravityclaw.toml`:
 
-Schedules enter the same `RunManager` path as channel messages. The API accepts
-`one_shot`, `interval`, `cron`, and `heartbeat` schedules and stores timestamps
-as UTC while evaluating cron expressions in an explicit IANA timezone. Use
-`/schedules/{id}/triggers` to inspect occurrence decisions. Heartbeats default
-to a single bounded evaluation, skip stale backlog, and remain silent unless an
-actionable notification policy and channel target are configured.
+```toml
+[server]
+host = "127.0.0.1"
+port = 8787
 
-## Security status
+[execution]
+mode = "agy"
+target = "host"            # or "container" for Podman isolation
+worker_image = "localhost/gravityclaw-agy:1.1.13"
 
-The live spike found that AGY's terminal sandbox can reset transiently. Milestone
-2 therefore adds external rootless Podman containment. The worker still needs a
-separate adversarial hardening review before autonomous mode is enabled against
-valuable workspaces.
+[control]
+token_file = "~/.config/gravityclaw/secrets/control-token"
+
+[telegram]
+enabled = true
+token_file = "~/.config/gravityclaw/secrets/telegram-token"
+allowed_user_id = "your-telegram-user-id"
+
+[learning]
+enabled = true
+```
+
+## Requirements
+
+- Python ≥ 3.12
+- Node.js ≥ 18 (for web console build)
+- Podman (rootless, for container execution mode)
+- AGY (Antigravity CLI) — authenticated on the host
+
+## Security
+
+- Never expose port 8787 directly to the internet — use the Caddy profile or your own reverse proxy
+- All secrets should be file-mode `0600`
+- AGY credentials are bind-mounted read-only in container mode
+- The systemd unit runs with `NoNewPrivileges=true` and `PrivateTmp=true`
+- Worker processes execute inside rootless Podman containers by default
+
+## Project Status
+
+**Version 0.10.0** — validated through Milestone 10. Active development on M11 (TaskFlow, curator, telemetry).
+
+## License
+
+MIT
+
