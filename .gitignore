@@ -1,14 +1,31 @@
+# AGY binary (not committed; authenticate yourself)
 .tools/
+
+# Python
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .coverage
 dist/
 build/
+
+# Web console
 web/node_modules/
 web/dist/
+
+# Runtime / data
 .runtime/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets
+secrets/
+.env
+
+# Temp / logs
 tmp*/
 *.log
 scratch/

@@ -1,0 +1,22 @@
+# GravityClaw Caddy reverse proxy
+# Replace {$GRAVITYCLAW_DOMAIN} with your actual domain,
+# or set the GRAVITYCLAW_DOMAIN env var.
+
+{$GRAVITYCLAW_DOMAIN:localhost} {
+    reverse_proxy server:8787
+    encode gzip
+
+    # WebSocket support for live run streaming
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @websocket server:8787
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}

@@ -1,0 +1,74 @@
+# GravityClaw Docker Compose
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f        # tail logs
+#   docker compose exec server gravityclaw doctor  # health check
+#
+# Before first run:
+#   1. Copy .env.example to .env and fill in values
+#   2. Place your AGY binary at .tools/antigravity (or mount it via AGY_BINARY_PATH)
+#   3. Authenticate AGY on the host first (credentials are bind-mounted)
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gravityclaw-server
+    restart: unless-stopped
+    ports:
+      - "${GRAVITYCLAW_PORT:-8787}:8787"
+    environment:
+      - GRAVITYCLAW_HOME=/data
+      - GRAVITYCLAW_MODE=${GRAVITYCLAW_MODE:-agy}
+      - GRAVITYCLAW_EXECUTION_TARGET=${GRAVITYCLAW_EXECUTION_TARGET:-host}
+      - GRAVITYCLAW_AGY_BINARY=/usr/local/bin/agy
+      - GRAVITYCLAW_WORKER_IMAGE=${GRAVITYCLAW_WORKER_IMAGE:-localhost/gravityclaw-agy:1.1.13}
+      - GRAVITYCLAW_COOKIE_SECURE=${GRAVITYCLAW_COOKIE_SECURE:-1}
+      - GRAVITYCLAW_TELEGRAM_USER_ID=${GRAVITYCLAW_TELEGRAM_USER_ID:-}
+      - GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE=${GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE:-}
+      - GRAVITYCLAW_LEARNING_ENABLED=${GRAVITYCLAW_LEARNING_ENABLED:-true}
+    volumes:
+      - gravityclaw-data:/data
+      - ${AGY_BINARY_PATH:-./.tools/antigravity}:/usr/local/bin/agy:ro
+      # Mount AGY credentials from host (read-only)
+      - ${AGY_CONFIG_DIR:-~/.config/agy}:/home/gravityclaw/.config/agy:ro
+      # If using container execution, mount the podman socket
+      - ${PODMAN_SOCKET:-/run/user/1000/podman/podman.sock}:/run/podman/podman.sock
+    secrets:
+      - control-token
+      - telegram-token
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Caddy reverse proxy with automatic HTTPS
+  caddy:
+    image: caddy:2-alpine
+    container_name: gravityclaw-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - server
+    profiles:
+      - with-proxy
+
+volumes:
+  gravityclaw-data:
+  caddy-data:
+  caddy-config:
+
+secrets:
+  control-token:
+    file: ${CONTROL_TOKEN_FILE:-./secrets/control-token}
+  telegram-token:
+    file: ${TELEGRAM_TOKEN_FILE:-./secrets/telegram-token}

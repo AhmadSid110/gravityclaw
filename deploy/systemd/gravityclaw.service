@@ -1,0 +1,25 @@
+# GravityClaw systemd user unit (template)
+# Install to: ~/.config/systemd/user/gravityclaw.service
+# Then: systemctl --user daemon-reload && systemctl --user enable --now gravityclaw
+#
+# Note: `gravityclaw setup` generates this automatically with correct paths.
+# This template is for manual reference.
+
+[Unit]
+Description=GravityClaw persistent personal agent
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/gravityclaw/venv/bin/gravityclaw-server --host 127.0.0.1 --port 8787 --log-level info
+Environment=GRAVITYCLAW_CONFIG=%h/.config/gravityclaw/gravityclaw.toml
+Environment=GRAVITYCLAW_COOKIE_SECURE=1
+WorkingDirectory=%h/.local/share/gravityclaw
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
