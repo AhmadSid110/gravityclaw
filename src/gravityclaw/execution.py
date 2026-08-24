@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -306,7 +307,7 @@ class AgyContainerSpecFactory:
         resolved_model = run.request.get("resolved_model")
         if resolved_model:
             command.extend(["--model", str(resolved_model)])
-        effort = run.request.get("effort")
+        effort = run.request.get("effort") or ("medium" if resolved_model else None)
         if effort:
             command.extend(["--effort", str(effort)])
         backend_conversation = conversation.agy_conversation_id
@@ -604,7 +605,7 @@ class AgyHostSpecFactory:
         resolved_model = run.request.get("resolved_model")
         if resolved_model:
             command.extend(["--model", str(resolved_model)])
-        effort = run.request.get("effort")
+        effort = run.request.get("effort") or ("medium" if resolved_model else None)
         if effort:
             command.extend(["--effort", str(effort)])
         backend_conversation = conversation.agy_conversation_id
@@ -627,14 +628,19 @@ class AgyHostSpecFactory:
 class FakeHostSpecFactory:
     """Build command specifications for direct host fake runner execution."""
 
-    def __init__(self, script_path: str = "/opt/gravityclaw/fake_agent.py") -> None:
-        self.script_path = script_path
+    def __init__(self, script_path: str | None = None) -> None:
+        if script_path is not None:
+            self.script_path = script_path
+        elif Path("/opt/gravityclaw/fake_agent.py").is_file():
+            self.script_path = "/opt/gravityclaw/fake_agent.py"
+        else:
+            self.script_path = str(Path(__file__).resolve().parents[2] / "worker" / "fake_agent.py")
 
     def build(
         self, run: RunRecord, conversation: Conversation, workspace: Workspace
     ) -> ContainerSpec:
         scenario = str(run.request.get("scenario", "text"))
-        command = ["python", self.script_path, scenario]
+        command = [sys.executable, self.script_path, scenario]
         if conversation.agy_conversation_id:
             command.extend(["--conversation", conversation.agy_conversation_id])
         delay = run.request.get("delay")

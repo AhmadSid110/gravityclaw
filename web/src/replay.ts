@@ -142,7 +142,10 @@ export function presentationForRun(run: RunRecord, events: PersistedEvent[]): Pr
     completedActivities: [],
     subagents: [],
     currentTaskSummary: typeof run.request?.prompt === "string" ? run.request.prompt : undefined,
+    progress: null,
   };
+
+  const outputTail: string[] = [];
 
   for (const event of events.slice().sort((left, right) => left.sequence - right.sequence)) {
     const payload = event.payload ?? {};
@@ -171,6 +174,12 @@ export function presentationForRun(run: RunRecord, events: PersistedEvent[]): Pr
           presentation.currentActivity = null;
         }
       }
+    } else if (event.event_type === "process.output" || event.event_type === "ssh.output") {
+      const text = String(payload.text ?? "");
+      if (text.trim()) {
+        outputTail.push(text.trim());
+        if (outputTail.length > 15) outputTail.shift();
+      }
     } else if (event.event_type === "subagent.updated") {
       const info = payload.subagent_info;
       const label = typeof info === "string" ? info : typeof info === "object" && info !== null ? String((info as Record<string, unknown>).name ?? "Subagent") : "Subagent active";
@@ -178,12 +187,32 @@ export function presentationForRun(run: RunRecord, events: PersistedEvent[]): Pr
     } else if (event.event_type === "agent.completed" || event.event_type === "run.completed") {
       presentation.status = "completed";
       if (!presentation.assistantText && typeof payload.response === "string") presentation.assistantText = payload.response;
-    } else if (event.event_type === "agent.failed" || event.event_type === "run.failed") presentation.status = "failed";
-    else if (event.event_type === "run.cancelled") presentation.status = "cancelled";
+    } else if (event.event_type === "agent.failed" || event.event_type === "run.failed") {
+      presentation.status = "failed";
+    } else if (event.event_type === "run.cancelled") presentation.status = "cancelled";
     else if (event.event_type === "run.interrupted") presentation.status = "interrupted";
     else if (event.event_type === "run.running") presentation.status = "running";
     else if (event.event_type === "run.queued") presentation.status = "queued";
   }
+
+  if (outputTail.length > 0) {
+    if (!presentation.progress) {
+      presentation.progress = {
+        run_id: run.id,
+        status: run.status,
+        started_at: run.created_at,
+        last_activity_at: events[events.length - 1]?.created_at || run.created_at,
+        completed_steps: [],
+        pending_steps: [],
+        recent_output_tail: outputTail,
+        counters: { tool_calls: presentation.completedTools.length, commands: 0, files_read: 0, files_modified: 0, output_lines: outputTail.length, output_bytes: 0 },
+        version: events.length,
+      };
+    } else {
+      presentation.progress.recent_output_tail = outputTail;
+    }
+  }
+
   return presentation;
 }
 

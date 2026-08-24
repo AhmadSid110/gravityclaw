@@ -677,7 +677,7 @@ class LearningEngineEndToEndTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-        self.assertEqual(version, "17")
+        self.assertEqual(version, "18")
         self.assertIn("learning_jobs", tables)
         self.assertIn("learning_events", tables)
 

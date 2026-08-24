@@ -28,10 +28,11 @@ import { RichRunInspector } from "./RunInspector";
 import { MemoryStudio } from "./MemoryStudio";
 import { ContextStudio } from "./ContextStudio";
 import { AutomationsStudio } from "./AutomationsStudio";
+import { TaskFlowStudio } from "./TaskFlowStudio";
+import { TaskFlowHomeCard } from "./TaskFlowHomeCard";
 import { CapabilitiesStudio } from "./CapabilitiesStudio";
 import { LearningStudio } from "./LearningStudio";
 import { SettingsPage } from "./SettingsPage";
-import { GoalCard } from "./GoalCard";
 import { useAppearance } from "./theme";
 import { SlashCommandMenu, SlashCommand, SLASH_COMMANDS } from "./SlashCommandMenu";
 import type { AttachmentRecord, Conversation, ConversationDetail, ConversationSearchResult, ControlState, Message, NormalizedActivity, PersistedEvent, PresentationState, RunRecord } from "./types";
@@ -49,7 +50,7 @@ const navItems = [
   ["channels", "◉", "Channels"],
 ] as const;
 
-type View = typeof navItems[number][0] | "usage" | "settings";
+type View = typeof navItems[number][0] | "taskflow" | "usage" | "settings";
 
 function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -130,9 +131,13 @@ function AppSidebar({
   connection,
   mobileOpen,
   onCloseMobile,
+  onRenameSession,
+  onArchiveSession,
+  archivedCount,
+  onOpenArchivedChats,
 }: {
   view: View;
-  setView: (v: View) => void;
+  setView: (view: View) => void;
   conversations: Conversation[];
   selectedConvId: string | null;
   onSelectConv: (id: string) => void;
@@ -144,9 +149,24 @@ function AppSidebar({
   connection: string;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  onRenameSession: (convId: string, title: string) => Promise<void>;
+  onArchiveSession: (convId: string) => Promise<void>;
+  archivedCount: number;
+  onOpenArchivedChats: () => void;
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+
+  // Close menus when mobile drawer closes
+  useEffect(() => {
+    if (!mobileOpen) {
+      setActiveMenuId(null);
+      setMoreOpen(false);
+      setRenamingSessionId(null);
+    }
+  }, [mobileOpen]);
 
   const pinned = conversations.filter((c) => pinnedIds.includes(c.id));
   const recent = conversations.filter((c) => !pinnedIds.includes(c.id));
@@ -157,10 +177,55 @@ function AppSidebar({
     onCloseMobile();
   };
 
+  const handleStartRename = (conv: Conversation, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setActiveMenuId(null);
+    setRenamingSessionId(conv.id);
+    setRenameDraft(conv.title || "");
+  };
+
+  const handleSaveRenameSubmit = async (convId: string, e: React.FormEvent) => {
+    e.preventDefault();
+    const title = renameDraft.trim();
+    if (!title) return;
+    try {
+      await onRenameSession(convId, title);
+      setRenamingSessionId(null);
+    } catch (err) {
+      console.error("Failed to rename session:", err);
+    }
+  };
+
   const renderSessionRow = (conv: Conversation, isPinned: boolean) => {
     const isSelected = view === "conversations" && selectedConvId === conv.id;
     const isRunning = activeRuns.some((r) => r.conversation_id === conv.id && r.status === "running");
     const menuOpen = activeMenuId === conv.id;
+    const isRenaming = renamingSessionId === conv.id;
+
+    if (isRenaming) {
+      return (
+        <div key={conv.id} className="sidebar-session-item is-renaming">
+          <form
+            onSubmit={(e) => void handleSaveRenameSubmit(conv.id, e)}
+            className="sidebar-inline-rename-form"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <input
+              type="text"
+              autoFocus
+              className="sidebar-rename-input"
+              value={renameDraft}
+              onChange={(e) => setRenameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setRenamingSessionId(null);
+              }}
+            />
+            <button type="submit" className="sidebar-rename-submit-btn" title="Save title">✓</button>
+            <button type="button" className="sidebar-rename-cancel-btn" onClick={() => setRenamingSessionId(null)} title="Cancel">✕</button>
+          </form>
+        </div>
+      );
+    }
 
     return (
       <div key={conv.id} className={`sidebar-session-item ${isSelected ? "active" : ""}`}>
@@ -195,6 +260,7 @@ function AppSidebar({
             <div className="sidebar-popover-menu" onClick={(e) => e.stopPropagation()}>
               <button
                 type="button"
+                className="sidebar-popover-item"
                 onClick={(e) => {
                   onTogglePin(conv.id, e);
                   setActiveMenuId(null);
@@ -204,34 +270,24 @@ function AppSidebar({
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setActiveMenuId(null);
-                  window.dispatchEvent(new CustomEvent("gravityclaw:rename-chat", { detail: conv }));
-                }}
+                className="sidebar-popover-item"
+                onClick={(e) => handleStartRename(conv, e)}
               >
                 <span>✎</span> Rename
               </button>
               <button
                 type="button"
+                className="sidebar-popover-item"
                 onClick={() => {
                   setActiveMenuId(null);
-                  window.dispatchEvent(new CustomEvent("gravityclaw:archive-chat", { detail: conv.id }));
+                  void onArchiveSession(conv.id);
                 }}
               >
                 <span>📦</span> Archive
               </button>
               <button
                 type="button"
-                className="danger"
-                onClick={() => {
-                  setActiveMenuId(null);
-                  window.dispatchEvent(new CustomEvent("gravityclaw:delete-chat", { detail: conv }));
-                }}
-              >
-                <span>🗑</span> Delete
-              </button>
-              <button
-                type="button"
+                className="sidebar-popover-item"
                 onClick={() => {
                   setActiveMenuId(null);
                   void navigator.clipboard.writeText(conv.id);
@@ -248,100 +304,50 @@ function AppSidebar({
 
   return (
     <aside className={`sidebar ${mobileOpen ? "open" : ""}`}>
-      {/* Brand */}
-      <div className="sidebar-brand-row">
-        <div className="brand-mark">✦</div>
-        <strong>GravityClaw</strong>
-      </div>
+      {/* ═══ ZONE 1: FIXED TOP NAVIGATION ═══ */}
+      <div className="sidebar-zone-top">
+        {/* Brand */}
+        <div className="sidebar-brand-row">
+          <div className="brand-mark">✦</div>
+          <strong>GravityClaw</strong>
+        </div>
 
-      {/* Overview Button */}
-      <button
-        type="button"
-        className={`sidebar-nav-entry ${view === "home" ? "active" : ""}`}
-        onClick={() => { setView("home"); onCloseMobile(); }}
-      >
-        <span className="sidebar-entry-icon">⌁</span>
-        <span>Overview</span>
-      </button>
+        {/* Primary Navigation Entries */}
+        <button
+          type="button"
+          className={`sidebar-nav-entry ${view === "home" ? "active" : ""}`}
+          onClick={() => { setView("home"); onCloseMobile(); }}
+        >
+          <span className="sidebar-entry-icon">⌁</span>
+          <span>Overview</span>
+        </button>
+
+        <button
+          type="button"
+          className={`sidebar-nav-entry ${view === "taskflow" ? "active" : ""}`}
+          onClick={() => { setView("taskflow"); onCloseMobile(); }}
+        >
+          <span className="sidebar-entry-icon">⚡</span>
+          <span>TaskFlow</span>
+        </button>
+
+        {/* Prominent New Session Action */}
+        <button
+          type="button"
+          className="sidebar-new-session-action"
+          onClick={() => {
+            onNewSession();
+            onCloseMobile();
+          }}
+        >
+          <span className="plus">＋</span>
+          <span>New session</span>
+        </button>
+      </div>
 
       <div className="sidebar-divider" />
 
-      {/* Collapsible MORE Accordion */}
-      <div className="sidebar-more-section">
-        <button
-          type="button"
-          className={`sidebar-more-toggle ${moreOpen ? "open" : ""}`}
-          onClick={() => setMoreOpen(!moreOpen)}
-          aria-expanded={moreOpen}
-        >
-          <span>MORE</span>
-          <span className="more-arrow">{moreOpen ? "⌄" : "›"}</span>
-        </button>
-
-        {moreOpen && (
-          <div className="sidebar-more-list fade-in">
-            <button className={`sidebar-sub-entry ${view === "automations" ? "active" : ""}`} onClick={() => { setView("automations"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">⚡</span>
-              <span>Automations</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "memory" ? "active" : ""}`} onClick={() => { setView("memory"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">🧠</span>
-              <span>Memory</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "capabilities" ? "active" : ""}`} onClick={() => { setView("capabilities"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">◇</span>
-              <span>Skills</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "learning" ? "active" : ""}`} onClick={() => { setView("learning"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">✦</span>
-              <span>Learning</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "capabilities" ? "active" : ""}`} onClick={() => { setView("capabilities"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">⌘</span>
-              <span>Capabilities</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "context" ? "active" : ""}`} onClick={() => { setView("context"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">🔌</span>
-              <span>Integrations</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "workspaces" ? "active" : ""}`} onClick={() => { setView("workspaces"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">◫</span>
-              <span>Workspaces</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "runs" ? "active" : ""}`} onClick={() => { setView("runs"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">◎</span>
-              <span>Models</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "channels" ? "active" : ""}`} onClick={() => { setView("channels"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">◉</span>
-              <span>Channels</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "runs" ? "active" : ""}`} onClick={() => { setView("runs"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">▤</span>
-              <span>Logs</span>
-            </button>
-            <button className={`sidebar-sub-entry ${view === "settings" ? "active" : ""}`} onClick={() => { setView("settings"); onCloseMobile(); }}>
-              <span className="sidebar-entry-icon">⚙</span>
-              <span>Settings</span>
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Prominent New Session Button */}
-      <button
-        type="button"
-        className="sidebar-new-session-action"
-        onClick={() => {
-          onNewSession();
-          onCloseMobile();
-        }}
-      >
-        <span className="plus">＋</span>
-        <span>New session</span>
-      </button>
-
-      {/* SESSIONS Area (Dominates visible area) */}
+      {/* ═══ ZONE 2: SCROLLABLE SESSIONS LIST ═══ */}
       <div className="sidebar-sessions-container">
         <div className="sidebar-sessions-bar">
           <span className="sessions-heading">SESSIONS</span>
@@ -378,60 +384,112 @@ function AppSidebar({
           )}
         </div>
 
-        <button
-          type="button"
-          className="sidebar-all-sessions-footer-btn"
-          onClick={() => {
-            onOpenAllSessions();
-            onCloseMobile();
-          }}
-        >
-          <span>All sessions</span>
-          <span className="chevron-right">›</span>
-        </button>
+        {/* Action Footers: All sessions + Archived sessions */}
+        <div className="sidebar-sessions-footer-actions">
+          <button
+            type="button"
+            className="sidebar-all-sessions-footer-btn"
+            onClick={() => {
+              onOpenAllSessions();
+              onCloseMobile();
+            }}
+          >
+            <span>All sessions</span>
+            <span className="chevron-right">›</span>
+          </button>
+
+          <button
+            type="button"
+            className="sidebar-archived-footer-btn"
+            onClick={() => {
+              onOpenArchivedChats();
+              onCloseMobile();
+            }}
+            title="View and restore archived sessions"
+          >
+            <span className="arch-left">
+              <span className="archive-icon">📦</span>
+              <span>Archived ({archivedCount})</span>
+            </span>
+            <span className="chevron-right">›</span>
+          </button>
+        </div>
       </div>
 
       <div className="sidebar-divider" />
 
-      {/* Sidebar Footer */}
-      <div className="sidebar-bottom-bar">
-        <div className="sidebar-conn-pill">
-          <span className={`status-dot ${connection === "connected" ? "green" : "amber"}`} />
-          <span>{connection === "connected" ? "Connected" : connection}</span>
+      {/* ═══ ZONE 3: FIXED BOTTOM NAVIGATION & TOOLS ═══ */}
+      <div className="sidebar-zone-footer">
+        <div className="sidebar-more-section">
+          <button
+            type="button"
+            className={`sidebar-more-toggle ${moreOpen ? "open" : ""}`}
+            onClick={() => setMoreOpen(!moreOpen)}
+            aria-expanded={moreOpen}
+          >
+            <span>MORE</span>
+            <span className="more-arrow">{moreOpen ? "⌄" : "›"}</span>
+          </button>
+
+          {moreOpen && (
+            <div className="sidebar-more-list fade-in">
+              <button type="button" className={`sidebar-sub-entry ${view === "automations" ? "active" : ""}`} onClick={() => { setView("automations"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">⚡</span>
+                <span>Automations</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "memory" ? "active" : ""}`} onClick={() => { setView("memory"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">🧠</span>
+                <span>Memory</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "capabilities" ? "active" : ""}`} onClick={() => { setView("capabilities"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">◇</span>
+                <span>Skills</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "learning" ? "active" : ""}`} onClick={() => { setView("learning"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">✦</span>
+                <span>Learning</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "capabilities" ? "active" : ""}`} onClick={() => { setView("capabilities"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">⌘</span>
+                <span>Capabilities</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "context" ? "active" : ""}`} onClick={() => { setView("context"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">🔌</span>
+                <span>Integrations</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "workspaces" ? "active" : ""}`} onClick={() => { setView("workspaces"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">◫</span>
+                <span>Workspaces</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "runs" ? "active" : ""}`} onClick={() => { setView("runs"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">◎</span>
+                <span>Models</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "channels" ? "active" : ""}`} onClick={() => { setView("channels"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">◉</span>
+                <span>Channels</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "runs" ? "active" : ""}`} onClick={() => { setView("runs"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">▤</span>
+                <span>Logs</span>
+              </button>
+              <button type="button" className={`sidebar-sub-entry ${view === "settings" ? "active" : ""}`} onClick={() => { setView("settings"); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">⚙</span>
+                <span>Settings</span>
+              </button>
+              <button type="button" className="sidebar-sub-entry" onClick={() => { onOpenArchivedChats(); onCloseMobile(); }}>
+                <span className="sidebar-entry-icon">📦</span>
+                <span>Archived ({archivedCount})</span>
+              </button>
+            </div>
+          )}
         </div>
-        <div className="sidebar-bottom-actions">
-          <button
-            type="button"
-            className="sidebar-action-icon-btn"
-            onClick={() => { setView("settings"); onCloseMobile(); }}
-            title="Settings"
-            aria-label="Settings"
-          >
-            ⚙
-          </button>
-          <button
-            type="button"
-            className="sidebar-action-icon-btn"
-            onClick={() => { setView("workspaces"); onCloseMobile(); }}
-            title="Workspaces"
-            aria-label="Workspaces"
-          >
-            ◫
-          </button>
-          <button
-            type="button"
-            className="sidebar-action-icon-btn"
-            onClick={() => {
-              const curr = document.documentElement.getAttribute("data-density") || "compact";
-              const next = curr === "compact" ? "comfortable" : "compact";
-              document.documentElement.setAttribute("data-density", next);
-              localStorage.setItem("gravityclaw:density", next);
-            }}
-            title="Toggle Layout"
-            aria-label="Toggle Layout"
-          >
-            ◧
-          </button>
+
+        {/* Minimal Connection Dot */}
+        <div className="sidebar-conn-footer">
+          <div className="sidebar-conn-dot-only" title={connection === "connected" ? "Connected" : "Disconnected / Error"}>
+            <span className={`status-dot ${connection === "connected" ? "green" : "red"}`} />
+          </div>
         </div>
       </div>
     </aside>
@@ -440,14 +498,76 @@ function AppSidebar({
 
 function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
   const [view, setView] = useState<View>(() => {
-    const hash = window.location.hash.replace(/^#/, "");
-    return (hash && navItems.some(([id]) => id === hash)) ? (hash as View) : "conversations";
+    try {
+      const rawHash = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+      const baseHash = rawHash.split("/")[0];
+      if (baseHash && (navItems.some(([id]) => id === baseHash) || baseHash === "taskflow" || baseHash === "settings" || baseHash === "usage")) {
+        return baseHash as View;
+      }
+      const saved = localStorage.getItem("gravityclaw:active-view");
+      if (saved && (navItems.some(([id]) => id === saved) || saved === "taskflow" || saved === "settings" || saved === "usage")) {
+        return saved as View;
+      }
+    } catch {}
+    return "home";
   });
+
+  const [selectedConvId, setSelectedConvId] = useState<string | null>(() => {
+    try {
+      const rawHash = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+      const parts = rawHash.split("/");
+      if ((parts[0] === "conversations" || parts[0] === "chat") && parts[1]) {
+        return parts[1];
+      }
+      const saved = localStorage.getItem("gravityclaw:active-conversation-id");
+      return saved || null;
+    } catch {
+      return null;
+    }
+  });
+
+  // Sync view and selected conversation to URL hash and localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem("gravityclaw:active-view", view);
+      if (selectedConvId) {
+        localStorage.setItem("gravityclaw:active-conversation-id", selectedConvId);
+      }
+      const rawHash = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+      const expectedHash = view === "conversations" && selectedConvId ? `conversations/${selectedConvId}` : view;
+      if (rawHash !== expectedHash && rawHash !== view) {
+        window.history.replaceState(null, "", `#${expectedHash}`);
+      }
+    } catch {}
+  }, [view, selectedConvId]);
+
+  // Listen to browser forward/back button navigation (hashchange)
+  useEffect(() => {
+    const handleHashChange = () => {
+      const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+      const [targetView, targetConvId] = raw.split("/");
+      if (targetView && (navItems.some(([id]) => id === targetView) || targetView === "taskflow" || targetView === "settings" || targetView === "usage")) {
+        setView(targetView as View);
+        if (targetConvId) {
+          setSelectedConvId(targetConvId);
+          try {
+            localStorage.setItem("gravityclaw:active-conversation-id", targetConvId);
+          } catch {}
+          window.dispatchEvent(new CustomEvent("gravityclaw:select-chat", { detail: { id: targetConvId } }));
+        }
+      }
+    };
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
   const [mobileNav, setMobileNav] = useState(false);
   const [selectedRun, setSelectedRun] = useState<RunRecord | null>(null);
   const [contextInspectorRunId, setContextInspectorRunId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
+  const [archivedList, setArchivedList] = useState<Conversation[]>([]);
+  const [archivedModalOpen, setArchivedModalOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
   const [pinnedIds, setPinnedIds] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem("gravityclaw:pinned-sessions");
@@ -461,18 +581,48 @@ function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
   useAppearance(); // Reactively syncs theme, font, and density with localStorage and data attributes
   const title = navItems.find(([id]) => id === view)?.[2] ?? (view === "usage" ? "Usage" : view === "settings" ? "Settings" : "Home");
 
-  // Sync conversations list
-  useEffect(() => {
-    let cancelled = false;
-    void getArchivedConversations().then((all) => {
-      if (cancelled) return;
+  const showToast = (message: string) => {
+    setToast(message);
+    setTimeout(() => setToast((curr) => (curr === message ? null : curr)), 3200);
+  };
+
+  const syncConversations = async () => {
+    try {
+      const all = await getArchivedConversations();
       const active = all.filter((c) => !c.archived_at);
+      const archived = all.filter((c) => !!c.archived_at);
       setConversations(active);
-      if (active.length > 0 && !selectedConvId) {
-        setSelectedConvId(active[0].id);
+      setArchivedList(archived);
+
+      const fromUrl = (() => {
+        try {
+          const parts = window.location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
+          if ((parts[0] === "conversations" || parts[0] === "chat") && parts[1]) return parts[1];
+        } catch {}
+        return null;
+      })();
+      const savedId = localStorage.getItem("gravityclaw:active-conversation-id");
+
+      const targetId = (fromUrl && active.some((c) => c.id === fromUrl) ? fromUrl : null)
+        || (selectedConvId && active.some((c) => c.id === selectedConvId) ? selectedConvId : null)
+        || (savedId && active.some((c) => c.id === savedId) ? savedId : null)
+        || active[0]?.id
+        || null;
+
+      if (targetId) {
+        setSelectedConvId(targetId);
+        try {
+          localStorage.setItem("gravityclaw:active-conversation-id", targetId);
+        } catch {}
       }
-    }).catch(() => undefined);
-    return () => { cancelled = true; };
+      return { active, archived };
+    } catch {
+      return { active: [], archived: [] };
+    }
+  };
+
+  useEffect(() => {
+    void syncConversations();
   }, []);
 
   useEffect(() => {
@@ -496,14 +646,94 @@ function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
     });
   };
 
+  const handleGlobalRenameSession = async (convId: string, newTitle: string) => {
+    try {
+      const updated = await updateConversation(convId, { title: newTitle });
+      setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, title: updated.title } : c)));
+      const cached = conversationDetailCache.get(convId);
+      if (cached) {
+        cached.conversation.title = updated.title;
+        conversationDetailCache.set(convId, { ...cached });
+      }
+      showToast("✓ Session renamed");
+      window.dispatchEvent(new CustomEvent("gravityclaw:conversations-updated", {
+        detail: conversations.map((c) => (c.id === convId ? { ...c, title: updated.title } : c))
+      }));
+    } catch (err) {
+      showToast("✕ Failed to rename session");
+      throw err;
+    }
+  };
+
+  const handleGlobalArchiveSession = async (convId: string) => {
+    try {
+      await archiveConversation(convId);
+      const { active } = await syncConversations();
+      showToast("✓ Session moved to Archived chats");
+      if (selectedConvId === convId) {
+        const nextId = active[0]?.id ?? null;
+        setSelectedConvId(nextId);
+        if (nextId) {
+          window.dispatchEvent(new CustomEvent("gravityclaw:select-chat", { detail: { id: nextId } }));
+        }
+      }
+      window.dispatchEvent(new CustomEvent("gravityclaw:conversations-updated", { detail: active }));
+    } catch {
+      showToast("✕ Failed to archive session");
+    }
+  };
+
+  const handleRestoreFromArchived = async (convId: string) => {
+    try {
+      await restoreConversation(convId);
+      await syncConversations();
+      setArchivedModalOpen(false);
+      setSelectedConvId(convId);
+      setView("conversations");
+      showToast("✓ Session restored");
+      window.dispatchEvent(new CustomEvent("gravityclaw:select-chat", { detail: { id: convId } }));
+    } catch {
+      showToast("✕ Failed to restore session");
+    }
+  };
+
+  const handleDeletePermanent = async (conv: Conversation) => {
+    try {
+      await deleteConversationPermanent(conv.id);
+      await syncConversations();
+      showToast("✓ Session permanently deleted");
+    } catch {
+      showToast("✕ Failed to delete session");
+    }
+  };
+
   const handleOpenAllSessions = () => {
     setView("conversations");
     window.dispatchEvent(new CustomEvent("gravityclaw:search-chats"));
   };
 
-  const handleNewSession = () => {
-    setView("conversations");
-    window.dispatchEvent(new CustomEvent("gravityclaw:new-chat"));
+  const handleNewSession = async () => {
+    try {
+      const workspaces = await getWorkspaces();
+      if (!workspaces[0]) {
+        showToast("✕ No workspace found");
+        return;
+      }
+      const countNormal = conversations.filter((c) => c.kind !== "main").length;
+      const title = countNormal > 0 ? `New chat ${countNormal + 1}` : "New chat";
+      const conversation = await createConversation(workspaces[0].id, title, "normal");
+      setSelectedConvId(conversation.id);
+      setView("conversations");
+      try {
+        localStorage.setItem("gravityclaw:active-conversation-id", conversation.id);
+      } catch {}
+      await syncConversations();
+      showToast("✓ New chat created");
+      window.dispatchEvent(new CustomEvent("gravityclaw:select-chat", { detail: { id: conversation.id } }));
+    } catch (err) {
+      console.error("Failed to create conversation:", err);
+      showToast("✕ Failed to create new session");
+    }
   };
 
   // Compute the latest active run for the context circle
@@ -511,6 +741,7 @@ function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
   const contextRatio = latestActiveRun ? 0.42 : 0;
 
   return <div className="app">
+    {toast && <div className="global-toast" role="status">{toast}</div>}
     <AppSidebar
       view={view}
       setView={setView}
@@ -528,6 +759,10 @@ function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
       connection={state.connection}
       mobileOpen={mobileNav}
       onCloseMobile={() => setMobileNav(false)}
+      onRenameSession={handleGlobalRenameSession}
+      onArchiveSession={handleGlobalArchiveSession}
+      archivedCount={archivedList.length}
+      onOpenArchivedChats={() => setArchivedModalOpen(true)}
     />
     {mobileNav && <button className="scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
     <main className="main-shell">
@@ -554,8 +789,9 @@ function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
       )}
       {state.connection !== "connected" && <div className="connection-banner" role="status" aria-live="polite">{state.connection === "reconnecting" ? "Connection interrupted. GravityClaw is still running on the server. Reconnecting…" : state.connection === "offline" ? "Control plane unavailable. Retrying…" : "Connecting to GravityClaw…"}</div>}
       <div className={`content-shell ${view === "conversations" ? "chat-fullscreen" : ""}`}>
-        {view === "home" && <Home state={state} onRunSelect={setSelectedRun} onOpenRuns={() => setView("runs")} />}
-        {view === "conversations" && <ConversationWorkspace state={state} onRunSelect={setSelectedRun} onOpenMobileNav={() => setMobileNav(true)} />}
+        {view === "home" && <Home state={state} onRunSelect={setSelectedRun} onOpenRuns={() => setView("runs")} onOpenTaskFlow={() => setView("taskflow")} />}
+        {view === "taskflow" && <TaskFlowStudio onOpenContextInspector={setContextInspectorRunId} />}
+        {view === "conversations" && <ConversationWorkspace state={state} onRunSelect={setSelectedRun} onOpenMobileNav={() => setMobileNav(true)} selectedConvId={selectedConvId} onSelectConv={setSelectedConvId} />}
         {view === "runs" && <Runs state={state} onRunSelect={setSelectedRun} />}
         {view === "memory" && <MemoryStudio />}
         {view === "context" && <ContextStudio />}
@@ -563,24 +799,120 @@ function Console({ onLogout: _onLogout }: { onLogout: () => Promise<void> }) {
         {view === "capabilities" && <CapabilitiesStudio />}
         {view === "learning" && <LearningStudio />}
         {view === "settings" && <SettingsPage state={state} />}
-        {view !== "home" && view !== "runs" && view !== "conversations" && view !== "memory" && view !== "context" && view !== "automations" && view !== "capabilities" && view !== "learning" && view !== "settings" && <ComingSoon title={title} />}
+        {view !== "home" && view !== "runs" && view !== "conversations" && view !== "memory" && view !== "context" && view !== "automations" && view !== "capabilities" && view !== "learning" && view !== "settings" && view !== "taskflow" && <ComingSoon title={title} />}
       </div>
       {selectedRun && <RichRunInspector run={selectedRun} state={state} onClose={() => setSelectedRun(null)} />}
       {contextInspectorRunId && <ContextInspector runId={contextInspectorRunId} runStatus={latestActiveRun?.status} onClose={() => setContextInspectorRunId(null)} onOpenSkill={(_skillId) => { setContextInspectorRunId(null); setView("learning"); }} onOpenMemory={(_memoryId) => { setContextInspectorRunId(null); setView("learning"); }} onOpenJourney={(_skillId) => { setContextInspectorRunId(null); setView("learning"); }} />}
+      {archivedModalOpen && (
+        <ArchivedChatsModal
+          archived={archivedList}
+          onRestore={(id) => void handleRestoreFromArchived(id)}
+          onDeletePermanent={(conv) => void handleDeletePermanent(conv)}
+          onClose={() => setArchivedModalOpen(false)}
+        />
+      )}
     </main>
   </div>;
 }
 
-function Home({ state, onRunSelect, onOpenRuns }: { state: ControlState; onRunSelect: (run: RunRecord) => void; onOpenRuns: () => void }) {
+function Home({ state, onRunSelect, onOpenRuns, onOpenTaskFlow }: { state: ControlState; onRunSelect: (run: RunRecord) => void; onOpenRuns: () => void; onOpenTaskFlow: () => void }) {
   const snapshot = state.snapshot;
   const active = state.activeRuns.filter((run) => run.status === "running");
   const queued = state.activeRuns.filter((run) => run.status === "queued");
-  return <div className="page fade-in"><div className="page-heading"><div><div className="eyebrow">SUNDAY · AUGUST 16, 2026</div><h1>Good evening, Ahmad <span className="wave">✦</span></h1><p className="muted">GravityClaw is keeping watch.</p></div><div className="live-pill"><span className="status-dot green" /> {state.connection === "connected" ? "Live" : "Reconnecting"}</div></div>
-    <section className="stat-grid"><StatCard label="Active runs" value={String(active.length)} detail={active.length ? "Agent activity in progress" : "Nothing running"} accent="blue" /><StatCard label="Queued" value={String(queued.length)} detail={queued.length ? "Waiting for a conversation lock" : "Queue is clear"} accent="violet" /><StatCard label="Next heartbeat" value={nextHeartbeat(snapshot)} detail="Autonomous check" accent="amber" /></section>
-    <GoalCard />
-    <div className="content-grid"><section className="panel active-panel"><PanelHeader title="Active now" link={active.length ? "View all runs" : undefined} onLink={onOpenRuns} />{active.length === 0 && <EmptyState icon="◌" title="GravityClaw is quiet" detail="Start a conversation when you have something to build, inspect, or untangle." />}{active.map((run) => <RunRow key={run.id} run={run} onClick={() => onRunSelect(run)} />)}</section><section className="panel"><PanelHeader title="Up next" /><div className="schedule-row"><span className="schedule-icon">◷</span><div><strong>Main heartbeat</strong><span>Next evaluation in 18m</span></div><span className="schedule-state">Enabled</span></div><div className="schedule-row"><span className="schedule-icon subdued">◌</span><div><strong>Weekly dependency review</strong><span>Monday · 09:00 · gravityclaw</span></div><span className="schedule-state muted-text">Tomorrow</span></div></section></div>
-    <section className="panel activity-panel"><PanelHeader title="Recent activity" link="Open runs" onLink={onOpenRuns} /><div className="activity-list">{state.activity.slice(-8).reverse().map((event) => <ActivityRow key={event.id} event={event} />)}</div></section>
-  </div>;
+
+  const now = new Date();
+  const dateStr = now.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  }).toUpperCase();
+  const hour = now.getHours();
+  const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+
+  return (
+    <div className="page fade-in home-page">
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">{dateStr}</div>
+          <h1>{greeting}, Ahmad <span className="wave">✦</span></h1>
+          <p className="muted">GravityClaw is active and keeping watch.</p>
+        </div>
+        <div className="live-pill">
+          <span className={`status-dot ${state.connection === "connected" ? "green" : "amber"}`} />
+          {state.connection === "connected" ? "Live" : "Reconnecting"}
+        </div>
+      </div>
+
+      <section className="stat-grid">
+        <StatCard
+          label="Active runs"
+          value={String(active.length)}
+          detail={active.length ? `${active.length} task${active.length > 1 ? "s" : ""} in progress` : "Nothing running"}
+          accent="blue"
+        />
+        <StatCard
+          label="Queued"
+          value={String(queued.length)}
+          detail={queued.length ? "Waiting for conversation lock" : "Queue is clear"}
+          accent="violet"
+        />
+        <StatCard
+          label="Next heartbeat"
+          value={nextHeartbeat(snapshot)}
+          detail="Autonomous check"
+          accent="amber"
+        />
+      </section>
+
+      <TaskFlowHomeCard onOpenTaskFlow={onOpenTaskFlow} />
+
+      <div className="content-grid">
+        <section className="panel active-panel">
+          <PanelHeader title="Active now" link={active.length ? "View all runs" : undefined} onLink={onOpenRuns} />
+          {active.length === 0 && (
+            <EmptyState
+              icon="◌"
+              title="GravityClaw is quiet"
+              detail="Start a conversation or trigger a TaskFlow when you have work to execute."
+            />
+          )}
+          {active.map((run) => <RunRow key={run.id} run={run} onClick={() => onRunSelect(run)} />)}
+        </section>
+
+        <section className="panel">
+          <PanelHeader title="System Status" />
+          <div className="schedule-row">
+            <span className="schedule-icon">◷</span>
+            <div>
+              <strong>Autonomous Heartbeat</strong>
+              <span>Evaluates memory curator, dream consolidation, and triggers</span>
+            </div>
+            <span className="schedule-state">Active</span>
+          </div>
+          <div className="schedule-row">
+            <span className="schedule-icon subdued">◌</span>
+            <div>
+              <strong>Control Plane</strong>
+              <span>FastAPI · Tailscale Secure Mesh</span>
+            </div>
+            <span className="schedule-state">{state.connection === "connected" ? "Online" : state.connection}</span>
+          </div>
+        </section>
+      </div>
+
+      <section className="panel activity-panel">
+        <PanelHeader title="Recent activity" link="Open runs" onLink={onOpenRuns} />
+        <div className="activity-list">
+          {state.activity.length === 0 ? (
+            <div className="sidebar-empty-sessions">No recent activity</div>
+          ) : (
+            state.activity.slice(-8).reverse().map((event) => <ActivityRow key={event.id} event={event} />)
+          )}
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function Runs({ state, onRunSelect }: { state: ControlState; onRunSelect: (run: RunRecord) => void }) {
@@ -600,61 +932,86 @@ function Runs({ state, onRunSelect }: { state: ControlState; onRunSelect: (run: 
   return <div className="page fade-in"><div className="page-heading"><div><div className="eyebrow">OPERATIONS</div><h1>Runs</h1><p className="muted">Every execution, one durable timeline.</p></div><span className="history-count" role="status">{runs.length} {runs.length === 1 ? "run" : "runs"}</span></div><div className="filter-bar"><button className="filter active">All <span>⌄</span></button><button className="filter">Workspace <span>⌄</span></button><button className="filter">State <span>⌄</span></button><span className="filter-count">{runs.length} visible</span></div><section className="panel runs-table" aria-label="Execution history"><div className="table-head"><span>STATE</span><span>TASK</span><span>WORKSPACE</span><span>VERSION</span><span>TIME</span></div>{runs.length === 0 && <EmptyState icon="ϟ" title="No runs yet" detail="Your execution history will appear here." />}{runs.map((run) => <button className="table-row" key={run.id} onClick={() => onRunSelect(run)}><span><StatusBadge status={run.status} /></span><span className="task-cell"><strong>{String(run.request.prompt ?? "Untitled run")}</strong><small>{run.id.slice(0, 8)} · {run.request.context_profile ?? "chat"}</small></span><span className="workspace-cell">gravityclaw</span><span className="mono">v{run.version}</span><span className="muted-text">{formatTime(run.created_at)}</span></button>)}</section></div>;
 }
 
-function parseTimestamp(ts: string | undefined): number {
-  if (!ts) return Date.now();
-  const normalized = ts.includes("T")
-    ? (ts.endsWith("Z") || ts.includes("+") ? ts : `${ts}Z`)
-    : `${ts.replace(" ", "T")}Z`;
-  const parsed = new Date(normalized).getTime();
-  return isNaN(parsed) ? new Date(ts).getTime() || Date.now() : parsed;
-}
 
-function groupConversations(conversations: Conversation[]) {
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const yesterdayStart = todayStart - 86400000;
-  const last7DaysStart = todayStart - 6 * 86400000;
 
-  const main = conversations.filter((c) => c.kind === "main");
-  const normals = conversations.filter((c) => c.kind !== "main");
 
-  const today: Conversation[] = [];
-  const yesterday: Conversation[] = [];
-  const previous7Days: Conversation[] = [];
-  const older: Conversation[] = [];
 
-  for (const c of normals) {
-    const updated = parseTimestamp(c.updated_at || c.created_at);
-    if (updated >= todayStart) {
-      today.push(c);
-    } else if (updated >= yesterdayStart) {
-      yesterday.push(c);
-    } else if (updated >= last7DaysStart) {
-      previous7Days.push(c);
-    } else {
-      older.push(c);
-    }
-  }
-
-  return { main, today, yesterday, previous7Days, older };
-}
+// In-memory cache for instant conversation switching & restoration without loading flicker
+const conversationDetailCache = new Map<string, ConversationDetail>();
+let cachedConversationsList: Conversation[] = [];
 
 function ConversationWorkspace({
   state,
   onRunSelect,
   onOpenMobileNav,
+  selectedConvId,
+  onSelectConv,
 }: {
   state: ControlState;
   onRunSelect: (run: RunRecord) => void;
   onOpenMobileNav?: () => void;
+  selectedConvId?: string | null;
+  onSelectConv?: (id: string) => void;
 }) {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>(() => cachedConversationsList);
   const [archivedList, setArchivedList] = useState<Conversation[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [selectedId, setSelectedIdState] = useState<string | null>(() => {
+    const fromUrl = (() => {
+      try {
+        const parts = window.location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
+        if ((parts[0] === "conversations" || parts[0] === "chat") && parts[1]) return parts[1];
+      } catch {}
+      return null;
+    })();
+    return selectedConvId || fromUrl || localStorage.getItem("gravityclaw:active-conversation-id") || null;
+  });
+
+  const setSelectedId = (id: string | null) => {
+    setSelectedIdState(id);
+    if (id) {
+      try {
+        localStorage.setItem("gravityclaw:active-conversation-id", id);
+      } catch {}
+      if (onSelectConv) onSelectConv(id);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedConvId && selectedConvId !== selectedId) {
+      setSelectedIdState(selectedConvId);
+    }
+  }, [selectedConvId]);
+
+  useEffect(() => {
+    const handleSelectChat = (e: any) => {
+      if (e.detail?.id) {
+        setSelectedIdState(e.detail.id);
+        try {
+          localStorage.setItem("gravityclaw:active-conversation-id", e.detail.id);
+        } catch {}
+      }
+    };
+    window.addEventListener("gravityclaw:select-chat" as any, handleSelectChat);
+    return () => window.removeEventListener("gravityclaw:select-chat" as any, handleSelectChat);
+  }, []);
+
+  useEffect(() => {
+    const handleNewChat = () => {
+      void newConversation();
+    };
+    window.addEventListener("gravityclaw:new-chat" as any, handleNewChat);
+    return () => window.removeEventListener("gravityclaw:new-chat" as any, handleNewChat);
+  }, [conversations]);
+  const [detail, setDetail] = useState<ConversationDetail | null>(() => {
+    const savedId = localStorage.getItem("gravityclaw:active-conversation-id");
+    return savedId ? conversationDetailCache.get(savedId) || null : null;
+  });
   const [timeline, setTimeline] = useState<PersistedEvent[]>([]);
   const [draft, setDraft] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(() => {
+    const savedId = localStorage.getItem("gravityclaw:active-conversation-id");
+    return savedId ? !conversationDetailCache.has(savedId) : false;
+  });
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<Array<{ file: File; id?: string; state: "uploading" | "ready" | "failed" }>>([]);
@@ -666,8 +1023,6 @@ function ConversationWorkspace({
   const [deleteConfirmConv, setDeleteConfirmConv] = useState<Conversation | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [activeItemMenuId, setActiveItemMenuId] = useState<string | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -675,6 +1030,14 @@ function ConversationWorkspace({
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      const scrollH = textareaRef.current.scrollHeight;
+      textareaRef.current.style.height = `${Math.min(Math.max(scrollH, 32), 240)}px`;
+    }
+  }, [draft]);
 
   const handleExecuteSlashCommand = (cmd: SlashCommand) => {
     if (cmd.actionType === "insert" && cmd.insertText) {
@@ -714,6 +1077,7 @@ function ConversationWorkspace({
       const all = await getArchivedConversations();
       const active = all.filter((c) => !c.archived_at);
       const archived = all.filter((c) => !!c.archived_at);
+      cachedConversationsList = active;
       setConversations(active);
       setArchivedList(archived);
       window.dispatchEvent(new CustomEvent("gravityclaw:conversations-updated", { detail: active }));
@@ -725,54 +1089,25 @@ function ConversationWorkspace({
   };
 
   useEffect(() => {
-    const handleNewChatEvent = () => {
-      void newConversation();
-    };
-    const handleSelectChat = (e: any) => {
-      if (e.detail?.id) {
-        setSelectedId(e.detail.id);
-      }
-    };
-    const handleSearchChats = () => {
-      setSearchOpen(true);
-    };
-    const handleRenameChat = (e: any) => {
-      if (e.detail) {
-        startRename(e.detail);
-      }
-    };
-    const handleArchiveChat = (e: any) => {
-      if (e.detail) {
-        void handleArchive(e.detail);
-      }
-    };
-    const handleDeleteChat = (e: any) => {
-      if (e.detail) {
-        setDeleteConfirmConv(e.detail);
-      }
-    };
-    window.addEventListener("gravityclaw:new-chat", handleNewChatEvent);
-    window.addEventListener("gravityclaw:select-chat" as any, handleSelectChat);
-    window.addEventListener("gravityclaw:search-chats" as any, handleSearchChats);
-    window.addEventListener("gravityclaw:rename-chat" as any, handleRenameChat);
-    window.addEventListener("gravityclaw:archive-chat" as any, handleArchiveChat);
-    window.addEventListener("gravityclaw:delete-chat" as any, handleDeleteChat);
-    return () => {
-      window.removeEventListener("gravityclaw:new-chat", handleNewChatEvent);
-      window.removeEventListener("gravityclaw:select-chat" as any, handleSelectChat);
-      window.removeEventListener("gravityclaw:search-chats" as any, handleSearchChats);
-      window.removeEventListener("gravityclaw:rename-chat" as any, handleRenameChat);
-      window.removeEventListener("gravityclaw:archive-chat" as any, handleArchiveChat);
-      window.removeEventListener("gravityclaw:delete-chat" as any, handleDeleteChat);
-    };
-  }, [conversations]);
-
-  useEffect(() => {
     let cancelled = false;
     void loadConversations().then((active) => {
       if (cancelled) return;
-      setSelectedId((current) => current ?? active[0]?.id ?? null);
-      setLoading(false);
+      const fromUrl = (() => {
+        try {
+          const parts = window.location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
+          if ((parts[0] === "conversations" || parts[0] === "chat") && parts[1]) return parts[1];
+        } catch {}
+        return null;
+      })();
+      const savedId = localStorage.getItem("gravityclaw:active-conversation-id");
+      const matched = (fromUrl && active.some((c) => c.id === fromUrl) ? fromUrl : null)
+        || (selectedId && active.some((c) => c.id === selectedId) ? selectedId : null)
+        || (selectedConvId && active.some((c) => c.id === selectedConvId) ? selectedConvId : null)
+        || (savedId && active.some((c) => c.id === savedId) ? savedId : null);
+      const targetId = matched ?? active[0]?.id ?? null;
+      if (targetId && targetId !== selectedId) {
+        setSelectedId(targetId);
+      }
     });
     return () => {
       cancelled = true;
@@ -783,15 +1118,21 @@ function ConversationWorkspace({
     if (!selectedId) {
       setDetail(null);
       setTimeline([]);
+      setLoading(false);
       return;
     }
     let cancelled = false;
-    setLoading(true);
-    setDetail(null);
-    setTimeline([]);
+    const cached = conversationDetailCache.get(selectedId);
+    if (cached) {
+      setDetail(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     void getConversation(selectedId)
       .then((value) => {
         if (!cancelled) {
+          conversationDetailCache.set(selectedId, value);
           setDetail(value);
           setLoading(false);
         }
@@ -869,7 +1210,6 @@ function ConversationWorkspace({
   // Close menus when clicking outside
   useEffect(() => {
     const handleGlobalClick = () => {
-      setActiveItemMenuId(null);
       setHeaderMenuOpen(false);
     };
     window.addEventListener("click", handleGlobalClick);
@@ -891,7 +1231,6 @@ function ConversationWorkspace({
       await loadConversations();
       const fresh = await getConversation(conversation.id);
       setDetail(fresh);
-      setDrawerOpen(false);
       showToast("✓ New chat created");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to create conversation");
@@ -944,12 +1283,19 @@ function ConversationWorkspace({
     if (!title) return;
     try {
       const updated = await updateConversation(conversationId, { title });
-      setConversations((items) => items.map((c) => (c.id === conversationId ? { ...c, title: updated.title } : c)));
+      const nextList = conversations.map((c) => (c.id === conversationId ? { ...c, title: updated.title } : c));
+      setConversations(nextList);
       if (detail && detail.conversation.id === conversationId) {
         setDetail({ ...detail, conversation: { ...detail.conversation, title: updated.title } });
       }
+      const cached = conversationDetailCache.get(conversationId);
+      if (cached) {
+        cached.conversation.title = updated.title;
+        conversationDetailCache.set(conversationId, { ...cached });
+      }
       setRenamingId(null);
       showToast("✓ Chat title updated");
+      window.dispatchEvent(new CustomEvent("gravityclaw:conversations-updated", { detail: nextList }));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to update title");
     }
@@ -959,7 +1305,6 @@ function ConversationWorkspace({
     if (e) e.stopPropagation();
     setRenamingId(conv.id);
     setRenameDraft(conv.title || "");
-    setActiveItemMenuId(null);
     setHeaderMenuOpen(false);
   }
 
@@ -967,7 +1312,6 @@ function ConversationWorkspace({
     if (e) e.stopPropagation();
     void navigator.clipboard.writeText(convId);
     showToast("✓ Copied Chat ID to clipboard");
-    setActiveItemMenuId(null);
     setHeaderMenuOpen(false);
   }
 
@@ -1112,101 +1456,15 @@ function ConversationWorkspace({
     scrollToBottom("auto");
   }, [selectedId]);
 
+  const knownConv = conversations.find((c) => c.id === selectedId);
   const activeTitle =
     detail?.conversation.title ||
+    knownConv?.title ||
     detail?.messages.find((item) => item.role === "user")?.content.slice(0, 34) ||
-    "New chat";
-
-  const grouped = useMemo(() => groupConversations(conversations), [conversations]);
-
-  function renderConversationItem(conv: Conversation) {
-    const isSelected = selectedId === conv.id;
-    const isEditing = renamingId === conv.id;
-    const menuOpen = activeItemMenuId === conv.id;
-
-    return (
-      <div key={conv.id} className={`conversation-item-wrap ${isSelected ? "selected" : ""}`}>
-        {isEditing ? (
-          <form onSubmit={(e) => void handleSaveRename(conv.id, e)} className="item-rename-form">
-            <input
-              type="text"
-              autoFocus
-              className="item-rename-input"
-              value={renameDraft}
-              onChange={(e) => setRenameDraft(e.target.value)}
-              onBlur={() => setRenamingId(null)}
-            />
-            <button type="submit" className="rename-submit-btn" title="Save">✓</button>
-            <button type="button" className="rename-cancel-btn" onClick={() => setRenamingId(null)} title="Cancel">✕</button>
-          </form>
-        ) : (
-          <div className="item-main-row">
-            <button
-              className={`conversation-item ${isSelected ? "selected" : ""}`}
-              onClick={() => {
-                setSelectedId(conv.id);
-                setDrawerOpen(false);
-              }}
-            >
-              <span className="conversation-item-copy">
-                <strong>{conv.title || "Untitled chat"}</strong>
-                <small>{formatTime(conv.updated_at || conv.created_at)}</small>
-              </span>
-              {state.activeRuns.some((item) => item.conversation_id === conv.id && item.status === "running") && (
-                <span className="status-dot blue pulsing" />
-              )}
-            </button>
-
-            {conv.kind !== "main" && (
-              <div className="item-action-cluster">
-                <button
-                  className="action-btn menu-trigger-btn"
-                  title="Chat options"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setActiveItemMenuId(menuOpen ? null : conv.id);
-                  }}
-                >
-                  •••
-                </button>
-
-                {menuOpen && (
-                  <div className="item-dropdown-menu" onClick={(e) => e.stopPropagation()}>
-                    <button onClick={(e) => startRename(conv, e)}>
-                      <span>✎</span> Rename
-                    </button>
-                    <button onClick={(e) => void handleArchive(conv.id, e)}>
-                      <span>📦</span> Archive
-                    </button>
-                    <button
-                      className="danger-item"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setActiveItemMenuId(null);
-                        setDeleteConfirmConv(conv);
-                      }}
-                    >
-                      <span>🗑</span> Delete permanently
-                    </button>
-                    <button onClick={(e) => copyChatId(conv.id, e)}>
-                      <span>📋</span> Copy ID
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  }
+    (selectedId ? (selectedId.startsWith("agent:") ? "Main Agent" : "Chat") : "New chat");
 
   return (
     <div className="conversation-workspace">
-      {drawerOpen && (
-        <div className="conversation-drawer-scrim" onClick={() => setDrawerOpen(false)} aria-hidden="true" />
-      )}
-
       {/* TOAST NOTIFICATION */}
       {toast && <div className="toast-notification fade-in">{toast}</div>}
 
@@ -1254,94 +1512,7 @@ function ConversationWorkspace({
         />
       )}
 
-      <aside className={`conversation-nav ${drawerOpen ? "drawer-open" : ""}`}>
-        <div className="conversation-nav-head">
-          <button className="new-chat-button" onClick={() => void newConversation()}>
-            <span className="plus-icon">＋</span>
-            <span>New chat</span>
-          </button>
-        </div>
-
-          <div className="conversation-list">
-            {loading && conversations.length === 0 && <div className="list-loading">Loading chats…</div>}
-
-            {/* PINNED MAIN CHAT */}
-            {grouped.main.map((conv) => (
-              <div key={conv.id} className="conversation-group pinned-group">
-                <button
-                  className={`conversation-item main-item ${selectedId === conv.id ? "selected" : ""}`}
-                  onClick={() => {
-                    setSelectedId(conv.id);
-                    setDrawerOpen(false);
-                  }}
-                >
-                  <span className="main-star">★</span>
-                  <span className="conversation-item-copy">
-                    <strong>Main</strong>
-                    <small>Default personal agent</small>
-                  </span>
-                  {state.activeRuns.some((item) => item.conversation_id === conv.id && item.status === "running") && (
-                    <span className="status-dot blue pulsing" />
-                  )}
-                </button>
-              </div>
-            ))}
-
-            {/* TODAY */}
-            {grouped.today.length > 0 && (
-              <div className="conversation-group">
-                <div className="group-label">Today</div>
-                {grouped.today.map((conv) => renderConversationItem(conv))}
-              </div>
-            )}
-
-            {/* YESTERDAY */}
-            {grouped.yesterday.length > 0 && (
-              <div className="conversation-group">
-                <div className="group-label">Yesterday</div>
-                {grouped.yesterday.map((conv) => renderConversationItem(conv))}
-              </div>
-            )}
-
-            {/* PREVIOUS 7 DAYS */}
-            {grouped.previous7Days.length > 0 && (
-              <div className="conversation-group">
-                <div className="group-label">Previous 7 Days</div>
-                {grouped.previous7Days.map((conv) => renderConversationItem(conv))}
-              </div>
-            )}
-
-            {/* OLDER */}
-            {grouped.older.length > 0 && (
-              <div className="conversation-group">
-                <div className="group-label">Older</div>
-                {grouped.older.map((conv) => renderConversationItem(conv))}
-              </div>
-            )}
-
-            {!loading && conversations.length === 0 && (
-              <EmptyState icon="◌" title="No chats" detail="Start one with the New chat button." />
-            )}
-          </div>
-
-          {/* SIDEBAR FOOTER */}
-          <div className="conversation-nav-footer">
-            <button className="search-chats-trigger" onClick={() => setSearchOpen(true)}>
-              <span className="search-icon">🔍</span>
-              <span>Search chats…</span>
-            </button>
-            <button
-              className="archived-chats-trigger"
-              onClick={() => setArchivedModalOpen(true)}
-              title="View archived chats"
-            >
-              <span className="archive-icon">📦</span>
-              <span>Archived ({archivedList.length})</span>
-            </button>
-          </div>
-        </aside>
-
-        {/* CHAT PANE */}
+      {/* CHAT PANE */}
       <section className="conversation-main" aria-busy={loading}>
         {/* COMPRESSED CONVERSATION HEADER */}
         <div className="conversation-header">
@@ -1353,11 +1524,10 @@ function ConversationWorkspace({
                 onClick={() => {
                   if (onOpenMobileNav) {
                     onOpenMobileNav();
-                  } else {
-                    setDrawerOpen(!drawerOpen);
                   }
                 }}
-                aria-label="Toggle navigation"
+                aria-label="Open sessions and navigation"
+                title="Sessions & navigation"
               >
                 ☰
               </button>
@@ -1373,29 +1543,36 @@ function ConversationWorkspace({
                       className="text-input rename-input"
                       value={renameDraft}
                       onChange={(e) => setRenameDraft(e.target.value)}
-                      onBlur={() => setRenamingId(null)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") setRenamingId(null);
+                      }}
                     />
-                    <button type="submit" className="rename-submit-btn">✓</button>
-                    <button type="button" className="rename-cancel-btn" onClick={() => setRenamingId(null)}>✕</button>
+                    <button type="submit" className="rename-submit-btn" title="Save title">✓</button>
+                    <button type="button" className="rename-cancel-btn" onClick={() => setRenamingId(null)} title="Cancel">✕</button>
                   </form>
                 ) : (
                   <div className="title-heading-row">
                     <h1
                       onClick={() => {
-                        if (detail && detail.conversation.kind !== "main") {
-                          startRename(detail.conversation);
-                        }
+                        if (detail) startRename(detail.conversation);
                       }}
-                      title={detail && detail.conversation.kind !== "main" ? "Click to rename" : undefined}
-                      className={detail && detail.conversation.kind !== "main" ? "editable-title" : ""}
+                      title="Click to rename"
+                      className="editable-title"
                     >
                       {activeTitle}
                     </h1>
-                    {latestRun && (latestRun.status === "running" || latestRun.status === "queued") && (
-                      <span className={`header-status-chip ${latestRun.status}`}>
-                        {latestRun.status === "running" ? "● Running" : "◌ Queued"}
-                      </span>
+                    {detail && (
+                      <button
+                        type="button"
+                        className="title-edit-trigger"
+                        onClick={() => startRename(detail.conversation)}
+                        title="Rename conversation"
+                        aria-label="Rename conversation"
+                      >
+                        ✎
+                      </button>
                     )}
+                    
                   </div>
                 )}
               </div>
@@ -1427,7 +1604,7 @@ function ConversationWorkspace({
                         <span>⚡</span> Full Trace
                       </button>
                     )}
-                    {detail && detail.conversation.kind !== "main" && (
+                    {detail && (
                       <>
                         <button onClick={(e) => startRename(detail.conversation, e)}>
                           <span>✎</span> Rename conversation
@@ -1455,50 +1632,43 @@ function ConversationWorkspace({
               </div>
             </div>
           </div>
-
-          {/* ROW 2: Model selector + Context status + Trace button */}
-          <div className="conversation-header-row header-secondary-row">
-            <div className="sub-row-left">
-              {detail && <ModelSelector conversationId={detail.conversation.id} />}
-            </div>
-            <div className="sub-row-right">
-              {detail && (
-                <ContextStatus
-                  conversationId={detail.conversation.id}
-                  refreshKey={`${run?.id ?? "none"}:${run?.status ?? "none"}:${state.activity.length}`}
-                />
-              )}
-              {run && (
-                <button
-                  className={`secondary-button trace-pill-btn ${latestRun?.status === "running" ? "is-running" : ""} ${inspectorOpen ? "is-active" : ""}`}
-                  onClick={() => setInspectorOpen(!inspectorOpen)}
-                  title="Open execution trace drawer"
-                >
-                  {((presentation?.completedActivities?.length || 0) + (presentation?.currentActivity ? 1 : 0)) > 0
-                    ? `${latestRun?.status === "running" ? "● " : ""}Trace · ${(presentation?.completedActivities?.length || 0) + (presentation?.currentActivity ? 1 : 0)}`
-                    : "Trace"}
-                </button>
-              )}
-            </div>
-          </div>
         </div>
 
         {error && <div className="inline-error workspace-error" role="alert">{error}</div>}
-        {loading && !detail && <div className="workspace-loading" role="status" aria-live="polite">Loading chat…</div>}
-        {!detail && !loading && <EmptyState icon="◌" title="Choose a conversation" detail="Select a chat from the sidebar or create a new one." />}
+
+        {/* State 1: No conversation selected */}
+        {!selectedId && !loading && conversations.length > 0 && (
+          <EmptyState icon="◌" title="Choose a conversation" detail="Select a chat from the sidebar or create a new one." />
+        )}
+
+        {/* State 2: Welcome empty state when no chats exist */}
+        {!selectedId && !loading && conversations.length === 0 && (
+          <EmptyState icon="✦" title="Welcome to GravityClaw" detail="Start a conversation with the New chat button." />
+        )}
+
+        {/* State 3: Skeleton Loader while existing conversation hydrates */}
+        {selectedId && loading && !detail && (
+          <div className="message-scroll">
+            <div className="message-list message-skeleton-list">
+              <div className="message-skeleton user-skeleton">
+                <div className="skeleton-line full" />
+                <div className="skeleton-line short" />
+              </div>
+              <div className="message-skeleton assistant-skeleton">
+                <div className="skeleton-line full" />
+                <div className="skeleton-line mid" />
+                <div className="skeleton-line short" />
+              </div>
+              <div className="message-skeleton assistant-skeleton">
+                <div className="skeleton-line full" />
+                <div className="skeleton-line mid" />
+              </div>
+            </div>
+          </div>
+        )}
 
         {detail && (
           <div className="message-scroll" ref={messageScrollRef} onScroll={handleScroll}>
-            {/* STICKY ACTIVE RUN BAR */}
-            {latestRun && (latestRun.status === "running" || latestRun.status === "queued") && (
-              <StickyActiveRunBar
-                run={latestRun}
-                title={presentation?.currentActivity?.title || latestRun.request.prompt?.slice(0, 36) || "Executing…"}
-                onCancel={(r) => void handleCancelRun(r)}
-                canceling={cancelingRunId === latestRun.id}
-              />
-            )}
-
             {detail.messages.length === 0 && !showLiveBlock && (
               <StarterPrompts onSelect={(prompt) => void send(prompt)} />
             )}
@@ -1575,6 +1745,11 @@ function ConversationWorkspace({
               ref={textareaRef}
               aria-label="Message GravityClaw"
               value={draft}
+              onInput={(event) => {
+                const target = event.currentTarget;
+                target.style.height = "auto";
+                target.style.height = `${Math.min(Math.max(target.scrollHeight, 32), 240)}px`;
+              }}
               onChange={(event) => {
                 const val = event.target.value;
                 setDraft(val);
@@ -1633,32 +1808,28 @@ function ConversationWorkspace({
                 }
               }}
             />
-            <div className="composer-bottom-bar">
-              <div className="composer-tools">
+            <div className="composer-bottom-bar compact-composer-bar">
+              <div className="composer-tools-left">
                 <label className="composer-tool-btn" aria-label="Attach file" title="Attach file or image">
                   <input type="file" multiple hidden onChange={(event) => void handleFileSelect(event.target.files)} />
                   <span>＋</span>
                 </label>
-                <button
-                  type="button"
-                  className="composer-tool-btn"
-                  onClick={() => {
-                    setDraft("/");
-                    setSlashMenuOpen(true);
-                    setSlashSelectedIndex(0);
-                    setTimeout(() => textareaRef.current?.focus(), 50);
-                  }}
-                  title="Slash commands (/)"
-                  aria-label="Slash commands"
-                >
-                  <span>/</span>
-                </button>
+                {detail && (
+                  <ModelSelector
+                    conversationId={detail.conversation.id}
+                    variant="compact"
+                    placement="up"
+                  />
+                )}
               </div>
 
               <div className="composer-actions-right">
-                <span className="composer-workspace-badge" title="Target workspace">
-                  gravityclaw
-                </span>
+                {detail && (
+                  <ContextStatus
+                    conversationId={detail.conversation.id}
+                    refreshKey={`${run?.id ?? "none"}:${run?.status ?? "none"}:${state.activity.length}`}
+                  />
+                )}
                 <button
                   type="button"
                   className={`composer-send-btn ${hasDraft ? "has-content" : ""} ${sending ? "is-sending" : isRunning || isQueued ? "is-queuing" : ""}`}
@@ -1670,7 +1841,7 @@ function ConversationWorkspace({
                   {sending ? (
                     <span className="composer-spinner" />
                   ) : (
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <line x1="12" y1="19" x2="12" y2="5" />
                       <polyline points="5 12 12 5 19 12" />
                     </svg>
@@ -1727,7 +1898,6 @@ function ConversationWorkspace({
           onSelect={(convId) => {
             setSelectedId(convId);
             setSearchOpen(false);
-            setDrawerOpen(false);
           }}
           onClose={() => setSearchOpen(false)}
         />
@@ -1943,21 +2113,71 @@ function SearchModal({ onSelect, onClose }: { onSelect: (convId: string) => void
 
 function MessageCard({ message }: { message: Message }) {
   const user = message.role === "user";
-  return (
-    <article className={`message-card ${user ? "user" : "assistant"}`}>
-      {!user && (
-        <div className="message-avatar agent-avatar">✦</div>
-      )}
-      <div className="message-content">
-        <div className="message-meta">
-          <strong>{user ? "You" : "GravityClaw"}</strong>
-          <span>· {formatTime(message.created_at)}</span>
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const selection = window.getSelection()?.toString();
+      const textToCopy = (selection && selection.trim().length > 0) ? selection : (message.content || "");
+      await navigator.clipboard.writeText(textToCopy);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      void navigator.clipboard.writeText(message.content || "");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  if (user) {
+    return (
+      <article className="message-group user-group">
+        <div className="user-meta-row">
+          <span className="msg-meta-label">You · {formatTime(message.created_at)}</span>
+          <button
+            type="button"
+            className={`msg-copy-icon-btn ${copied ? "copied" : ""}`}
+            onClick={handleCopy}
+            title="Copy message (or selection)"
+            aria-label="Copy message"
+          >
+            {copied ? "✓" : "⧉"}
+          </button>
         </div>
-        {user ? (
-          <p>{message.content}</p>
-        ) : (
-          <MarkdownMessage content={message.content} />
-        )}
+        <div className="user-bubble">
+          <p className="user-message-text">{message.content}</p>
+          {message.attachments && message.attachments.length > 0 && (
+            <div className="message-attachments">
+              {message.attachments.map((att) => (
+                <AttachmentPreview key={att.id} attachment={att} />
+              ))}
+            </div>
+          )}
+        </div>
+      </article>
+    );
+  }
+
+  return (
+    <article className="message-group assistant-group">
+      <div className="assistant-meta-row">
+        <div className="assistant-meta-left">
+          <span className="agent-meta-name">GravityClaw</span>
+          <span className="msg-meta-label">· {formatTime(message.created_at)}</span>
+        </div>
+        <button
+          type="button"
+          className={`msg-copy-icon-btn ${copied ? "copied" : ""}`}
+          onClick={handleCopy}
+          title="Copy response (or selection)"
+          aria-label="Copy response"
+        >
+          {copied ? "✓" : "⧉"}
+        </button>
+      </div>
+      <div className="assistant-body">
+        <MarkdownMessage content={message.content} />
         {message.attachments && message.attachments.length > 0 && (
           <div className="message-attachments">
             {message.attachments.map((att) => (
@@ -1967,40 +2187,6 @@ function MessageCard({ message }: { message: Message }) {
         )}
       </div>
     </article>
-  );
-}
-
-function StickyActiveRunBar({
-  run,
-  title,
-  onCancel,
-  canceling,
-}: {
-  run: RunRecord;
-  title: string;
-  onCancel: (run: RunRecord) => void;
-  canceling: boolean;
-}) {
-  const elapsedStr = useElapsedTime(run.created_at, run.status === "running" || run.status === "queued");
-
-  return (
-    <div className="sticky-active-run-bar">
-      <div className="sticky-active-left">
-        <span className={`pulsing-dot ${run.status === "running" ? "blue" : "amber"}`}>●</span>
-        <strong>{run.status === "running" ? "Running" : "Queued"}</strong>
-        <span className="sticky-task-name">· {title || "Executing…"}</span>
-        {elapsedStr && <span className="sticky-time">· {elapsedStr}</span>}
-      </div>
-      <button
-        type="button"
-        className="sticky-stop-btn"
-        onClick={() => onCancel(run)}
-        disabled={canceling}
-        title="Stop execution"
-      >
-        ■ Stop
-      </button>
-    </div>
   );
 }
 
@@ -2157,6 +2343,8 @@ function LiveRunBlock({
   canceling?: boolean;
 }) {
   const [showAllCompleted, setShowAllCompleted] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(true);
+  const [copiedTerminal, setCopiedTerminal] = useState(false);
   const elapsedStr = useElapsedTime(run.created_at, run.status === "running" || run.status === "queued");
 
   const currentActivity = presentation.currentActivity;
@@ -2164,6 +2352,20 @@ function LiveRunBlock({
   const taskSummary = presentation.currentTaskSummary;
   const isRunning = run.status === "running";
   const isQueued = run.status === "queued";
+  const progress = presentation.progress;
+
+  // Extract recent output lines from active activity or progress snapshot
+  const rawTail = progress?.recent_output_tail || [];
+  const activityOutput = currentActivity?.output ? currentActivity.output.trim().split("\n") : [];
+  const terminalLines = rawTail.length > 0 ? rawTail : activityOutput;
+
+  const handleCopyTerminal = async () => {
+    try {
+      await navigator.clipboard.writeText(terminalLines.join("\n"));
+      setCopiedTerminal(true);
+      setTimeout(() => setCopiedTerminal(false), 2000);
+    } catch {}
+  };
 
   return (
     <article className={`live-run-block ${run.status}`}>
@@ -2188,29 +2390,106 @@ function LiveRunBlock({
         )}
       </div>
 
-      {/* 2. Direct Task / Prompt Text (Unboxed, clean) */}
+      {/* 2. Direct Task Objective */}
       {taskSummary && (
         <div className="live-task-objective-text">
           {taskSummary}
         </div>
       )}
 
-      {/* 3. Activity Timeline */}
-      {(currentActivity || completedActivities.length > 0) && (
-        <div className="activity-timeline-section">
-          <div className="activity-timeline-header">ACTIVITY</div>
-
-          <div className="activity-timeline-list">
-            {/* Active event in progress */}
-            {currentActivity && (
-              <ActivityTimelineRow activity={currentActivity} active />
+      {/* 3. Current Active Telemetry Status */}
+      {currentActivity && (
+        <div className="live-current-activity-box">
+          <div className="current-activity-eyebrow">CURRENT ACTIVITY</div>
+          <div className="current-activity-title-row">
+            <strong className="current-activity-name">{currentActivity.title}</strong>
+            <span className="current-activity-tag">{currentActivity.tool} · active</span>
+          </div>
+          {currentActivity.command && (
+            <div className="current-activity-cmd">
+              <span className="prompt-symbol">$</span>
+              <code>{currentActivity.command}</code>
+            </div>
+          )}
+          <div className="current-activity-telemetry-meta">
+            <span className="telemetry-item">Process: <strong>alive</strong></span>
+            {currentActivity.durationSeconds && (
+              <span className="telemetry-item">· Elapsed: <strong>{currentActivity.durationSeconds.toFixed(1)}s</strong></span>
             )}
+          </div>
+        </div>
+      )}
 
-            {/* Completed events */}
+      {/* 4. Live Terminal Preview (Streamed real-time output) */}
+      {terminalLines.length > 0 && (
+        <div className="live-terminal-preview-box">
+          <div className="terminal-header">
+            <div className="terminal-header-left">
+              <span className="terminal-dot green">●</span>
+              <span className="terminal-title">Live Terminal Output</span>
+              <span className="terminal-lines-count">({terminalLines.length} lines)</span>
+            </div>
+            <div className="terminal-header-actions">
+              <button
+                type="button"
+                className={`terminal-action-btn ${copiedTerminal ? "copied" : ""}`}
+                onClick={handleCopyTerminal}
+                title="Copy terminal output"
+              >
+                {copiedTerminal ? "✓ Copied" : "Copy"}
+              </button>
+              <button
+                type="button"
+                className="terminal-action-btn"
+                onClick={() => setTerminalOpen(!terminalOpen)}
+              >
+                {terminalOpen ? "Hide" : "Show"}
+              </button>
+            </div>
+          </div>
+          {terminalOpen && (
+            <pre className="terminal-output-body">
+              <code>{terminalLines.join("\n")}</code>
+            </pre>
+          )}
+        </div>
+      )}
+
+      {/* 5. Semantic Progress Steps (if present) */}
+      {progress && progress.completed_steps && progress.completed_steps.length > 0 && (
+        <div className="semantic-progress-section">
+          <div className="progress-section-eyebrow">PROGRESS</div>
+          <div className="progress-steps-list">
+            {progress.completed_steps.map((step) => (
+              <div key={step.key} className="progress-step-row completed">
+                <span className="step-icon">✓</span>
+                <span className="step-label">{step.label}</span>
+              </div>
+            ))}
+            {progress.active_step && (
+              <div className="progress-step-row active">
+                <span className="step-icon">●</span>
+                <span className="step-label">{progress.active_step.label}</span>
+              </div>
+            )}
+            {progress.pending_steps && progress.pending_steps.map((step) => (
+              <div key={step.key} className="progress-step-row pending">
+                <span className="step-icon">○</span>
+                <span className="step-label">{step.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 6. Activity Timeline */}
+      {(completedActivities.length > 0 || (currentActivity && !terminalLines.length)) && (
+        <div className="activity-timeline-section">
+          <div className="activity-timeline-header">ACTIVITY HISTORY</div>
+          <div className="activity-timeline-list">
             {(showAllCompleted ? completedActivities : completedActivities.slice(-3)).map((activity) => (
               <ActivityTimelineRow key={activity.id} activity={activity} />
             ))}
-
             {!showAllCompleted && completedActivities.length > 3 && (
               <button
                 type="button"
@@ -2224,7 +2503,7 @@ function LiveRunBlock({
         </div>
       )}
 
-      {/* 4. Subagents */}
+      {/* 7. Subagents */}
       {presentation.subagents.length > 0 && (
         <div className="live-subagents-section">
           {presentation.subagents.map((agent, i) => (
@@ -2233,14 +2512,14 @@ function LiveRunBlock({
         </div>
       )}
 
-      {/* 5. Streaming Assistant Text */}
+      {/* 8. Streaming Assistant Text */}
       {presentation.assistantText && (
         <div className="streaming-response-box">
           <MarkdownMessage content={presentation.assistantText} streaming={isRunning} />
         </div>
       )}
 
-      {/* 6. Error Banner */}
+      {/* 9. Error Banner */}
       {run.status === "failed" && run.error && (
         <div className="run-error-banner">
           ✕ {run.error}

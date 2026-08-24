@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { THEMES, FONTS, DENSITIES, useAppearance } from "./theme";
+import { THEMES, FONTS, FONT_SIZES, DENSITIES, useAppearance } from "./theme";
 import type { ControlState } from "./types";
 
 export function SettingsPage({ state }: { state: ControlState }) {
@@ -9,10 +9,13 @@ export function SettingsPage({ state }: { state: ControlState }) {
     setTheme,
     font,
     setFont,
+    fontSize,
+    setFontSize,
     density,
     setDensity,
     currentThemeConfig,
     currentFontConfig,
+    currentFontSizeConfig,
     currentDensityConfig,
   } = useAppearance();
 
@@ -73,19 +76,9 @@ export function SettingsPage({ state }: { state: ControlState }) {
                     key={item.id}
                     className={`theme-card ${isSelected ? "selected" : ""}`}
                     onClick={() => setTheme(item.id)}
-                    style={{
-                      // @ts-expect-error custom CSS variable for preview swatch
-                      "--preview-bg": item.bg,
-                      "--preview-surface": item.surface,
-                      "--preview-accent": item.accent,
-                    }}
                   >
-                    <div className="theme-swatch-box">
-                      <div className="swatch-bg" style={{ background: item.bg }}>
-                        <div className="swatch-surface" style={{ background: item.surface }}>
-                          <span className="swatch-accent-dot" style={{ background: item.accent }} />
-                        </div>
-                      </div>
+                    <div className="theme-card-left">
+                      <span className="theme-accent-pip" style={{ background: item.accent }} />
                     </div>
                     <div className="theme-card-info">
                       <div className="theme-card-head">
@@ -130,6 +123,40 @@ export function SettingsPage({ state }: { state: ControlState }) {
                     <div className="font-sample-box">
                       <span>{item.sample}</span>
                     </div>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+                    {/* FONT SIZE SCALING */}
+          <section className="panel settings-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Font Size Scaling</h2>
+                <small className="muted-text">Adjust text scaling across chat messages, headers, and UI elements.</small>
+              </div>
+              <span className="count-pill">{currentFontSizeConfig.name} ({currentFontSizeConfig.label})</span>
+            </div>
+
+            <div className="font-size-grid">
+              {FONT_SIZES.map((item) => {
+                const isSelected = fontSize === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    className={`font-size-card ${isSelected ? "selected" : ""}`}
+                    onClick={() => setFontSize(item.id)}
+                  >
+                    <div className="font-size-card-head">
+                      <span className="font-size-glyph">Aa</span>
+                      <div className="font-size-card-titles">
+                        <strong>{item.name}</strong>
+                        <span className="font-size-badge">{item.label}</span>
+                      </div>
+                      {isSelected && <span className="selected-check">✓</span>}
+                    </div>
+                    <small className="font-size-desc">{item.description}</small>
                   </button>
                 );
               })}

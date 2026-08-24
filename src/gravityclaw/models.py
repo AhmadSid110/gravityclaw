@@ -84,6 +84,54 @@ _MODEL_LABELS: dict[str, str] = {
     "gpt-oss-120b": "GPT-OSS 120B",
 }
 
+MODEL_CONTEXT_LIMITS: dict[str, int] = {
+    # Gemini models (1M token standard context window)
+    "gemini-3.7-flash": 1_000_000,
+    "gemini-3.6-flash": 1_000_000,
+    "gemini-3.5-flash": 1_000_000,
+    "gemini-3.1-pro": 1_000_000,
+    "gemini-2.5-flash": 1_000_000,
+    "gemini-2.5-pro": 1_000_000,
+    "gemini-2.0-flash": 1_000_000,
+    "gemini-1.5-pro": 2_000_000,
+    "gemini-1.5-flash": 1_000_000,
+
+    # Claude models (200k token context window)
+    "claude-sonnet-4-6": 200_000,
+    "claude-opus-4-6-thinking": 200_000,
+    "claude-3-7-sonnet": 200_000,
+    "claude-3-5-sonnet": 200_000,
+    "claude-3-5-haiku": 200_000,
+    "claude-3-opus": 200_000,
+
+    # GPT / OpenAI models (128k / 256k token context window)
+    "gpt-5.6-luna": 256_000,
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-oss-120b": 128_000,
+    "o1": 200_000,
+    "o3-mini": 200_000,
+}
+
+
+def get_model_context_limit(model_id: str | None) -> int:
+    """Return the context limit in tokens for a given model ID. Default 1M for Gemini."""
+    if not model_id:
+        return 1_000_000
+    norm = model_id.lower().strip()
+    if norm in MODEL_CONTEXT_LIMITS:
+        return MODEL_CONTEXT_LIMITS[norm]
+    if "gemini" in norm:
+        return 1_000_000
+    if "claude" in norm or "sonnet" in norm or "opus" in norm or "haiku" in norm:
+        return 200_000
+    if "gpt-5" in norm or "gpt-4.5" in norm:
+        return 256_000
+    if "gpt" in norm or "o1" in norm or "o3" in norm:
+        return 128_000
+    return 1_000_000
+
 
 def _model_label(model_id: str) -> str:
     """Return a human-friendly label for a model ID."""

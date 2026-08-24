@@ -2,17 +2,14 @@ import { useEffect, useState } from "react";
 import { getContextStatus } from "./api";
 import type { ContextStatus } from "./types";
 
-function tokens(value: number): string {
+function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1000) {
     const k = value / 1000;
-    return k === Math.floor(k) ? `${k}k` : `${k.toFixed(1)}k`;
+    return k === Math.floor(k) ? `${k}K` : `${k.toFixed(1)}K`;
   }
   return String(value);
 }
-
-
-
 
 function percent(value: number): number { return Math.max(0, Math.min(100, value)); }
 
@@ -57,77 +54,95 @@ export function ContextStatus({ conversationId, refreshKey }: { conversationId: 
   </>;
 }
 
-
-
 function ContextDialog({ status, onClose }: { status: ContextStatus; onClose: () => void }) {
   const value = percent(status.percent);
   const isCurrentlyRunning = status.state === "current";
-  const currentRunUsed = isCurrentlyRunning ? status.used_tokens : 0;
-  const currentRunBudget = status.budget_tokens || 128000;
-  
-  // Previous run is recent[1] if currently executing, otherwise recent[0]
-  const prevRun = isCurrentlyRunning ? status.recent[1] : status.recent[0];
+  const currentRunUsed = isCurrentlyRunning ? status.used_tokens : status.used_tokens;
+  const currentRunBudget = status.budget_tokens || 1000000;
   
   const conversationTotal = status.conversation_total_tokens ?? (status.breakdown.conversation ?? 0);
   const systemHarness = (status.breakdown.identity ?? 0) + (status.breakdown.operational ?? 0);
   const memory = status.breakdown.memory ?? 0;
   const toolResults = status.breakdown.artifacts ?? 0;
-  const messages = status.breakdown.conversation ?? conversationTotal;
-  const compactions = status.compactions_count ?? (status.messages_compacted > 0 ? 1 : 0);
+  const reserved = Math.max(0, currentRunBudget - currentRunUsed);
 
   return (
     <div className="context-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="context-modal" role="dialog" aria-modal="true" aria-labelledby="context-dialog-title">
         {/* Header */}
         <header className="context-modal-head">
-          <div>
-            <div className="eyebrow">CONTEXT BUDGET</div>
-            <h2 id="context-dialog-title">{getCircleGlyph(value)} {value.toFixed(0)}%</h2>
-            <span className="mono">{tokens(status.used_tokens)} / {tokens(status.budget_tokens)} tokens</span>
+          <div className="context-head-main">
+            <div className="eyebrow">CONTEXT UTILIZATION</div>
+            <div className="context-head-hero">
+              <span className="context-glyph-big">{getCircleGlyph(value)}</span>
+              <h2>{value.toFixed(0)}% Used</h2>
+            </div>
+            <span className="context-tokens-counter">{formatTokens(status.used_tokens)} / {formatTokens(status.budget_tokens)} tokens</span>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close context details">&times;</button>
         </header>
 
         {/* Breakdown List */}
         <div className="context-modal-section">
-          <div className="section-label">CONTEXT</div>
-          <div className="context-breakdown-row">
+          <div className="section-label">ACTIVE BUDGET BREAKDOWN</div>
+          <div className="context-breakdown-row highlight">
             <span>Current run</span>
-            <strong>{tokens(currentRunUsed)} / {tokens(currentRunBudget)}</strong>
+            <strong>{formatTokens(currentRunUsed)} / {formatTokens(currentRunBudget)}</strong>
           </div>
           <div className="context-breakdown-row">
-            <span>Previous run</span>
-            <strong>{prevRun ? `${tokens(prevRun.used_tokens)} / ${tokens(prevRun.budget_tokens)}` : "—"}</strong>
+            <span>Used capacity</span>
+            <strong>{value.toFixed(1)}%</strong>
           </div>
           <div className="context-breakdown-row">
-            <span>Conversation total</span>
-            <strong>{tokens(conversationTotal)} tokens</strong>
+            <span>System / Harness</span>
+            <strong>{formatTokens(systemHarness)}</strong>
           </div>
           <div className="context-breakdown-row">
-            <span>System / harness</span>
-            <strong>{tokens(systemHarness)}</strong>
+            <span>Conversation</span>
+            <strong>{formatTokens(conversationTotal)}</strong>
           </div>
           <div className="context-breakdown-row">
-            <span>Memory</span>
-            <strong>{tokens(memory)}</strong>
+            <span>Memory (curated + indexed)</span>
+            <strong>{formatTokens(memory)}</strong>
           </div>
           <div className="context-breakdown-row">
-            <span>Tool results</span>
-            <strong>{tokens(toolResults)}</strong>
+            <span>Tools & Artifacts</span>
+            <strong>{formatTokens(toolResults)}</strong>
           </div>
           <div className="context-breakdown-row">
-            <span>Messages</span>
-            <strong>{tokens(messages)}</strong>
-          </div>
-          <div className="context-breakdown-row">
-            <span>Compactions</span>
-            <strong>{compactions}</strong>
+            <span>Reserved headroom</span>
+            <strong>{formatTokens(reserved)}</strong>
           </div>
         </div>
 
-        {/* Footer */}
+        {/* Compaction Status */}
+        <div className="context-modal-section">
+          <div className="section-label">COMPACTION & THRESHOLDS</div>
+          <div className="context-breakdown-row">
+            <span>Last compaction</span>
+            <strong>{status.messages_compacted > 0 ? "Active" : "None yet"}</strong>
+          </div>
+          <div className="context-breakdown-row">
+            <span>Messages compacted</span>
+            <strong>{status.messages_compacted} messages</strong>
+          </div>
+          <div className="context-breakdown-row">
+            <span>Compaction threshold</span>
+            <strong>80% of budget</strong>
+          </div>
+        </div>
+
+        {/* Footer Link */}
         <footer className="context-modal-foot">
-          Context is immutable per run. Model and state changes apply on next execution.
+          <button
+            className="context-details-link-btn"
+            onClick={() => {
+              onClose();
+              window.location.hash = "#context";
+            }}
+          >
+            View context details & manifest →
+          </button>
         </footer>
       </section>
     </div>

@@ -120,6 +120,58 @@ export interface ToolActivity {
   output?: string;
 }
 
+
+export interface ProgressStep {
+  key: string;
+  label: string;
+  state: "pending" | "active" | "completed" | "failed";
+  started_at?: string | null;
+  completed_at?: string | null;
+  detail?: string | null;
+}
+
+export interface ProgressCounters {
+  tool_calls: number;
+  commands: number;
+  files_read: number;
+  files_modified: number;
+  output_lines: number;
+  output_bytes: number;
+}
+
+export interface ProgressSnapshot {
+  run_id: string;
+  status: RunStatus;
+  current_label?: string | null;
+  current_detail?: string | null;
+  active_operation_id?: string | null;
+  active_operation_kind?: string | null;
+  started_at: string;
+  last_activity_at: string;
+  last_output_at?: string | null;
+  last_progress_at?: string | null;
+  completed_steps: ProgressStep[];
+  active_step?: ProgressStep | null;
+  pending_steps: ProgressStep[];
+  recent_output_tail: string[];
+  counters: ProgressCounters;
+  version: number;
+}
+
+export interface TelemetryEvent {
+  id?: number;
+  event_id: string;
+  run_id: string;
+  type: string;
+  timestamp: string;
+  source: string;
+  operation_id?: string | null;
+  parent_operation_id?: string | null;
+  sequence: number;
+  tool?: string | null;
+  data: Record<string, any>;
+}
+
 export interface PresentationState {
   runId: string;
   status: RunStatus;
@@ -130,6 +182,7 @@ export interface PresentationState {
   completedActivities: NormalizedActivity[];
   subagents: string[];
   currentTaskSummary?: string;
+  progress?: ProgressSnapshot | null;
 }
 
 export interface Artifact {
@@ -166,6 +219,12 @@ export interface RunInspection {
   artifacts: Artifact[];
   context: Record<string, unknown> | null;
   capabilities: Record<string, unknown> | null;
+}
+
+export interface WorkspaceRecord {
+  id: string;
+  name: string;
+  path: string;
 }
 
 export interface PersistedEvent {
@@ -228,6 +287,42 @@ export interface JournalRecord {
   characters?: number;
   sha256: string;
   updated_at?: string;
+}
+
+export interface MemoryRevision {
+  id: string;
+  memory_id: string;
+  revision: number;
+  previous_content: string;
+  new_content: string;
+  superseded_at: string;
+  source_run_id: string | null;
+  source_conversation_id: string | null;
+  reason: string;
+}
+
+export interface CuratorStatus {
+  mode: "manual" | "assisted" | "automatic";
+  enabled: boolean;
+  status: string;
+  stats: {
+    curated_memories: number;
+    episodic_memories: number;
+    total_revisions: number;
+    pending_candidates: number;
+    daily_journals: number;
+  };
+}
+
+export interface ConsolidationReport {
+  started_at: string;
+  completed_at: string;
+  journals_scanned: number;
+  entries_analyzed: number;
+  candidates_discovered: number;
+  memories_promoted: number;
+  memories_superseded: number;
+  summary: string;
 }
 
 export interface ContextManifest {
@@ -474,11 +569,21 @@ export interface CapabilityState {
 
 export interface LearningOverview {
   enabled: boolean;
+  mode?: "suggest" | "automatic" | "off";
   trust_mode: string;
+  learning_engine_status?: "active" | "idle" | "healthy";
+  skill_registry_status?: string;
+  memory_index_status?: string;
+  last_scan_at?: string | null;
   stats: {
     memories: number;
+    curated_memories?: number;
+    episodic_memories?: number;
+    memory_candidates?: number;
     skills: number;
     pending_proposals: number;
+    daily_journals?: number;
+    total_messages?: number;
     success_rate: number | null;
     corrections: number;
   };
@@ -489,6 +594,20 @@ export interface LearningOverview {
     last_run_at: string | null;
     last_report: Record<string, unknown> | null;
   };
+}
+
+export interface MemoryCandidate {
+  id: string;
+  key: string;
+  namespace: "agent" | "user";
+  category: "project decision" | "user preference" | "architecture rule" | "operational fact";
+  content: string;
+  confidence: number;
+  source_run_id: string | null;
+  source_conversation_id: string | null;
+  status: "pending_approval" | "applied" | "rejected";
+  reviewer_model: string;
+  created_at: string;
 }
 
 export interface LearningEvent {
@@ -762,4 +881,124 @@ export interface ContextSnapshot {
   run_status: RunStatus;
   is_final: boolean;
   is_estimated: boolean;
+}
+
+// ─── TaskFlow & Kanban Types ──────────────────────────────────────────
+
+export type TaskFlowView = "board" | "timeline" | "dependencies" | "activity";
+export type InspectorTab = "overview" | "activity" | "runs" | "comments" | "artifacts";
+export type DensityMode = "comfortable" | "compact";
+
+export type TaskFlowStatus =
+  | "QUEUED"
+  | "RUNNING"
+  | "WAITING"
+  | "BLOCKED"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CANCELLED";
+
+export type FlowTaskStatus =
+  | "TRIAGE"
+  | "TODO"
+  | "READY"
+  | "RUNNING"
+  | "BLOCKED"
+  | "DONE"
+  | "FAILED"
+  | "CANCELLED"
+  | "ARCHIVED";
+
+export type TaskPriority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
+
+export type BlockReason =
+  | "dependency"
+  | "needs_user_input"
+  | "missing_capability"
+  | "transient_failure"
+  | "external_service"
+  | "review_required";
+
+export interface TaskFlowStats {
+  total_tasks: number;
+  done_tasks: number;
+  running_tasks: number;
+  ready_tasks: number;
+  todo_tasks: number;
+  triage_tasks: number;
+  blocked_tasks: number;
+  failed_tasks: number;
+}
+
+export interface TaskFlow {
+  id: string;
+  title: string;
+  objective: string;
+  status: TaskFlowStatus;
+  workspace_id: string;
+  context_profile: string;
+  state_json: Record<string, any>;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  stats?: TaskFlowStats;
+}
+
+export interface TaskAttempt {
+  id: string;
+  task_id: string;
+  run_id: string;
+  attempt_no: number;
+  started_at: string;
+  finished_at: string | null;
+  outcome: string | null;
+  summary: string | null;
+}
+
+export interface TaskComment {
+  id: string;
+  task_id: string;
+  author_type: "user" | "agent" | "system";
+  author_id: string;
+  body: string;
+  created_at: string;
+}
+
+export interface TaskClaim {
+  task_id: string;
+  owner: string;
+  lease_until: string;
+  heartbeat_at: string;
+  heartbeat_message: string | null;
+}
+
+export interface FlowTask {
+  id: string;
+  flow_id: string;
+  title: string;
+  body: string;
+  acceptance_criteria: Array<string | { text?: string; criterion?: string }>;
+  status: FlowTaskStatus;
+  assignee_profile: string;
+  priority: TaskPriority;
+  workspace_id: string;
+  idempotency_key: string | null;
+  max_attempts: number;
+  block_reason: BlockReason | null;
+  block_detail: string | null;
+  block_recurrence_count: number;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  parent_ids: string[];
+  child_ids: string[];
+  attempt_count?: number;
+  latest_attempt?: TaskAttempt | null;
+  comment_count?: number;
+  claim?: TaskClaim | null;
+}
+
+export interface TaskHandoffItem {
+  parent_task: FlowTask;
+  comments: TaskComment[];
 }

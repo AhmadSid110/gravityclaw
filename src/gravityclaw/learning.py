@@ -508,16 +508,71 @@ class LearningEngine:
             )
             if proc.returncode != 0:
                 LOGGER.warning(
-                    "reviewer subprocess failed (exit %d): %s",
+                    "reviewer subprocess failed (exit %d): %s, using heuristic extraction",
                     proc.returncode, proc.stderr[:500],
                 )
-                return None
+                return self._heuristic_extract(context)
 
             raw = json.loads(proc.stdout)
-            return self._parse_reviewer_response(raw)
+            parsed = self._parse_reviewer_response(raw)
+            if parsed and parsed.worth_learning:
+                return parsed
+            return self._heuristic_extract(context)
         except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
-            LOGGER.warning("reviewer call failed: %s", exc)
-            return None
+            LOGGER.warning("reviewer call failed: %s, using heuristic extraction", exc)
+            return self._heuristic_extract(context)
+
+    def _heuristic_extract(self, context: dict[str, Any]) -> LearningResult:
+        """Deterministic heuristic extraction when LLM reviewer is offline or returns nothing."""
+        import re
+        user_prompt = context.get("user_prompt", "")
+        signals = context.get("signals", [])
+        lower_prompt = user_prompt.lower()
+
+        memory_ops: list[MemoryOperation] = []
+        skill_candidates: list[SkillCandidate] = []
+
+        # 1. Directives and preferences
+        # e.g., "Always use rootless Podman for GravityClaw workers"
+        for prefix in ("always use", "never use", "i prefer", "default to", "remember that", "remember:", "note that", "we must use", "always run"):
+            if prefix in lower_prompt:
+                sentences = [s.strip() for s in re.split(r"[\n\.\;]", user_prompt) if prefix in s.lower()]
+                for sentence in sentences:
+                    if len(sentence) < 8:
+                        continue
+                    key = re.sub(r"[^a-zA-Z0-9]+", "-", sentence.lower())[:32].strip("-")
+                    is_agent_scope = any(w in sentence.lower() for w in ("gravityclaw", "worker", "podman", "docker", "test", "build", "release", "we "))
+                    memory_ops.append(MemoryOperation(
+                        namespace="agent" if is_agent_scope else "user",
+                        operation="upsert",
+                        key=key or "directive",
+                        content=sentence,
+                        confidence=0.95,
+                        reason=f"Explicit directive detected in turn ({prefix})",
+                    ))
+
+        # 2. Explicit /learn commands or procedure learning
+        if "/learn" in lower_prompt or "learn this" in lower_prompt or "remember this procedure" in lower_prompt:
+            clean_name = re.sub(r"[^a-zA-Z0-9]+", "-", lower_prompt.replace("/learn", "").replace("learn this", "").strip())[:32].strip("-")
+            skill_name = clean_name or "learned-procedure"
+            skill_candidates.append(SkillCandidate(
+                operation="create",
+                name=skill_name,
+                description=f"Learned procedure: {user_prompt[:120]}",
+                content=f"# {skill_name}\n\n## Description\n{user_prompt}\n\n## Instructions\n1. Follow standard workflow verified from run evidence.\n",
+                reason="Explicit /learn command invoked by user",
+                confidence=0.9,
+            ))
+
+        if memory_ops or skill_candidates:
+            return LearningResult(
+                worth_learning=True,
+                memory_operations=tuple(memory_ops),
+                skill_candidates=tuple(skill_candidates),
+                summary=f"Extracted {len(memory_ops)} memory facts and {len(skill_candidates)} skill proposals",
+                reviewer_model="deterministic-heuristic",
+            )
+        return LearningResult(worth_learning=False, reviewer_model="deterministic-heuristic")
 
     def _parse_reviewer_response(self, raw: dict[str, Any]) -> LearningResult | None:
         """Parse structured JSON from the reviewer into typed objects."""

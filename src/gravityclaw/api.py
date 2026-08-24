@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -53,6 +53,7 @@ from .telegram import TelegramAdapter
 from .learning_config import LearningConfig
 from .learn_service import LearnChannel, LearnOptions, LearnRequest, LearnResponse, LearnService, parse_learn_command
 from .curator_job import CuratorJob, CURATOR_SCHEDULE_PROMPT, ensure_curator_schedule
+from .curator import MemoryCurator, MemoryCurationMode, MemoryCandidateCategory
 from .skills import (
     Curator,
     CuratorConfig,
@@ -60,6 +61,23 @@ from .skills import (
     SkillService,
     TrustMode,
     TrustPolicy,
+)
+from .taskflow import (
+    TaskFlowDispatcher,
+    TaskFlowService,
+    TaskResultContract,
+    detect_dag_cycle,
+)
+from .store import (
+    BLOCK_REASONS,
+    FLOW_STATUSES,
+    TASK_PRIORITIES,
+    TASK_STATUSES,
+    FlowTaskRecord,
+    TaskAttemptRecord,
+    TaskClaimRecord,
+    TaskCommentRecord,
+    TaskFlowRecord,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -142,6 +160,25 @@ class Settings:
         control_token = _read_config_secret(control_file, required=False)
         telegram_token = _read_config_secret(telegram_file, required=bool(telegram.get("enabled")))
         policy = execution.get("policy", {}) if isinstance(execution, dict) else {}
+        # Fallback auto-discovery of telegram secret if present in home / secrets
+        telegram_token = _telegram_token_from_environment() or telegram_token
+        if not telegram_token and home:
+            for candidate_name in ("telegram-token", "telegram-bot-token", "telegram_token"):
+                cand = home / "secrets" / candidate_name
+                if cand.is_file():
+                    try:
+                        telegram_token = read_secret_file(cand)
+                        break
+                    except Exception:
+                        pass
+
+        telegram_user_id = os.environ.get("GRAVITYCLAW_TELEGRAM_USER_ID") or telegram.get("allowed_user_id") or None
+        telegram_default_workspace = os.environ.get(
+            "GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE", telegram.get("default_workspace") or None
+        )
+        telegram_api_root = os.environ.get(
+            "GRAVITYCLAW_TELEGRAM_API_ROOT", "https://api.telegram.org"
+        )
         return cls(
             home=home,
             identity_home=identity_home,
@@ -158,14 +195,10 @@ class Settings:
             agy_models=tuple(_model_list_from_environment(execution.get("models", []))),
             agy_default_model=os.environ.get("GRAVITYCLAW_AGY_DEFAULT_MODEL") or execution.get("default_model"),
             poll_interval=float(os.environ.get("GRAVITYCLAW_POLL_INTERVAL", "0.2")),
-            telegram_token=_telegram_token_from_environment() or telegram_token,
-            telegram_user_id=os.environ.get("GRAVITYCLAW_TELEGRAM_USER_ID") or telegram.get("allowed_user_id") or None,
-            telegram_default_workspace=os.environ.get(
-                "GRAVITYCLAW_TELEGRAM_DEFAULT_WORKSPACE", telegram.get("default_workspace") or None
-            ),
-            telegram_api_root=os.environ.get(
-                "GRAVITYCLAW_TELEGRAM_API_ROOT", "https://api.telegram.org"
-            ),
+            telegram_token=telegram_token,
+            telegram_user_id=telegram_user_id,
+            telegram_default_workspace=telegram_default_workspace,
+            telegram_api_root=telegram_api_root,
             scheduler_poll_interval=float(
                 os.environ.get("GRAVITYCLAW_SCHEDULER_POLL_INTERVAL", str(scheduler.get("poll_interval", 1.0)))
             ),
@@ -356,6 +389,96 @@ class LearningSettingsUpdate(BaseModel):
     notifications_mode: str | None = Field(default=None, pattern="^(silent|normal|verbose)$")
 
 
+class LearnBody(BaseModel):
+    source: str = Field(min_length=1, max_length=100_000)
+    skill_name: str | None = None
+    force_new: bool = False
+    trust_override: str | None = None
+    conversation_id: str | None = None
+    run_id: str | None = None
+
+
+class CuratorSettingsUpdate(BaseModel):
+    mode: str = Field(pattern="^(manual|assisted|automatic)$")
+
+
+class ExplicitRememberRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=50_000)
+    category: str = "user_preference"
+    conversation_id: str | None = None
+    run_id: str | None = None
+
+
+class TaskFlowCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    objective: str = Field(min_length=1, max_length=5000)
+    workspace_id: str
+    context_profile: str = "TASKFLOW_WORKER"
+    state_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskFlowUpdate(BaseModel):
+    title: str | None = None
+    objective: str | None = None
+    status: str | None = None
+    context_profile: str | None = None
+    state_json: dict[str, Any] | None = None
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class FlowTaskCreate(BaseModel):
+    flow_id: str
+    title: str = Field(min_length=1, max_length=300)
+    body: str = ""
+    workspace_id: str
+    acceptance_criteria: list[Any] = Field(default_factory=list)
+    priority: str = "MEDIUM"
+    assignee_profile: str = "default"
+    idempotency_key: str | None = None
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    parent_ids: list[str] = Field(default_factory=list)
+
+
+class FlowTaskUpdate(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    acceptance_criteria: list[Any] | None = None
+    status: str | None = None
+    priority: str | None = None
+    assignee_profile: str | None = None
+    max_attempts: int | None = Field(default=None, ge=1, le=10)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class TaskDependencyCreate(BaseModel):
+    parent_task_id: str
+
+
+class TaskCommentCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=20000)
+    author_type: str = "user"
+    author_id: str = "user"
+
+
+class TaskBlockRequest(BaseModel):
+    reason: str
+    detail: str | None = None
+    author_type: str = "user"
+    author_id: str = "user"
+
+
+class TaskUnblockRequest(BaseModel):
+    comment: str | None = None
+    author_type: str = "user"
+    author_id: str = "user"
+
+
+class TaskRetryRequest(BaseModel):
+    comment: str | None = None
+    author_type: str = "user"
+    author_id: str = "user"
+
+
 class SPAStaticFiles(StaticFiles):
     """Serve the production console while preserving API 404 semantics."""
 
@@ -430,11 +553,11 @@ def _is_public_frontend_request(request: Request, frontend_directory: Path | Non
     if path in {
         "/api", "/auth", "/health", "/docs", "/redoc", "/openapi.json",
         "/identity", "/memories", "/journals", "/schedules", "/workspace-aliases",
-        "/workspaces", "/capabilities",
+        "/workspaces", "/capabilities", "/taskflows", "/flow-tasks",
     } or path.startswith((
         "/api/", "/auth/", "/health/", "/runs/", "/schedules/", "/identity/",
         "/memories/", "/journals/", "/workspace-aliases/", "/workspaces/",
-        "/capabilities/",
+        "/capabilities/", "/taskflows/", "/flow-tasks/",
     )):
         return False
     if path.startswith("/conversations/") and path.rsplit("/", 1)[-1] in {
@@ -521,6 +644,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     attachment_store = AttachmentStore(store)
     attachment_service = AttachmentService(attachment_store, attachment_storage)
     attachment_resolver = AttachmentResolver()
+    memory_curator = MemoryCurator(
+        store, identity, memory,
+        mode=MemoryCurationMode.ASSISTED,
+    )
     manager = RunManager(
         store,
         backend,
@@ -534,6 +661,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store, identity, memory,
             enabled=configured.learning_enabled,
         ),
+        memory_curator=memory_curator,
         attachment_store=attachment_store,
         attachment_resolver=attachment_resolver,
         attachment_storage=attachment_storage,
@@ -542,22 +670,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         store, manager, channel_store,
         poll_interval=configured.scheduler_poll_interval,
     )
-    if bool(configured.telegram_token) != bool(configured.telegram_user_id):
-        raise ValueError(
-            "Telegram requires both GRAVITYCLAW_TELEGRAM_BOT_TOKEN and "
-            "GRAVITYCLAW_TELEGRAM_USER_ID"
-        )
+    telegram_token = configured.telegram_token
+    telegram_user_id = configured.telegram_user_id
+    if telegram_token and not telegram_user_id:
+        try:
+            with store._connect() as conn:
+                row = conn.execute(
+                    "SELECT sender_id FROM channel_bindings WHERE channel='telegram' ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()
+                if row:
+                    telegram_user_id = str(row[0] if isinstance(row, tuple) else row["sender_id"])
+        except Exception:
+            pass
+
     channel_runtime: ChannelRuntime | None = None
-    if configured.telegram_token and configured.telegram_user_id:
+    if telegram_token and telegram_user_id:
         channel_runtime = ChannelRuntime(
             manager,
             channel_store,
             TelegramAdapter(
-                configured.telegram_token, api_root=configured.telegram_api_root
+                telegram_token, api_root=configured.telegram_api_root
             ),
-            authorized_sender_id=configured.telegram_user_id,
+            authorized_sender_id=telegram_user_id,
             default_workspace_alias=configured.telegram_default_workspace,
             attachment_service=attachment_service,
+        )
+    elif telegram_token or telegram_user_id:
+        LOGGER.warning(
+            "Telegram partially configured (token=%s, user_id=%s). Disabling telegram adapter.",
+            bool(telegram_token),
+            bool(telegram_user_id),
         )
 
     # ─── Phase 3.1: Learning subsystem wiring ────────────────────────────────
@@ -590,12 +732,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if manager.learning_engine is not None:
         manager.learning_engine.skill_service = skill_service
 
+    taskflow_service = TaskFlowService(store)
+    taskflow_dispatcher = TaskFlowDispatcher(
+        store,
+        manager,
+        taskflow_service,
+        poll_interval=configured.scheduler_poll_interval,
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         report = await manager.start()
         app.state.reconciliation = asdict(report)
         scheduler_report = await scheduler.start()
         app.state.scheduler_reconciliation = asdict(scheduler_report)
+        await taskflow_dispatcher.start()
         # Register curator schedule after scheduler is started and workspaces exist
         if learning_config.curator.enabled:
             try:
@@ -611,6 +762,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if channel_runtime is not None:
                 await channel_runtime.close()
+            await taskflow_dispatcher.close()
             await scheduler.close()
             await manager.close()
 
@@ -626,6 +778,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.channel_runtime = channel_runtime
     app.state.scheduler = scheduler
     app.state.capabilities = capabilities
+    app.state.taskflow_service = taskflow_service
+    app.state.taskflow_dispatcher = taskflow_dispatcher
     app.state.reconciliation = {}
     app.state.scheduler_reconciliation = {}
     app.state.control_auth_enabled = configured.control_token is not None
@@ -1076,6 +1230,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [_attachment_json(r) for r in records]
 
     @app.post("/conversations/{conversation_id}/runs", status_code=202)
+    @app.post("/api/v1/conversations/{conversation_id}/runs", status_code=202)
     async def submit_run(conversation_id: str, body: RunCreate, request: Request) -> dict[str, Any]:
         request_data = body.model_dump(exclude_none=True)
         try:
@@ -1090,7 +1245,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+
+    @app.get("/runs/{run_id}/progress")
+    @app.get("/api/v1/runs/{run_id}/progress")
+    async def get_run_progress(run_id: str) -> Any:
+        snap = store.get_progress_snapshot(run_id)
+        if snap is None:
+            try:
+                run = store.get_run(run_id)
+                return {
+                    "run_id": run.id,
+                    "status": run.status,
+                    "current_label": "Run in progress",
+                    "started_at": run.created_at,
+                    "last_activity_at": run.created_at,
+                    "completed_steps": [],
+                    "recent_output_tail": [],
+                    "counters": {"tool_calls": 0, "commands": 0, "output_lines": 0},
+                    "version": 1,
+                }
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Run not found")
+        return snap
+
+    @app.get("/runs/{run_id}/telemetry")
+    @app.get("/api/v1/runs/{run_id}/telemetry")
+    async def get_run_telemetry(
+        run_id: str, since_sequence: int = Query(default=0, ge=0), limit: int = Query(default=100, le=500)
+    ) -> Any:
+        return store.list_telemetry_events(run_id, since_sequence=since_sequence, limit=limit)
+
     @app.get("/runs/{run_id}")
+    @app.get("/api/v1/runs/{run_id}")
     async def get_run(run_id: str) -> dict[str, Any]:
         try:
             return _run_json(store.get_run(run_id))
@@ -1309,12 +1495,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/conversations/{conversation_id}/summaries")
+    @app.get("/api/v1/conversations/{conversation_id}/summaries")
     async def list_context_summaries(conversation_id: str) -> list[dict[str, Any]]:
         try:
             store.get_conversation(conversation_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return store.list_conversation_summaries(conversation_id)
+
+    @app.post("/conversations/{conversation_id}/compact")
+    @app.post("/api/v1/conversations/{conversation_id}/compact")
+    async def manual_compact_conversation(
+        conversation_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        try:
+            keep_recent = int(body.get("keep_recent_turns", 8))
+            result = store.compact_conversation(conversation_id, keep_recent_turns=keep_recent)
+            store.record_audit(
+                actor=request.state.actor,
+                action="conversation.compact",
+                resource_type="conversation",
+                resource_id=conversation_id,
+                resulting_version=result["version"],
+            )
+            return result
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/runs/{run_id}/artifacts", status_code=201)
     async def create_artifact(run_id: str, body: ArtifactCreate) -> dict[str, str]:
@@ -1730,6 +1940,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         evaluations = store.list_goal_evaluations(goal_id)
         return [asdict(item) for item in evaluations]
 
+    @app.get("/workspaces")
     @app.get("/api/v1/workspaces")
     async def control_workspaces() -> list[dict[str, Any]]:
         return [{**asdict(item), "path": str(item.path)} for item in store.list_workspaces()]
@@ -2081,6 +2292,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         {"type": "run.event", "event": _event_json(event)}
                     )
                     sequence = event.sequence
+                progress_snap = store.get_progress_snapshot(run_id)
+                if progress_snap:
+                    await websocket.send_json(
+                        {"type": "run.progress", "run_id": run_id, "snapshot": progress_snap}
+                    )
                 run = store.get_run(run_id)
                 if run.status in TERMINAL_RUN_STATUSES:
                     await websocket.send_json(
@@ -2094,16 +2310,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ─── Phase 3.1: Learning API routes ───────────────────────────────────────
 
-    class LearnBody(BaseModel):
-        source: str = Field(min_length=1, max_length=100_000)
-        skill_name: str | None = None
-        force_new: bool = False
-        trust_override: str | None = None
-        conversation_id: str | None = None
-        run_id: str | None = None
 
     @app.post("/api/learning/learn", status_code=201)
-    async def api_learn(body: LearnBody, request: Request) -> dict[str, Any]:
+    async def api_learn(request: Request, body: LearnBody = Body(...)) -> Any:
         req = LearnRequest(
             source=body.source,
             requested_by=request.state.actor,
@@ -2151,11 +2360,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/learning/overview")
     async def api_learning_overview() -> dict[str, Any]:
-        """Overview: is learning enabled, stats, and what needs attention."""
-        from dataclasses import asdict as _asdict
+        """Overview: is learning enabled, stats, modes, and what needs attention."""
         skills = skill_service.registry.list_skills(limit=1000)
         pending_proposals = skill_service.registry.list_proposals(status="pending", limit=1000)
-        memories_count = len(store.list_memories(limit=1000))
+        all_memories = store.list_memories(limit=1000)
+        curated_memories = [m for m in all_memories if m.get("kind") == "curated"]
+        episodic_memories = [m for m in all_memories if m.get("kind") == "episodic"]
+        journals = memory.list_journals() if memory else []
+
+        # Memory candidates from learning events
+        memory_events = store.list_learning_events(limit=500)
+        pending_candidates = [
+            e for e in memory_events
+            if e.event_type.startswith("memory_") and e.status == "pending_approval"
+        ]
+
+        # Message count across conversations
+        all_convs = store.list_conversations(limit=1000)
+        total_messages = sum(len(store.list_messages(c.id, limit=5000)) for c in all_convs[:50])
 
         # Compute success rate from telemetry
         total_executed = 0
@@ -2172,18 +2394,171 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if total_executed > 0 else None
         )
 
+        last_audit = store.list_audit(limit=1)
+        last_scan_at = last_audit[0].created_at if last_audit else None
+
         return {
             "enabled": learning_config.enabled,
+            "mode": "suggest" if learning_config.skills.create_approval_required else "automatic",
             "trust_mode": learning_config.skills.trust_mode,
+            "learning_engine_status": "active" if (manager.learning_engine and manager.learning_engine.enabled) else "idle",
+            "skill_registry_status": "healthy",
+            "memory_index_status": "healthy",
             "stats": {
-                "memories": memories_count,
+                "memories": len(all_memories),
+                "curated_memories": len(curated_memories),
+                "episodic_memories": len(episodic_memories),
+                "memory_candidates": len(pending_candidates),
                 "skills": len(skills),
                 "pending_proposals": len(pending_proposals),
+                "daily_journals": len(journals),
+                "total_messages": total_messages,
                 "success_rate": success_rate,
                 "corrections": total_corrected,
             },
+            "last_scan_at": last_scan_at,
             "curator": curator_job.status(),
         }
+
+    @app.get("/api/learning/memory-candidates")
+    async def api_learning_memory_candidates(
+        status: str | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> list[dict[str, Any]]:
+        """List candidate memories extracted from runs/journals."""
+        events = store.list_learning_events(status=status, limit=limit * 2)
+        candidates: list[dict[str, Any]] = []
+        for e in events:
+            if not e.event_type.startswith("memory_"):
+                continue
+            namespace = "agent"
+            key = e.target
+            if ":" in e.target:
+                namespace, key = e.target.split(":", 1)
+            
+            # Determine human-friendly category
+            lower = e.summary.lower()
+            if any(k in lower for k in ("prefer", "like", "favorite", "user")):
+                category = "user preference"
+            elif any(k in lower for k in ("always", "never", "must", "podman", "docker", "worker", "architecture", "standard")):
+                category = "project decision"
+            elif any(k in lower for k in ("rule", "security", "token", "secret")):
+                category = "architecture rule"
+            else:
+                category = "operational fact"
+
+            candidates.append({
+                "id": e.id,
+                "key": key or "fact",
+                "namespace": namespace,
+                "category": category,
+                "content": e.summary,
+                "confidence": 0.95,
+                "source_run_id": e.run_id,
+                "source_conversation_id": e.conversation_id,
+                "status": e.status,
+                "reviewer_model": e.reviewer_model,
+                "created_at": e.created_at,
+            })
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    @app.post("/api/learning/memory-candidates/{candidate_id}/promote")
+    async def api_learning_memory_candidate_promote(
+        candidate_id: str, request: Request,
+    ) -> dict[str, Any]:
+        """Promote a candidate memory into curated long-term memory."""
+        try:
+            event = store.get_learning_event(candidate_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        if event.status == "applied":
+            return {"promoted": True, "status": "already_applied", "content": event.summary}
+
+        namespace = "agent"
+        if ":" in event.target:
+            namespace = event.target.split(":", 1)[0]
+
+        # 1. Insert into memories table with kind='curated' (creates SQLite FTS5 index entry)
+        source_label = f"run:{event.run_id[:8]}" if event.run_id else "learning:promoted"
+        mem_id = store.add_memory(
+            event.summary,
+            kind="curated",
+            source=source_label,
+            source_conversation_id=event.conversation_id,
+            confidence=0.95,
+        )
+
+        # 2. Append/update in MEMORY.md (or USER.md)
+        target_file = "MEMORY.md" if namespace == "agent" else "USER.md"
+        try:
+            doc = identity.load((target_file,))[0]
+            section_header = "## Learned Knowledge"
+            new_line = f"\n- <!-- learn:{event.id[:8]} --> {event.summary}"
+            if section_header in doc.content:
+                idx = doc.content.index(section_header) + len(section_header)
+                updated_content = doc.content[:idx] + new_line + doc.content[idx:]
+            else:
+                updated_content = doc.content + f"\n\n{section_header}{new_line}\n"
+            identity.update(target_file, updated_content)
+        except Exception as exc:
+            LOGGER.warning("failed to update identity file for memory promotion: %s", exc)
+
+        # 3. Update event status to 'applied'
+        store.update_learning_event(candidate_id, status="applied")
+        store.record_audit(
+            actor=request.state.actor,
+            action="learning.memory.promoted",
+            resource_type="memory",
+            resource_id=mem_id,
+            payload={"event_id": candidate_id, "summary": event.summary},
+        )
+        return {"promoted": True, "memory_id": mem_id, "status": "applied", "content": event.summary}
+
+    @app.post("/api/learning/memory-candidates/{candidate_id}/dismiss")
+    async def api_learning_memory_candidate_dismiss(
+        candidate_id: str, request: Request,
+    ) -> dict[str, Any]:
+        """Dismiss a candidate memory."""
+        try:
+            store.update_learning_event(candidate_id, status="rejected")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        store.record_audit(
+            actor=request.state.actor,
+            action="learning.memory.dismissed",
+            resource_type="learning_event",
+            resource_id=candidate_id,
+        )
+        return {"dismissed": True, "status": "rejected"}
+
+    @app.post("/api/learning/memory-candidates/scan")
+    async def api_learning_memory_candidate_scan(request: Request) -> dict[str, Any]:
+        """Scan recent conversations for potential memory candidates."""
+        runs = store.list_runs(statuses=["completed"])[-10:]
+        found = 0
+        if manager.learning_engine is not None:
+            for r in runs:
+                events = manager.learning_engine._get_run_events(r)
+                gate_res = manager.learning_engine.gate.evaluate(r, events)
+                if gate_res.eligible:
+                    ctx = manager.learning_engine._build_review_context(r, events, gate_res)
+                    res = manager.learning_engine._heuristic_extract(ctx)
+                    for op in res.memory_operations:
+                        store.record_learning_event(
+                            run_id=r.id,
+                            conversation_id=r.conversation_id,
+                            event_type=f"memory_{op.operation}",
+                            target=f"{op.namespace}:{op.key}",
+                            status="pending_approval",
+                            summary=op.content,
+                            reviewer_model="heuristic-scan",
+                        )
+                        found += 1
+        return {"status": "ok", "candidates_discovered": found}
 
     @app.get("/api/learning/events")
     async def api_learning_events(
@@ -2518,6 +2893,90 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return {"deleted": True, "id": memory_id}
 
+    # ─── Memory Curator API routes ──────────────────────────────────────────
+
+    @app.get("/api/memory/curator/status")
+    async def api_memory_curator_status() -> dict[str, Any]:
+        """Get Memory Curator mode, health, and statistics."""
+        curated_mems = store.list_memories(kind="curated")
+        episodic_mems = store.list_memories(kind="episodic")
+        revisions = store.list_memory_revisions(limit=100)
+        pending_candidates = store.list_learning_events(status="pending_approval")
+        journals = memory.list_journals()
+        return {
+            "mode": memory_curator.mode.value,
+            "enabled": True,
+            "status": "healthy",
+            "stats": {
+                "curated_memories": len(curated_mems),
+                "episodic_memories": len(episodic_mems),
+                "total_revisions": len(revisions),
+                "pending_candidates": len(pending_candidates),
+                "daily_journals": len(journals),
+            },
+        }
+
+    @app.post("/api/memory/curator/settings")
+    async def api_memory_curator_settings_update(
+        request: Request, body: CuratorSettingsUpdate
+    ) -> dict[str, Any]:
+        """Update Memory Curator mode (manual, assisted, automatic)."""
+        memory_curator.mode = body.mode
+        store.record_audit(
+            actor=request.state.actor,
+            action="memory.curator.mode_updated",
+            resource_type="memory_curator",
+            resource_id="settings",
+            payload={"new_mode": body.mode},
+        )
+        return {"status": "ok", "mode": memory_curator.mode.value}
+
+    @app.post("/api/memory/curator/consolidate")
+    async def api_memory_curator_consolidate(
+        request: Request, days_back: int = Query(default=7, ge=1, le=90)
+    ) -> dict[str, Any]:
+        """Trigger episodic journal consolidation ('dreaming' layer)."""
+        report = memory_curator.consolidate_journals(days_back=days_back)
+        store.record_audit(
+            actor=request.state.actor,
+            action="memory.curator.consolidated",
+            resource_type="memory_curator",
+            resource_id="consolidation",
+            payload=report.to_dict(),
+        )
+        return report.to_dict()
+
+    @app.post("/api/memory/remember")
+    async def api_memory_remember_explicit(
+        request: Request, body: ExplicitRememberRequest
+    ) -> dict[str, Any]:
+        """Explicitly remember a user preference, project decision, or fact."""
+        try:
+            res = memory_curator.remember_explicit(
+                body.content,
+                category=body.category,
+                conversation_id=body.conversation_id,
+                run_id=body.run_id,
+            )
+            return res
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/memory/revisions")
+    async def api_memory_list_all_revisions(
+        limit: int = Query(default=50, ge=1, le=200)
+    ) -> list[dict[str, Any]]:
+        """List historical memory revisions (supersessions)."""
+        return store.list_memory_revisions(limit=limit)
+
+    @app.get("/api/memory/{memory_id}/revisions")
+    async def api_memory_get_revisions(
+        memory_id: str, limit: int = Query(default=50, ge=1, le=200)
+    ) -> list[dict[str, Any]]:
+        """List historical revisions for a specific memory record."""
+        return store.list_memory_revisions(memory_id=memory_id, limit=limit)
+
+
     @app.get("/api/learning/settings")
     async def api_learning_settings() -> dict[str, Any]:
         """Get current learning settings."""
@@ -2757,6 +3216,318 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "reason": revision.reason,
             "created_at": revision.created_at,
         }
+
+    # ─── TaskFlow & Kanban Routes ───────────────────────────────────────────
+
+    def _taskflow_json(flow: TaskFlowRecord) -> dict[str, Any]:
+        tasks = store.list_flow_tasks(flow_id=flow.id)
+        stats = {
+            "total_tasks": len(tasks),
+            "done_tasks": sum(1 for t in tasks if t.status == "DONE"),
+            "running_tasks": sum(1 for t in tasks if t.status == "RUNNING"),
+            "ready_tasks": sum(1 for t in tasks if t.status == "READY"),
+            "todo_tasks": sum(1 for t in tasks if t.status == "TODO"),
+            "triage_tasks": sum(1 for t in tasks if t.status == "TRIAGE"),
+            "blocked_tasks": sum(1 for t in tasks if t.status == "BLOCKED"),
+            "failed_tasks": sum(1 for t in tasks if t.status == "FAILED"),
+        }
+        return {
+            "id": flow.id,
+            "title": flow.title,
+            "objective": flow.objective,
+            "status": flow.status,
+            "workspace_id": flow.workspace_id,
+            "context_profile": flow.context_profile,
+            "state_json": flow.state_json,
+            "version": flow.version,
+            "created_at": flow.created_at,
+            "updated_at": flow.updated_at,
+            "stats": stats,
+        }
+
+    def _flowtask_json(task: FlowTaskRecord) -> dict[str, Any]:
+        attempts = store.list_task_attempts(task.id)
+        comments = store.list_task_comments(task.id)
+        claim = store.get_task_claim(task.id)
+        return {
+            "id": task.id,
+            "flow_id": task.flow_id,
+            "title": task.title,
+            "body": task.body,
+            "acceptance_criteria": task.acceptance_json,
+            "status": task.status,
+            "assignee_profile": task.assignee_profile,
+            "priority": task.priority,
+            "workspace_id": task.workspace_id,
+            "idempotency_key": task.idempotency_key,
+            "max_attempts": task.max_attempts,
+            "block_reason": task.block_reason,
+            "block_detail": task.block_detail,
+            "block_recurrence_count": task.block_recurrence_count,
+            "version": task.version,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "parent_ids": task.parent_ids,
+            "child_ids": task.child_ids,
+            "attempt_count": len(attempts),
+            "latest_attempt": asdict(attempts[-1]) if attempts else None,
+            "comment_count": len(comments),
+            "claim": asdict(claim) if claim else None,
+        }
+
+    @app.post("/api/taskflows")
+    @app.post("/api/v1/taskflows")
+    async def create_task_flow(req: TaskFlowCreate) -> dict[str, Any]:
+        try:
+            flow = taskflow_service.create_flow(
+                title=req.title,
+                objective=req.objective,
+                workspace_id=req.workspace_id,
+                context_profile=req.context_profile,
+                state_json=req.state_json,
+            )
+            return _taskflow_json(flow)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/taskflows")
+    @app.get("/api/v1/taskflows")
+    async def list_task_flows(
+        workspace_id: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        flows = taskflow_service.list_flows(workspace_id=workspace_id, status=status)
+        return [_taskflow_json(f) for f in flows]
+
+    @app.get("/api/taskflows/{flow_id}")
+    @app.get("/api/v1/taskflows/{flow_id}")
+    async def get_task_flow(flow_id: str) -> dict[str, Any]:
+        flow = taskflow_service.get_flow(flow_id)
+        if not flow:
+            raise HTTPException(status_code=404, detail="TaskFlow not found")
+        return _taskflow_json(flow)
+
+    @app.patch("/api/taskflows/{flow_id}")
+    @app.patch("/api/v1/taskflows/{flow_id}")
+    async def update_task_flow(flow_id: str, req: TaskFlowUpdate) -> dict[str, Any]:
+        try:
+            if req.status is not None:
+                flow = taskflow_service.update_flow_status(
+                    flow_id,
+                    req.status,
+                    expected_version=req.expected_version,
+                    state_json=req.state_json,
+                )
+            else:
+                flow = store.update_task_flow(
+                    flow_id,
+                    title=req.title,
+                    objective=req.objective,
+                    context_profile=req.context_profile,
+                    state_json=req.state_json,
+                    expected_version=req.expected_version,
+                )
+            return _taskflow_json(flow)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="TaskFlow not found")
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/taskflows/{flow_id}")
+    @app.delete("/api/v1/taskflows/{flow_id}")
+    async def delete_task_flow(flow_id: str) -> dict[str, bool]:
+        deleted = taskflow_service.delete_flow(flow_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="TaskFlow not found")
+        return {"deleted": True}
+
+    @app.post("/api/taskflows/{flow_id}/dispatch")
+    @app.post("/api/v1/taskflows/{flow_id}/dispatch")
+    async def dispatch_task_flow(flow_id: str) -> dict[str, Any]:
+        flow = taskflow_service.get_flow(flow_id)
+        if not flow:
+            raise HTTPException(status_code=404, detail="TaskFlow not found")
+        report = await taskflow_dispatcher.tick()
+        return asdict(report)
+
+    @app.get("/api/taskflows/{flow_id}/tasks")
+    @app.get("/api/v1/taskflows/{flow_id}/tasks")
+    async def list_flow_tasks(
+        flow_id: str, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        tasks = taskflow_service.list_tasks(flow_id=flow_id, status=status)
+        return [_flowtask_json(t) for t in tasks]
+
+    @app.post("/api/taskflows/{flow_id}/tasks")
+    @app.post("/api/v1/taskflows/{flow_id}/tasks")
+    async def create_flow_task(flow_id: str, req: FlowTaskCreate) -> dict[str, Any]:
+        flow = taskflow_service.get_flow(flow_id)
+        if not flow:
+            raise HTTPException(status_code=404, detail="TaskFlow not found")
+        try:
+            task = taskflow_service.create_task(
+                flow_id=flow_id,
+                title=req.title,
+                body=req.body,
+                workspace_id=req.workspace_id or flow.workspace_id,
+                acceptance_criteria=req.acceptance_criteria,
+                priority=req.priority,
+                assignee_profile=req.assignee_profile,
+                idempotency_key=req.idempotency_key,
+                max_attempts=req.max_attempts,
+                parent_ids=req.parent_ids,
+            )
+            return _flowtask_json(task)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/flow-tasks/{task_id}")
+    @app.get("/api/v1/flow-tasks/{task_id}")
+    async def get_flow_task(task_id: str) -> dict[str, Any]:
+        task = taskflow_service.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return _flowtask_json(task)
+
+    @app.patch("/api/flow-tasks/{task_id}")
+    @app.patch("/api/v1/flow-tasks/{task_id}")
+    async def update_flow_task(task_id: str, req: FlowTaskUpdate) -> dict[str, Any]:
+        try:
+            if req.status is not None:
+                task = store.update_flow_task_status(
+                    task_id, req.status, expected_version=req.expected_version
+                )
+            else:
+                task = store.update_flow_task(
+                    task_id,
+                    title=req.title,
+                    body=req.body,
+                    acceptance_criteria=req.acceptance_criteria,
+                    priority=req.priority,
+                    assignee_profile=req.assignee_profile,
+                    max_attempts=req.max_attempts,
+                    expected_version=req.expected_version,
+                )
+            return _flowtask_json(task)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Task not found")
+        except VersionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/flow-tasks/{task_id}")
+    @app.delete("/api/v1/flow-tasks/{task_id}")
+    async def delete_flow_task(task_id: str) -> dict[str, bool]:
+        deleted = store.delete_flow_task(task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"deleted": True}
+
+    @app.post("/api/flow-tasks/{task_id}/dependencies")
+    @app.post("/api/v1/flow-tasks/{task_id}/dependencies")
+    async def add_task_dependency(
+        task_id: str, req: TaskDependencyCreate
+    ) -> dict[str, Any]:
+        try:
+            taskflow_service.add_dependency(
+                parent_task_id=req.parent_task_id, child_task_id=task_id
+            )
+            task = taskflow_service.get_task(task_id)
+            return _flowtask_json(task) if task else {"success": True}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.delete("/api/flow-tasks/{task_id}/dependencies/{parent_id}")
+    @app.delete("/api/v1/flow-tasks/{task_id}/dependencies/{parent_id}")
+    async def remove_task_dependency(task_id: str, parent_id: str) -> dict[str, Any]:
+        taskflow_service.remove_dependency(parent_task_id=parent_id, child_task_id=task_id)
+        task = taskflow_service.get_task(task_id)
+        return _flowtask_json(task) if task else {"success": True}
+
+    @app.get("/api/flow-tasks/{task_id}/comments")
+    @app.get("/api/v1/flow-tasks/{task_id}/comments")
+    async def list_task_comments(task_id: str) -> list[dict[str, Any]]:
+        comments = store.list_task_comments(task_id)
+        return [asdict(c) for c in comments]
+
+    @app.post("/api/flow-tasks/{task_id}/comments")
+    @app.post("/api/v1/flow-tasks/{task_id}/comments")
+    async def add_task_comment(
+        task_id: str, req: TaskCommentCreate
+    ) -> dict[str, Any]:
+        try:
+            comment = taskflow_service.add_comment(
+                task_id=task_id,
+                author_type=req.author_type,
+                author_id=req.author_id,
+                body=req.body,
+            )
+            return asdict(comment)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/flow-tasks/{task_id}/block")
+    @app.post("/api/v1/flow-tasks/{task_id}/block")
+    async def block_task(task_id: str, req: TaskBlockRequest) -> dict[str, Any]:
+        try:
+            task = taskflow_service.block_task(
+                task_id,
+                reason=req.reason,
+                detail=req.detail,
+                author_type=req.author_type,
+                author_id=req.author_id,
+            )
+            return _flowtask_json(task)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/flow-tasks/{task_id}/unblock")
+    @app.post("/api/v1/flow-tasks/{task_id}/unblock")
+    async def unblock_task(task_id: str, req: TaskUnblockRequest) -> dict[str, Any]:
+        try:
+            task = taskflow_service.unblock_task(
+                task_id,
+                comment=req.comment,
+                author_type=req.author_type,
+                author_id=req.author_id,
+            )
+            return _flowtask_json(task)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/flow-tasks/{task_id}/retry")
+    @app.post("/api/v1/flow-tasks/{task_id}/retry")
+    async def retry_task(task_id: str, req: TaskRetryRequest) -> dict[str, Any]:
+        try:
+            task = taskflow_service.retry_task(
+                task_id,
+                comment=req.comment,
+                author_type=req.author_type,
+                author_id=req.author_id,
+            )
+            return _flowtask_json(task)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/flow-tasks/{task_id}/attempts")
+    @app.get("/api/v1/flow-tasks/{task_id}/attempts")
+    async def list_task_attempts(task_id: str) -> list[dict[str, Any]]:
+        attempts = store.list_task_attempts(task_id)
+        return [asdict(a) for a in attempts]
+
+    @app.get("/api/flow-tasks/{task_id}/handoffs")
+    @app.get("/api/v1/flow-tasks/{task_id}/handoffs")
+    async def get_task_handoffs(task_id: str) -> list[dict[str, Any]]:
+        handoffs = taskflow_service.get_task_handoffs(task_id)
+        return [
+            {
+                "parent_task": _flowtask_json(p_task),
+                "comments": [asdict(c) for c in comments],
+            }
+            for p_task, comments in handoffs
+        ]
 
     if frontend_directory is not None:
         # Mount last so every API and WebSocket route above wins first. The

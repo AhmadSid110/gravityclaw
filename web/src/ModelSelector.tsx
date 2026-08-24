@@ -5,7 +5,17 @@ import type { AgyQuota, ConversationEffort, ConversationModel, ModelCatalog } fr
 const EFFORT_LABELS: Record<string, string> = { low: "Low", medium: "Medium", high: "High" };
 const EFFORT_ICONS: Record<string, string> = { low: "\u26A1", medium: "\u2696\uFE0F", high: "\uD83E\uDDE0" };
 
-export function ModelSelector({ conversationId, onChanged }: { conversationId: string; onChanged?: (model: ConversationModel) => void }) {
+export function ModelSelector({
+  conversationId,
+  onChanged,
+  variant = "default",
+  placement = "down",
+}: {
+  conversationId: string;
+  onChanged?: (model: ConversationModel) => void;
+  variant?: "default" | "compact";
+  placement?: "down" | "up";
+}) {
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [policy, setPolicy] = useState<ConversationModel | null>(null);
   const [effort, setEffort] = useState<ConversationEffort | null>(null);
@@ -107,8 +117,14 @@ export function ModelSelector({ conversationId, onChanged }: { conversationId: s
     }
     if (left < 12) left = 12;
 
-    const top = rect.bottom + 6;
-    setDropdownStyle({ top: `${top}px`, left: `${left}px` });
+    const isUp = placement === "up" || rect.bottom + 280 > window.innerHeight;
+    if (isUp) {
+      const bottom = window.innerHeight - rect.top + 6;
+      setDropdownStyle({ bottom: `${bottom}px`, left: `${left}px` });
+    } else {
+      const top = rect.bottom + 6;
+      setDropdownStyle({ top: `${top}px`, left: `${left}px` });
+    }
   }
 
   function togglePanel() {
@@ -123,26 +139,41 @@ export function ModelSelector({ conversationId, onChanged }: { conversationId: s
     function handleResizeOrScroll() {
       updatePosition();
     }
+    function handleClickOutside(e: MouseEvent) {
+      if (triggerRef.current && !triggerRef.current.contains(e.target as Node)) {
+        const dropdown = document.querySelector(".model-panel-dropdown");
+        if (dropdown && !dropdown.contains(e.target as Node)) {
+          setExpanded(false);
+        }
+      }
+    }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setExpanded(false);
+    }
     window.addEventListener("resize", handleResizeOrScroll);
     window.addEventListener("scroll", handleResizeOrScroll, true);
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("resize", handleResizeOrScroll);
       window.removeEventListener("scroll", handleResizeOrScroll, true);
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
     };
   }, [expanded]);
 
-  return <div className="model-panel">
+  return <div className={`model-panel ${variant === "compact" ? "model-panel-compact" : ""}`}>
     {/* Compact trigger pill */}
     <button
       ref={triggerRef}
-      className="model-panel-trigger"
+      className={`model-panel-trigger ${variant === "compact" ? "compact" : ""}`}
       onClick={togglePanel}
       title={error ?? `Model: ${activeLabel} (${EFFORT_LABELS[currentEffort]} reasoning)`}
       aria-expanded={expanded}
+      type="button"
     >
-      <span className="model-panel-icon">{"\u25C6"}</span>
-      <span className="model-panel-model">{activeLabel}</span>
-      <span className="model-panel-chevron">{expanded ? "\u25B4" : "\u25BE"}</span>
+      <span className="model-panel-model">{variant === "compact" ? (selected ? activeLabel : "AGY · Default") : activeLabel}</span>
+      <span className="model-panel-chevron">{expanded ? "▴" : "▾"}</span>
     </button>
 
     {/* Expanded dropdown panel */}

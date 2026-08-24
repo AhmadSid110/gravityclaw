@@ -257,8 +257,8 @@ Self-hosted means you own your data. GravityClaw takes that seriously:
 ## Roadmap
 
 - [x] **M1–M10**: Core platform, memory, scheduling, channels, console, security, XDG install
-- [ ] **M11** (active): TaskFlow orchestration, curator, telemetry, Console IA v2
-- [ ] **M12**: Multi-channel (Discord, Signal, WhatsApp)
+- [x] **M11**: TaskFlow orchestration, curator, telemetry, Console IA v2
+- [ ] **M12** (next): Multi-channel (Discord, Signal, WhatsApp)
 - [ ] **M13**: Multi-agent coordination
 - [ ] **M14**: Plugin marketplace
 

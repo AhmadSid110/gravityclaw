@@ -578,13 +578,13 @@ class ContextSnapshotStoreTests(unittest.TestCase):
         assert snap is not None
         self.assertIsNone(snap["transformations"])
 
-    def test_schema_version_15(self) -> None:
-        """Schema version is 17 after initialization."""
+    def test_schema_version_18(self) -> None:
+        """Schema version is 18 after initialization."""
         with self.store._connect() as conn:
             row = conn.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
-        self.assertEqual(row["value"], "17")
+        self.assertEqual(row["value"], "18")
 
 
 class ContextSnapshotPOSTTests(unittest.IsolatedAsyncioTestCase):

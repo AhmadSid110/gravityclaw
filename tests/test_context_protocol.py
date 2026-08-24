@@ -204,7 +204,7 @@ class ContextSchemaMigrationTests(unittest.TestCase):
                 tables = {row[0] for row in connection.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )}
-            self.assertEqual(version, "17")
+            self.assertEqual(version, "18")
             self.assertTrue({"context_manifests", "context_watermarks", "conversation_summaries", "artifacts"} <= tables)
 
 

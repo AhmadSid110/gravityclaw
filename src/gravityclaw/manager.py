@@ -16,6 +16,8 @@ from .capabilities import CapabilityManager
 from .context import RunContextCompiler
 from .event_bus import EventBus
 from .events import AgentEvent
+from .progress_engine import ProgressEngine
+from .telemetry import TelemetryEvent
 from .execution import (
     ContainerSpec,
     MANAGED_LABEL,
@@ -28,6 +30,7 @@ from .execution import (
 )
 from .goals import GoalEvaluator, build_continuation_prompt
 from .learning import LearningEngine
+from .curator import MemoryCurator
 from .store import GoalRecord, RunRecord, Store, TERMINAL_RUN_STATUSES
 
 
@@ -55,6 +58,7 @@ class RunManager:
         capability_manager: CapabilityManager | None = None,
         goal_evaluator: GoalEvaluator | None = None,
         learning_engine: LearningEngine | None = None,
+        memory_curator: MemoryCurator | None = None,
         attachment_store: AttachmentStore | None = None,
         attachment_resolver: AttachmentResolver | None = None,
         attachment_storage: AttachmentStorage | None = None,
@@ -68,12 +72,14 @@ class RunManager:
         self.capability_manager = capability_manager
         self.goal_evaluator = goal_evaluator
         self.learning_engine = learning_engine
+        self.memory_curator = memory_curator
         self.attachment_store = attachment_store
         self.attachment_resolver = attachment_resolver or AttachmentResolver()
         self.attachment_storage = attachment_storage
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._conversation_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._progress_engines: dict[str, ProgressEngine] = {}
         self._stopping = False
 
     async def start(self) -> ReconciliationReport:
@@ -391,17 +397,27 @@ class RunManager:
             raise
         except Exception as exc:
             LOGGER.exception("worker monitor failed for run %s", run_id)
-            run = self.store.get_run(run_id)
-            if run.status == "running":
-                self.store.append_event(
-                    run.id,
-                    AgentEvent(
-                        "backend.monitor_error",
+            try:
+                run = self.store.get_run(run_id)
+                if run.status == "running":
+                    self.store.append_event(
                         run.id,
-                        data={"message": str(exc)},
-                    ),
-                )
-                await self.event_bus.notify(run.id)
+                        AgentEvent(
+                            "backend.monitor_error",
+                            run.id,
+                            data={"message": str(exc)},
+                        ),
+                    )
+                    self.store.transition_run(
+                        run.id,
+                        "failed",
+                        expected=("running",),
+                        error=f"monitor loop error: {exc}",
+                    )
+                    await self.event_bus.notify(run.id)
+                    await self._dispatch_conversation(run.conversation_id)
+            except Exception as inner_exc:
+                LOGGER.exception("failed to recover from monitor error for run %s: %s", run_id, inner_exc)
 
     async def _ingest(self, run: RunRecord) -> None:
         if not run.worker_id:
@@ -465,6 +481,27 @@ class RunManager:
                 )
             persisted = self.store.append_event(
                 run.id, event, source_sequence=envelope.source_sequence
+            )
+            # Update Progress Engine & Telemetry
+            if run.id not in self._progress_engines:
+                self._progress_engines[run.id] = ProgressEngine(run.id)
+            engine = self._progress_engines[run.id]
+            telemetry_evt = TelemetryEvent.create(
+                run_id=run.id,
+                type=event.type,
+                source=envelope.source if envelope else "worker",
+                sequence=persisted.sequence,
+                data=dict(event.data),
+            )
+            snapshot = engine.consume(telemetry_evt)
+            self.store.save_progress_snapshot(snapshot.to_dict())
+            self.store.append_telemetry_event(
+                run_id=run.id,
+                event_id=telemetry_evt.event_id,
+                event_type=telemetry_evt.type,
+                source=telemetry_evt.source,
+                sequence=telemetry_evt.sequence,
+                data=telemetry_evt.data,
             )
             if event.conversation_id:
                 self.store.bind_backend_conversation(
@@ -549,6 +586,14 @@ class RunManager:
         # evaluate and potentially enqueue a follow-up run.
         if status in ("completed", "failed") and self.goal_evaluator is not None:
             await self._evaluate_goal(run, status)
+
+        # Memory Curator: evaluate what should become durable long-term memory
+        if status == "completed" and self.memory_curator is not None:
+            try:
+                finalized_run = self.store.get_run(run.id)
+                await self.memory_curator.process_run(finalized_run)
+            except Exception:
+                LOGGER.exception("memory curator failed for run %s", run.id)
 
         # Learning: if the completed run is eligible, enqueue a background
         # learning job for async review. This is non-blocking and never

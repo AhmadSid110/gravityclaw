@@ -1,4 +1,41 @@
-import type { Artifact, AgyQuota, AttachmentRecord, CapabilityState, ContextPreview, ContextSnapshot, ContextStatus, Conversation, ConversationDetail, ConversationEffort, ConversationModel, ConversationSearchResult, ControlSnapshot, ContextManifest, GoalEvaluation, GoalRecord, IdentityDocument, JournalRecord, MemoryRecord, MemoryUsage, ModelCatalog, PersistedEvent, RunRecord, ScheduleRecord, UsageSummary } from "./types";
+import type {
+  ProgressSnapshot,
+  TelemetryEvent,
+  Artifact,
+  AgyQuota,
+  AttachmentRecord,
+  CapabilityState,
+  ContextPreview,
+  ContextSnapshot,
+  ContextStatus,
+  Conversation,
+  ConversationDetail,
+  ConversationEffort,
+  ConversationModel,
+  ConversationSearchResult,
+  ControlSnapshot,
+  ContextManifest,
+  FlowTask,
+  GoalEvaluation,
+  GoalRecord,
+  IdentityDocument,
+  JournalRecord,
+  MemoryCandidate,
+  MemoryRecord,
+  MemoryRevision,
+  CuratorStatus,
+  ConsolidationReport,
+  MemoryUsage,
+  ModelCatalog,
+  PersistedEvent,
+  RunRecord,
+  ScheduleRecord,
+  TaskAttempt,
+  TaskComment,
+  TaskFlow,
+  TaskHandoffItem,
+  UsageSummary,
+} from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -101,6 +138,24 @@ export async function getAgyQuota(): Promise<AgyQuota> {
 
 export async function getContextStatus(conversationId: string): Promise<ContextStatus> {
   return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/context-status`);
+}
+
+export async function compactConversation(
+  conversationId: string,
+  keepRecentTurns = 8,
+): Promise<{
+  summary_id: string;
+  version: number;
+  message_count: number;
+  messages_compacted_this_run: number;
+  content: string;
+  context_status: ContextStatus;
+}> {
+  return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/compact`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ keep_recent_turns: keepRecentTurns }),
+  });
 }
 
 export async function getWorkspaces(): Promise<Array<{ id: string; name: string; path: string }>> {
@@ -465,6 +520,29 @@ export async function submitLearn(source: string, options?: { skill_name?: strin
   });
 }
 
+export async function getMemoryCandidates(status?: string, limit = 50): Promise<MemoryCandidate[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}&limit=${limit}` : `?limit=${limit}`;
+  return request(`/api/learning/memory-candidates${query}`);
+}
+
+export async function promoteMemoryCandidate(candidateId: string): Promise<{ promoted: boolean; memory_id: string; content: string }> {
+  return request(`/api/learning/memory-candidates/${encodeURIComponent(candidateId)}/promote`, {
+    method: "POST", headers: jsonHeaders,
+  });
+}
+
+export async function dismissMemoryCandidate(candidateId: string): Promise<{ dismissed: boolean }> {
+  return request(`/api/learning/memory-candidates/${encodeURIComponent(candidateId)}/dismiss`, {
+    method: "POST", headers: jsonHeaders,
+  });
+}
+
+export async function scanMemoryCandidates(): Promise<{ status: string; candidates_discovered: number }> {
+  return request("/api/learning/memory-candidates/scan", {
+    method: "POST", headers: jsonHeaders,
+  });
+}
+
 // ─── Journey Graph API ───────────────────────────────────────────────────────
 
 export async function getLearningJourney(skillId?: string): Promise<JourneyGraph> {
@@ -484,4 +562,252 @@ export async function saveRunContextSnapshot(runId: string, snapshot: Record<str
     headers: jsonHeaders,
     body: JSON.stringify(snapshot),
   });
+}
+
+// ─── TaskFlow & Kanban API ──────────────────────────────────────────────────
+
+export async function listTaskFlows(workspaceId?: string, status?: string): Promise<TaskFlow[]> {
+  const params = new URLSearchParams();
+  if (workspaceId) params.append("workspace_id", workspaceId);
+  if (status) params.append("status", status);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/taskflows${query}`);
+}
+
+export async function getTaskFlow(flowId: string): Promise<TaskFlow> {
+  return request(`/api/taskflows/${encodeURIComponent(flowId)}`);
+}
+
+export async function createTaskFlow(payload: {
+  title: string;
+  objective: string;
+  workspace_id: string;
+  context_profile?: string;
+  state_json?: Record<string, any>;
+}): Promise<TaskFlow> {
+  return request("/api/taskflows", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateTaskFlow(
+  flowId: string,
+  payload: {
+    title?: string;
+    objective?: string;
+    status?: string;
+    context_profile?: string;
+    state_json?: Record<string, any>;
+    expected_version?: number;
+  }
+): Promise<TaskFlow> {
+  return request(`/api/taskflows/${encodeURIComponent(flowId)}`, {
+    method: "PATCH",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteTaskFlow(flowId: string): Promise<{ deleted: boolean }> {
+  return request(`/api/taskflows/${encodeURIComponent(flowId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function dispatchTaskFlow(flowId: string): Promise<Record<string, any>> {
+  return request(`/api/taskflows/${encodeURIComponent(flowId)}/dispatch`, {
+    method: "POST",
+    headers: jsonHeaders,
+  });
+}
+
+export async function listFlowTasks(flowId: string, status?: string): Promise<FlowTask[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  return request(`/api/taskflows/${encodeURIComponent(flowId)}/tasks${query}`);
+}
+
+export async function createFlowTask(
+  flowId: string,
+  payload: {
+    title: string;
+    body?: string;
+    workspace_id?: string;
+    acceptance_criteria?: Array<string | { text?: string; criterion?: string }>;
+    priority?: string;
+    assignee_profile?: string;
+    idempotency_key?: string;
+    max_attempts?: number;
+    parent_ids?: string[];
+  }
+): Promise<FlowTask> {
+  return request(`/api/taskflows/${encodeURIComponent(flowId)}/tasks`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ flow_id: flowId, ...payload }),
+  });
+}
+
+export async function getFlowTask(taskId: string): Promise<FlowTask> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}`);
+}
+
+export async function updateFlowTask(
+  taskId: string,
+  payload: {
+    title?: string;
+    body?: string;
+    acceptance_criteria?: Array<string | { text?: string; criterion?: string }>;
+    status?: string;
+    priority?: string;
+    assignee_profile?: string;
+    max_attempts?: number;
+    expected_version?: number;
+  }
+): Promise<FlowTask> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}`, {
+    method: "PATCH",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteFlowTask(taskId: string): Promise<{ deleted: boolean }> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function addTaskDependency(
+  taskId: string,
+  parentTaskId: string
+): Promise<FlowTask> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/dependencies`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ parent_task_id: parentTaskId }),
+  });
+}
+
+export async function removeTaskDependency(
+  taskId: string,
+  parentTaskId: string
+): Promise<FlowTask> {
+  return request(
+    `/api/flow-tasks/${encodeURIComponent(taskId)}/dependencies/${encodeURIComponent(parentTaskId)}`,
+    {
+      method: "DELETE",
+    }
+  );
+}
+
+export async function listTaskComments(taskId: string): Promise<TaskComment[]> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/comments`);
+}
+
+export async function addTaskComment(
+  taskId: string,
+  body: string,
+  authorType: "user" | "agent" | "system" = "user",
+  authorId: string = "user"
+): Promise<TaskComment> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/comments`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ body, author_type: authorType, author_id: authorId }),
+  });
+}
+
+export async function blockTask(
+  taskId: string,
+  reason: string,
+  detail?: string
+): Promise<FlowTask> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/block`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ reason, detail }),
+  });
+}
+
+export async function unblockTask(taskId: string, comment?: string): Promise<FlowTask> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/unblock`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ comment }),
+  });
+}
+
+export async function retryTask(taskId: string, comment?: string): Promise<FlowTask> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/retry`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ comment }),
+  });
+}
+
+export async function listTaskAttempts(taskId: string): Promise<TaskAttempt[]> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/attempts`);
+}
+
+export async function getTaskHandoffs(taskId: string): Promise<TaskHandoffItem[]> {
+  return request(`/api/flow-tasks/${encodeURIComponent(taskId)}/handoffs`);
+}
+
+export async function getCuratorStatus(): Promise<CuratorStatus> {
+  return request(`/api/memory/curator/status`);
+}
+
+export async function updateCuratorSettings(
+  mode: "manual" | "assisted" | "automatic"
+): Promise<{ status: string; mode: string }> {
+  return request(`/api/memory/curator/settings`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function consolidateJournals(
+  daysBack: number = 7
+): Promise<ConsolidationReport> {
+  return request(`/api/memory/curator/consolidate?days_back=${daysBack}`, {
+    method: "POST",
+  });
+}
+
+export async function rememberExplicit(
+  content: string,
+  category: string = "user_preference",
+  conversationId?: string,
+  runId?: string
+): Promise<Record<string, unknown>> {
+  return request(`/api/memory/remember`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      content,
+      category,
+      conversation_id: conversationId,
+      run_id: runId,
+    }),
+  });
+}
+
+export async function getMemoryRevisions(
+  memoryId?: string
+): Promise<MemoryRevision[]> {
+  const path = memoryId
+    ? `/api/memory/${encodeURIComponent(memoryId)}/revisions`
+    : `/api/memory/revisions`;
+  return request(path);
+}
+
+export async function getRunProgress(runId: string): Promise<ProgressSnapshot> {
+  return request<ProgressSnapshot>(`api/v1/runs/${runId}/progress`);
+}
+
+export async function getRunTelemetry(runId: string, sinceSequence = 0): Promise<TelemetryEvent[]> {
+  return request<TelemetryEvent[]>(`api/v1/runs/${runId}/telemetry?since_sequence=${sinceSequence}`);
 }

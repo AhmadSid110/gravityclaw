@@ -9,10 +9,13 @@
         try {
           const theme = localStorage.getItem("gravityclaw-theme") || "midnight";
           const font = localStorage.getItem("gravityclaw-font") || "modern";
+          const fontSize = localStorage.getItem("gravityclaw-font-size") || "medium";
           const density = localStorage.getItem("gravityclaw-density") || "comfortable";
           const root = document.documentElement;
           root.dataset.theme = theme;
           root.dataset.font = font;
+          root.dataset.fontSize = fontSize;
+          root.setAttribute("data-font-size", fontSize);
           root.dataset.density = density;
         } catch (e) {}
       })();

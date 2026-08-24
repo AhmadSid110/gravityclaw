@@ -14,15 +14,16 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from .events import AgentEvent
+from .models import get_model_context_limit
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 RUN_STATUSES = (
     "queued",
     "running",
@@ -46,6 +47,41 @@ MISFIRE_POLICIES = ("MISFIRE_SKIP", "MISFIRE_RUN_ONCE", "MISFIRE_CATCH_UP")
 TRIGGER_STATES = (
     "PENDING", "CLAIMED", "DISPATCHED", "RUNNING", "COMPLETED", "SKIPPED",
     "MISSED", "FAILED", "CANCELLED",
+)
+
+FLOW_STATUSES = (
+    "QUEUED",
+    "RUNNING",
+    "WAITING",
+    "BLOCKED",
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELLED",
+)
+TERMINAL_FLOW_STATUSES = ("SUCCEEDED", "FAILED", "CANCELLED")
+
+TASK_STATUSES = (
+    "TRIAGE",
+    "TODO",
+    "READY",
+    "RUNNING",
+    "BLOCKED",
+    "DONE",
+    "FAILED",
+    "CANCELLED",
+    "ARCHIVED",
+)
+TERMINAL_TASK_STATUSES = ("DONE", "FAILED", "CANCELLED", "ARCHIVED")
+
+TASK_PRIORITIES = ("LOW", "MEDIUM", "HIGH", "URGENT")
+
+BLOCK_REASONS = (
+    "dependency",
+    "needs_user_input",
+    "missing_capability",
+    "transient_failure",
+    "external_service",
+    "review_required",
 )
 
 
@@ -250,6 +286,74 @@ class GoalEvaluationRecord:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class TaskFlowRecord:
+    id: str
+    title: str
+    objective: str
+    status: str
+    workspace_id: str
+    context_profile: str
+    state_json: dict[str, Any]
+    version: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class FlowTaskRecord:
+    id: str
+    flow_id: str
+    title: str
+    body: str
+    acceptance_json: list[dict[str, Any]] | list[str]
+    status: str
+    assignee_profile: str
+    priority: str
+    workspace_id: str
+    idempotency_key: str | None
+    max_attempts: int
+    block_reason: str | None
+    block_detail: str | None
+    block_recurrence_count: int
+    version: int
+    created_at: str
+    updated_at: str
+    parent_ids: list[str] = field(default_factory=list)
+    child_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAttemptRecord:
+    id: str
+    task_id: str
+    run_id: str
+    attempt_no: int
+    started_at: str
+    finished_at: str | None
+    outcome: str | None
+    summary: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCommentRecord:
+    id: str
+    task_id: str
+    author_type: str
+    author_id: str
+    body: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskClaimRecord:
+    task_id: str
+    owner: str
+    lease_until: str
+    heartbeat_at: str
+    heartbeat_message: str | None
+
+
 class Store:
     """Small synchronous repository with one connection per transaction."""
 
@@ -271,6 +375,7 @@ class Store:
             ).fetchone()
             if row is None:
                 connection.executescript(_SCHEMA)
+                connection.executescript(_MEMORY_SCHEMA)
                 connection.executescript(_CHANNEL_SCHEMA)
                 connection.executescript(_CONTEXT_SCHEMA)
                 connection.executescript(_SCHEDULER_SCHEMA)
@@ -282,6 +387,8 @@ class Store:
                 connection.executescript(_SKILLS_SCHEMA)
                 connection.executescript(_CONTEXT_SNAPSHOT_SCHEMA)
                 connection.executescript(_ATTACHMENT_SCHEMA)
+                connection.executescript(_TASKFLOW_SCHEMA)
+                connection.executescript(_TELEMETRY_SCHEMA)
                 self._ensure_message_index(connection)
                 connection.execute(
                     "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -403,7 +510,13 @@ class Store:
                         "ALTER TABLE conversations ADD COLUMN archived_at TEXT"
                     )
                 self._set_schema_version(connection, 17)
+                version = 17
+            if version == 17:
+                connection.executescript(_TASKFLOW_SCHEMA)
+                self._set_schema_version(connection, 18)
+                version = 18
             connection.executescript(_SCHEMA)
+            connection.executescript(_MEMORY_SCHEMA)
             connection.executescript(_CHANNEL_SCHEMA)
             connection.executescript(_CONTEXT_SCHEMA)
             connection.executescript(_SCHEDULER_SCHEMA)
@@ -415,6 +528,8 @@ class Store:
             connection.executescript(_SKILLS_SCHEMA)
             connection.executescript(_CONTEXT_SNAPSHOT_SCHEMA)
             connection.executescript(_ATTACHMENT_SCHEMA)
+            connection.executescript(_TASKFLOW_SCHEMA)
+            connection.executescript(_TELEMETRY_SCHEMA)
             self._ensure_message_index(connection)
             for ws_row in connection.execute("SELECT id FROM workspaces").fetchall():
                 self._ensure_main_conversation_tx(connection, str(ws_row["id"]))
@@ -754,6 +869,8 @@ class Store:
         requested = str(conversation["model_override"]).strip() if conversation["model_override"] else None
         resolved = requested or (str(default_row["value"]).strip() if default_row and default_row["value"] else None)
         effort = str(conversation["effort_override"]).strip() if conversation["effort_override"] else None
+        if not effort:
+            effort = "medium"
         snapshot = dict(request)
         snapshot["requested_model"] = requested
         snapshot["resolved_model"] = resolved
@@ -791,23 +908,24 @@ class Store:
             return
         now = utc_now()
         with self._connect() as connection:
-            cursor = connection.execute(
+            current = connection.execute(
+                "SELECT agy_conversation_id FROM conversations WHERE id=?",
+                (conversation_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"conversation not found: {conversation_id}")
+            existing = current[0]
+            if existing and existing != backend_id:
+                raise ValueError(
+                    f"conversation {conversation_id} already bound to "
+                    f"{existing!r}; cannot silently replace with {backend_id!r}"
+                )
+            connection.execute(
                 """UPDATE conversations
                    SET agy_conversation_id=?, updated_at=?
-                   WHERE id=? AND (agy_conversation_id IS NULL OR agy_conversation_id=?)""",
-                (backend_id, now, conversation_id, backend_id),
+                   WHERE id=?""",
+                (backend_id, now, conversation_id),
             )
-            if cursor.rowcount != 1:
-                current = connection.execute(
-                    "SELECT agy_conversation_id FROM conversations WHERE id=?",
-                    (conversation_id,),
-                ).fetchone()
-                if current is None:
-                    raise KeyError(f"conversation not found: {conversation_id}")
-                raise ValueError(
-                    "refusing to replace an existing AGY conversation binding "
-                    f"({current['agy_conversation_id']} != {backend_id})"
-                )
             connection.execute(
                 "UPDATE context_watermarks SET backend_conversation_id=?, updated_at=? "
                 "WHERE conversation_id=?",
@@ -2300,6 +2418,89 @@ class Store:
                 usage.append({"run_id": row["run_id"], **source})
         return usage
 
+    def record_memory_revision(
+        self,
+        memory_id: str,
+        *,
+        previous_content: str,
+        new_content: str,
+        reason: str = "",
+        superseded_at: str | None = None,
+        source_run_id: str | None = None,
+        source_conversation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record supersession revision history for an updated memory."""
+        now = superseded_at or utc_now()
+        rev_id = str(uuid.uuid4())
+        with self._connect() as connection:
+            # Determine current revision count
+            row = connection.execute(
+                "SELECT COUNT(*) as count FROM memory_revisions WHERE memory_id=?",
+                (memory_id,),
+            ).fetchone()
+            rev_num = (row["count"] + 1) if row else 1
+            connection.execute(
+                """INSERT INTO memory_revisions(
+                    id, memory_id, revision, previous_content, new_content,
+                    superseded_at, source_run_id, source_conversation_id, reason
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    rev_id,
+                    memory_id,
+                    rev_num,
+                    previous_content,
+                    new_content,
+                    now,
+                    source_run_id,
+                    source_conversation_id,
+                    reason,
+                ),
+            )
+        return {
+            "id": rev_id,
+            "memory_id": memory_id,
+            "revision": rev_num,
+            "previous_content": previous_content,
+            "new_content": new_content,
+            "superseded_at": now,
+            "source_run_id": source_run_id,
+            "source_conversation_id": source_conversation_id,
+            "reason": reason,
+        }
+
+    def list_memory_revisions(
+        self, memory_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """List historical memory supersession revisions."""
+        query = "SELECT * FROM memory_revisions"
+        params: list[Any] = []
+        if memory_id:
+            query += " WHERE memory_id=?"
+            params.append(memory_id)
+        query += " ORDER BY superseded_at DESC, revision DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as connection:
+            return [dict(r) for r in connection.execute(query, params).fetchall()]
+
+    def get_memory_curator_setting(self, key: str, default: str = "") -> str:
+        """Get a memory curator setting by key."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM memory_curator_settings WHERE key=?", (key,)
+            ).fetchone()
+        return str(row["value"]) if row else default
+
+    def set_memory_curator_setting(self, key: str, value: str) -> None:
+        """Set a memory curator setting by key."""
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO memory_curator_settings(key, value, updated_at)
+                   VALUES(?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (key, value, now),
+            )
+
     def sync_identity_revision(self, name: str, sha256_value: str, content: str) -> dict[str, Any]:
         now = utc_now()
         with self._connect() as connection:
@@ -2427,16 +2628,33 @@ class Store:
         active = next((item for item in reversed(manifests) if item[0].status in {"running", "queued"}), None)
         selected = active or (manifests[-1] if manifests else None)
 
-        default_budget = 128_000
+        # Resolve active model for the conversation
+        conv_model: str | None = None
+        try:
+            conv_model = self.get_conversation_model(conversation_id)
+        except Exception:
+            pass
+
+        selected_model = (
+            (selected[0].request.get("model") or selected[0].request.get("resolved_model"))
+            if selected
+            else conv_model
+        ) or conv_model
+
+        model_budget = get_model_context_limit(selected_model)
+        default_budget = model_budget
         if profile_budgets:
-            default_budget = profile_budgets.get("chat", 128_000)
+            default_budget = profile_budgets.get("chat", model_budget)
 
         def _resolve_budget(manifest: dict[str, Any]) -> int:
-            """Use the current profile budget if available, otherwise fall back to stored value."""
+            """Use the current profile budget if available, otherwise fall back to model limit."""
             if profile_budgets:
                 profile_name = str(manifest.get("profile", "chat"))
-                return profile_budgets.get(profile_name, 128_000)
-            return int(manifest.get("budget_tokens", 0) or 0) or default_budget
+                return profile_budgets.get(profile_name, model_budget)
+            stored = int(manifest.get("budget_tokens", 0) or 0)
+            if stored and stored > 128_000:
+                return stored
+            return model_budget
 
         recent: list[dict[str, Any]] = []
         for run, manifest in reversed(manifests[-limit:]):
@@ -2478,7 +2696,7 @@ class Store:
                     "recent": conv_tokens,
                 },
                 "memory_items": [], "memory_excluded": 0, "recent": recent,
-                "model": None, "context_profile": "chat",
+                "model": selected_model, "context_profile": "chat",
                 "conversation_turns": {
                     "total": total_turns,
                     "summary_range": None,
@@ -2530,7 +2748,7 @@ class Store:
         recent_last = total_turns
 
         # Model from the run request
-        model = run.request.get("model") or run.request.get("resolved_model")
+        model = run.request.get("model") or run.request.get("resolved_model") or selected_model
         context_profile = str(manifest.get("profile", "chat"))
 
         budget = _resolve_budget(manifest)
@@ -2579,6 +2797,61 @@ class Store:
             "memory_excluded": memory_excluded,
             "recent": recent,
             "manifest": manifest,
+        }
+
+    def compact_conversation(
+        self,
+        conversation_id: str,
+        *,
+        keep_recent_turns: int = 8,
+    ) -> dict[str, Any]:
+        """Manually trigger context compaction for a conversation."""
+        self.get_conversation(conversation_id)
+        messages = self.list_messages(conversation_id, limit=10000)
+        if len(messages) < 2:
+            raise ValueError("Conversation has too few messages to compact (minimum 2 messages required).")
+
+        if len(messages) <= keep_recent_turns:
+            older_messages = messages[:-1]
+        else:
+            older_messages = messages[:-keep_recent_turns]
+
+        summaries = self.list_conversation_summaries(conversation_id)
+        prior_summary = summaries[-1] if summaries else None
+        next_version = (int(prior_summary["version"]) + 1) if prior_summary else 1
+
+        from .context import _summarize_messages
+        summary_proposal = _summarize_messages(older_messages, next_version, prior_summary)
+
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            summary_id = str(uuid.uuid4())
+            connection.execute(
+                """INSERT OR REPLACE INTO conversation_summaries(
+                    id, conversation_id, version, first_message_id,
+                    last_message_id, message_count, content, sha256, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    summary_id,
+                    conversation_id,
+                    summary_proposal.version,
+                    summary_proposal.first_message_id,
+                    summary_proposal.last_message_id,
+                    summary_proposal.message_count,
+                    summary_proposal.content,
+                    summary_proposal.sha256,
+                    now,
+                ),
+            )
+
+        status = self.conversation_context_status(conversation_id)
+        return {
+            "summary_id": summary_id,
+            "version": summary_proposal.version,
+            "message_count": summary_proposal.message_count,
+            "messages_compacted_this_run": len(older_messages),
+            "content": summary_proposal.content,
+            "context_status": status,
         }
 
     def add_artifact(
@@ -3033,6 +3306,7 @@ class Store:
         conversation_id: str | None = None,
         run_id: str | None = None,
         event_type: str | None = None,
+        status: str | None = None,
         limit: int = 50,
     ) -> list["LearningEvent"]:
         clauses: list[str] = []
@@ -3046,6 +3320,9 @@ class Store:
         if event_type:
             clauses.append("event_type=?")
             params.append(event_type)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(limit)
         with self._connect() as connection:
@@ -3054,6 +3331,25 @@ class Store:
                 params,
             ).fetchall()
         return [_learning_event(row) for row in rows]
+
+    def get_learning_event(self, event_id: str) -> "LearningEvent":
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM learning_events WHERE id=?", (event_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"learning event not found: {event_id}")
+        return _learning_event(row)
+
+    def update_learning_event(self, event_id: str, *, status: str) -> None:
+        """Update status of a learning event."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE learning_events SET status=? WHERE id=?",
+                (status, event_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"learning event not found: {event_id}")
 
     # ──────────────────────────────────────────────────────────────────
     # Run Skill Context
@@ -3217,6 +3513,747 @@ class Store:
                     "INSERT INTO skills_fts(name, description) VALUES(?, ?)",
                     (row["name"], row["description"]),
                 )
+
+    # ── TaskFlow & Kanban Store Methods ─────────────────────────────────
+
+    def create_task_flow(
+        self,
+        title: str,
+        objective: str,
+        workspace_id: str,
+        *,
+        context_profile: str = "TASKFLOW_WORKER",
+        state_json: dict[str, Any] | None = None,
+        flow_id: str | None = None,
+    ) -> TaskFlowRecord:
+        now = utc_now()
+        flow_id = flow_id or f"flow_{uuid.uuid4().hex[:12]}"
+        state_str = json.dumps(state_json or {})
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO task_flows(id, title, objective, status, workspace_id, context_profile, state_json, version, created_at, updated_at) "
+                "VALUES(?, ?, ?, 'QUEUED', ?, ?, ?, 1, ?, ?)",
+                (flow_id, title, objective, workspace_id, context_profile, state_str, now, now),
+            )
+            row = connection.execute("SELECT * FROM task_flows WHERE id=?", (flow_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to create task flow {flow_id}")
+            return _task_flow(row)
+
+    def get_task_flow(self, flow_id: str) -> TaskFlowRecord | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM task_flows WHERE id=?", (flow_id,)).fetchone()
+            return _task_flow(row) if row is not None else None
+
+    def list_task_flows(
+        self, *, workspace_id: str | None = None, status: str | None = None
+    ) -> list[TaskFlowRecord]:
+        query = "SELECT * FROM task_flows WHERE 1=1"
+        params: list[Any] = []
+        if workspace_id:
+            query += " AND workspace_id=?"
+            params.append(workspace_id)
+        if status:
+            query += " AND status=?"
+            params.append(status.upper())
+        query += " ORDER BY updated_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+            return [_task_flow(r) for r in rows]
+
+    def update_task_flow_status(
+        self,
+        flow_id: str,
+        status: str,
+        *,
+        expected_version: int | None = None,
+        state_json: dict[str, Any] | None = None,
+    ) -> TaskFlowRecord:
+        now = utc_now()
+        status = status.upper().strip()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM task_flows WHERE id=?", (flow_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"task flow {flow_id} not found")
+            curr_ver = int(current["version"])
+            if expected_version is not None and curr_ver != expected_version:
+                raise VersionConflict(f"expected version {expected_version}, got {curr_ver}")
+
+            new_ver = curr_ver + 1
+            if state_json is not None:
+                connection.execute(
+                    "UPDATE task_flows SET status=?, state_json=?, version=?, updated_at=? WHERE id=?",
+                    (status, json.dumps(state_json), new_ver, now, flow_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE task_flows SET status=?, version=?, updated_at=? WHERE id=?",
+                    (status, new_ver, now, flow_id),
+                )
+            row = connection.execute("SELECT * FROM task_flows WHERE id=?", (flow_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to update task flow {flow_id}")
+            return _task_flow(row)
+
+    def update_task_flow(
+        self,
+        flow_id: str,
+        *,
+        title: str | None = None,
+        objective: str | None = None,
+        context_profile: str | None = None,
+        state_json: dict[str, Any] | None = None,
+        expected_version: int | None = None,
+    ) -> TaskFlowRecord:
+        now = utc_now()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM task_flows WHERE id=?", (flow_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"task flow {flow_id} not found")
+            curr_ver = int(current["version"])
+            if expected_version is not None and curr_ver != expected_version:
+                raise VersionConflict(f"expected version {expected_version}, got {curr_ver}")
+
+            new_title = title if title is not None else current["title"]
+            new_obj = objective if objective is not None else current["objective"]
+            new_profile = context_profile if context_profile is not None else current["context_profile"]
+            new_state = json.dumps(state_json) if state_json is not None else current["state_json"]
+            new_ver = curr_ver + 1
+
+            connection.execute(
+                "UPDATE task_flows SET title=?, objective=?, context_profile=?, state_json=?, version=?, updated_at=? WHERE id=?",
+                (new_title, new_obj, new_profile, new_state, new_ver, now, flow_id),
+            )
+            row = connection.execute("SELECT * FROM task_flows WHERE id=?", (flow_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to update task flow {flow_id}")
+            return _task_flow(row)
+
+    def delete_task_flow(self, flow_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM task_flows WHERE id=?", (flow_id,))
+            return cursor.rowcount > 0
+
+    # ── Flow Tasks CRUD ────────────────────────────────────────────────
+
+    def create_flow_task(
+        self,
+        flow_id: str,
+        title: str,
+        body: str,
+        workspace_id: str,
+        *,
+        acceptance_criteria: list[dict[str, Any]] | list[str] | None = None,
+        priority: str = "MEDIUM",
+        assignee_profile: str = "default",
+        idempotency_key: str | None = None,
+        max_attempts: int = 3,
+        parent_ids: Sequence[str] | None = None,
+        task_id: str | None = None,
+    ) -> FlowTaskRecord:
+        now = utc_now()
+        task_id = task_id or f"task_{uuid.uuid4().hex[:12]}"
+        acceptance_str = json.dumps(acceptance_criteria or [])
+        priority = priority.upper().strip()
+        status = "TODO"
+
+        with self._connect() as connection:
+            # Check idempotency within flow
+            if idempotency_key:
+                existing = connection.execute(
+                    "SELECT * FROM flow_tasks WHERE flow_id=? AND idempotency_key=?",
+                    (flow_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    parents = [
+                        str(r["parent_task_id"])
+                        for r in connection.execute(
+                            "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                            (str(existing["id"]),),
+                        ).fetchall()
+                    ]
+                    children = [
+                        str(r["child_task_id"])
+                        for r in connection.execute(
+                            "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                            (str(existing["id"]),),
+                        ).fetchall()
+                    ]
+                    return _flow_task(existing, parent_ids=parents, child_ids=children)
+
+            connection.execute(
+                "INSERT INTO flow_tasks(id, flow_id, title, body, acceptance_json, status, assignee_profile, priority, workspace_id, idempotency_key, max_attempts, version, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (task_id, flow_id, title, body, acceptance_str, status, assignee_profile, priority, workspace_id, idempotency_key, max_attempts, now, now),
+            )
+
+            # Insert parent dependencies
+            if parent_ids:
+                for p_id in parent_ids:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO task_dependencies(parent_task_id, child_task_id) VALUES(?, ?)",
+                        (p_id, task_id),
+                    )
+
+            row = connection.execute("SELECT * FROM flow_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to create flow task {task_id}")
+            return _flow_task(row, parent_ids=list(parent_ids or []))
+
+    def find_flow_task_by_idempotency(self, flow_id: str, idempotency_key: str) -> FlowTaskRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM flow_tasks WHERE flow_id=? AND idempotency_key=?",
+                (flow_id, idempotency_key),
+            ).fetchone()
+            if row is None:
+                return None
+            parents = [
+                str(r["parent_task_id"])
+                for r in connection.execute(
+                    "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                    (str(row["id"]),),
+                ).fetchall()
+            ]
+            children = [
+                str(r["child_task_id"])
+                for r in connection.execute(
+                    "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                    (str(row["id"]),),
+                ).fetchall()
+            ]
+            return _flow_task(row, parent_ids=parents, child_ids=children)
+
+    def get_flow_task(self, task_id: str) -> FlowTaskRecord | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM flow_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                return None
+            parents = [
+                str(r["parent_task_id"])
+                for r in connection.execute(
+                    "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            children = [
+                str(r["child_task_id"])
+                for r in connection.execute(
+                    "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            return _flow_task(row, parent_ids=parents, child_ids=children)
+
+    def list_flow_tasks(
+        self, *, flow_id: str | None = None, status: str | None = None
+    ) -> list[FlowTaskRecord]:
+        query = "SELECT * FROM flow_tasks WHERE 1=1"
+        params: list[Any] = []
+        if flow_id:
+            query += " AND flow_id=?"
+            params.append(flow_id)
+        if status:
+            query += " AND status=?"
+            params.append(status.upper())
+        query += " ORDER BY created_at ASC"
+
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+            tasks: list[FlowTaskRecord] = []
+            for r in rows:
+                t_id = str(r["id"])
+                parents = [
+                    str(p["parent_task_id"])
+                    for p in connection.execute(
+                        "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                        (t_id,),
+                    ).fetchall()
+                ]
+                children = [
+                    str(c["child_task_id"])
+                    for c in connection.execute(
+                        "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                        (t_id,),
+                    ).fetchall()
+                ]
+                tasks.append(_flow_task(r, parent_ids=parents, child_ids=children))
+            return tasks
+
+    def update_flow_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        expected_version: int | None = None,
+        block_reason: str | None = None,
+        block_detail: str | None = None,
+        increment_block_recurrence: bool = False,
+    ) -> FlowTaskRecord:
+        now = utc_now()
+        status = status.upper().strip()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM flow_tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"flow task {task_id} not found")
+            curr_ver = int(current["version"])
+            if expected_version is not None and curr_ver != expected_version:
+                raise VersionConflict(f"expected version {expected_version}, got {curr_ver}")
+
+            new_ver = curr_ver + 1
+            curr_count = int(current["block_recurrence_count"] or 0)
+            new_count = curr_count + 1 if increment_block_recurrence else (0 if status == "DONE" else curr_count)
+
+            connection.execute(
+                "UPDATE flow_tasks SET status=?, block_reason=?, block_detail=?, block_recurrence_count=?, version=?, updated_at=? WHERE id=?",
+                (status, block_reason, block_detail, new_count, new_ver, now, task_id),
+            )
+            row = connection.execute("SELECT * FROM flow_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to update flow task {task_id}")
+            parents = [
+                str(r["parent_task_id"])
+                for r in connection.execute(
+                    "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            children = [
+                str(r["child_task_id"])
+                for r in connection.execute(
+                    "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            return _flow_task(row, parent_ids=parents, child_ids=children)
+
+    def update_flow_task(
+        self,
+        task_id: str,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        acceptance_criteria: list[dict[str, Any]] | list[str] | None = None,
+        priority: str | None = None,
+        assignee_profile: str | None = None,
+        max_attempts: int | None = None,
+        expected_version: int | None = None,
+    ) -> FlowTaskRecord:
+        now = utc_now()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM flow_tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"flow task {task_id} not found")
+            curr_ver = int(current["version"])
+            if expected_version is not None and curr_ver != expected_version:
+                raise VersionConflict(f"expected version {expected_version}, got {curr_ver}")
+
+            new_title = title if title is not None else current["title"]
+            new_body = body if body is not None else current["body"]
+            new_acc = json.dumps(acceptance_criteria) if acceptance_criteria is not None else current["acceptance_json"]
+            new_priority = priority.upper().strip() if priority is not None else current["priority"]
+            new_assignee = assignee_profile if assignee_profile is not None else current["assignee_profile"]
+            new_max = max_attempts if max_attempts is not None else current["max_attempts"]
+            new_ver = curr_ver + 1
+
+            connection.execute(
+                "UPDATE flow_tasks SET title=?, body=?, acceptance_json=?, priority=?, assignee_profile=?, max_attempts=?, version=?, updated_at=? WHERE id=?",
+                (new_title, new_body, new_acc, new_priority, new_assignee, new_max, new_ver, now, task_id),
+            )
+            row = connection.execute("SELECT * FROM flow_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to update flow task {task_id}")
+            parents = [
+                str(r["parent_task_id"])
+                for r in connection.execute(
+                    "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            children = [
+                str(r["child_task_id"])
+                for r in connection.execute(
+                    "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            return _flow_task(row, parent_ids=parents, child_ids=children)
+
+    def delete_flow_task(self, task_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM flow_tasks WHERE id=?", (task_id,))
+            return cursor.rowcount > 0
+
+    # ── Dependencies ──────────────────────────────────────────────────
+
+    def add_task_dependency(self, parent_task_id: str, child_task_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO task_dependencies(parent_task_id, child_task_id) VALUES(?, ?)",
+                (parent_task_id, child_task_id),
+            )
+
+    def remove_task_dependency(self, parent_task_id: str, child_task_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM task_dependencies WHERE parent_task_id=? AND child_task_id=?",
+                (parent_task_id, child_task_id),
+            )
+
+    def get_task_dependencies(self, task_id: str) -> tuple[list[str], list[str]]:
+        with self._connect() as connection:
+            parents = [
+                str(r["parent_task_id"])
+                for r in connection.execute(
+                    "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            children = [
+                str(r["child_task_id"])
+                for r in connection.execute(
+                    "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                    (task_id,),
+                ).fetchall()
+            ]
+            return parents, children
+
+    def get_all_flow_dependencies(self, flow_id: str) -> list[tuple[str, str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT d.parent_task_id, d.child_task_id FROM task_dependencies d "
+                "JOIN flow_tasks t ON t.id=d.parent_task_id WHERE t.flow_id=?",
+                (flow_id,),
+            ).fetchall()
+            return [(str(r["parent_task_id"]), str(r["child_task_id"])) for r in rows]
+
+    # ── Comments ──────────────────────────────────────────────────────
+
+    def add_task_comment(
+        self,
+        task_id: str,
+        author_type: str,
+        author_id: str,
+        body: str,
+        *,
+        comment_id: str | None = None,
+    ) -> TaskCommentRecord:
+        now = utc_now()
+        comment_id = comment_id or f"comment_{uuid.uuid4().hex[:12]}"
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO task_comments(id, task_id, author_type, author_id, body, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (comment_id, task_id, author_type, author_id, body, now),
+            )
+            row = connection.execute("SELECT * FROM task_comments WHERE id=?", (comment_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to add task comment {comment_id}")
+            return _task_comment(row)
+
+    def list_task_comments(self, task_id: str) -> list[TaskCommentRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_comments WHERE task_id=? ORDER BY created_at ASC",
+                (task_id,),
+            ).fetchall()
+            return [_task_comment(r) for r in rows]
+
+    def delete_task_comment(self, comment_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM task_comments WHERE id=?", (comment_id,))
+            return cursor.rowcount > 0
+
+    # ── Attempts ──────────────────────────────────────────────────────
+
+    def record_task_attempt(
+        self,
+        task_id: str,
+        run_id: str,
+        attempt_no: int,
+        started_at: str,
+        *,
+        finished_at: str | None = None,
+        outcome: str | None = None,
+        summary: str | None = None,
+        attempt_id: str | None = None,
+    ) -> TaskAttemptRecord:
+        attempt_id = attempt_id or f"attempt_{uuid.uuid4().hex[:12]}"
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO task_attempts(id, task_id, run_id, attempt_no, started_at, finished_at, outcome, summary) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, task_id, run_id, attempt_no, started_at, finished_at, outcome, summary),
+            )
+            row = connection.execute("SELECT * FROM task_attempts WHERE id=?", (attempt_id,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"failed to record task attempt {attempt_id}")
+            return _task_attempt(row)
+
+    def update_task_attempt(
+        self,
+        attempt_id: str,
+        *,
+        finished_at: str | None = None,
+        outcome: str | None = None,
+        summary: str | None = None,
+    ) -> TaskAttemptRecord | None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE task_attempts SET finished_at=?, outcome=?, summary=? WHERE id=?",
+                (finished_at, outcome, summary, attempt_id),
+            )
+            row = connection.execute("SELECT * FROM task_attempts WHERE id=?", (attempt_id,)).fetchone()
+            return _task_attempt(row) if row is not None else None
+
+    def list_task_attempts(self, task_id: str) -> list[TaskAttemptRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_attempts WHERE task_id=? ORDER BY attempt_no ASC",
+                (task_id,),
+            ).fetchall()
+            return [_task_attempt(r) for r in rows]
+
+    # ── Claims & Leases ───────────────────────────────────────────────
+
+    def claim_task(self, task_id: str, owner: str, lease_seconds: int = 300) -> bool:
+        now = utc_now()
+        lease_until = _add_seconds(now, lease_seconds)
+        with self._connect() as connection:
+            task = connection.execute("SELECT status FROM flow_tasks WHERE id=?", (task_id,)).fetchone()
+            if not task or task["status"] != "READY":
+                return False
+            claim = connection.execute("SELECT lease_until FROM task_claims WHERE task_id=?", (task_id,)).fetchone()
+            if claim and claim["lease_until"] >= now:
+                return False
+
+            connection.execute(
+                "INSERT INTO task_claims(task_id, owner, lease_until, heartbeat_at) "
+                "VALUES(?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET "
+                "owner=excluded.owner, lease_until=excluded.lease_until, heartbeat_at=excluded.heartbeat_at",
+                (task_id, owner, lease_until, now),
+            )
+            connection.execute(
+                "UPDATE flow_tasks SET status='RUNNING', updated_at=? WHERE id=?",
+                (now, task_id),
+            )
+            return True
+
+    def claim_ready_tasks(
+        self, owner: str, limit: int = 4, lease_seconds: int = 300
+    ) -> list[FlowTaskRecord]:
+        now = utc_now()
+        lease_until = _add_seconds(now, lease_seconds)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT t.* FROM flow_tasks t "
+                "JOIN task_flows f ON f.id=t.flow_id "
+                "LEFT JOIN task_claims c ON c.task_id=t.id "
+                "WHERE t.status='READY' AND f.status IN ('RUNNING', 'QUEUED') "
+                "AND (c.task_id IS NULL OR c.lease_until < ?) "
+                "ORDER BY "
+                "CASE t.priority WHEN 'URGENT' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 ELSE 4 END, "
+                "t.created_at ASC LIMIT ?",
+                (now, limit),
+            ).fetchall()
+
+            claimed: list[FlowTaskRecord] = []
+            for r in rows:
+                t_id = str(r["id"])
+                connection.execute(
+                    "INSERT INTO task_claims(task_id, owner, lease_until, heartbeat_at) "
+                    "VALUES(?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET "
+                    "owner=excluded.owner, lease_until=excluded.lease_until, heartbeat_at=excluded.heartbeat_at",
+                    (t_id, owner, lease_until, now),
+                )
+                connection.execute(
+                    "UPDATE flow_tasks SET status='RUNNING', updated_at=? WHERE id=?",
+                    (now, t_id),
+                )
+                parents = [
+                    str(p["parent_task_id"])
+                    for p in connection.execute(
+                        "SELECT parent_task_id FROM task_dependencies WHERE child_task_id=?",
+                        (t_id,),
+                    ).fetchall()
+                ]
+                children = [
+                    str(c["child_task_id"])
+                    for c in connection.execute(
+                        "SELECT child_task_id FROM task_dependencies WHERE parent_task_id=?",
+                        (t_id,),
+                    ).fetchall()
+                ]
+                claimed.append(_flow_task(r, parent_ids=parents, child_ids=children))
+            return claimed
+
+    def release_task_claim(self, task_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM task_claims WHERE task_id=?", (task_id,))
+            return cursor.rowcount > 0
+
+    def heartbeat_task_claim(
+        self,
+        task_id: str,
+        owner: str,
+        *,
+        message: str | None = None,
+        extend_seconds: int = 300,
+    ) -> bool:
+        now = utc_now()
+        lease_until = _add_seconds(now, extend_seconds)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE task_claims SET lease_until=?, heartbeat_at=?, heartbeat_message=? "
+                "WHERE task_id=? AND owner=?",
+                (lease_until, now, message, task_id, owner),
+            )
+            return cursor.rowcount > 0
+
+    def get_task_claim(self, task_id: str) -> TaskClaimRecord | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM task_claims WHERE task_id=?", (task_id,)).fetchone()
+            return _task_claim(row) if row is not None else None
+
+    def list_expired_task_claims(self, now: str | None = None) -> list[TaskClaimRecord]:
+        now_ts = now or utc_now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_claims WHERE lease_until < ?", (now_ts,)
+            ).fetchall()
+            return [_task_claim(r) for r in rows]
+
+    # ── Task Artifact Links ───────────────────────────────────────────
+
+    def link_task_artifact(self, task_id: str, artifact_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO task_artifacts(task_id, artifact_id) VALUES(?, ?)",
+                (task_id, artifact_id),
+            )
+
+    def list_task_artifacts(self, task_id: str) -> list[Artifact]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT a.* FROM artifacts a JOIN task_artifacts ta ON ta.artifact_id=a.id WHERE ta.task_id=?",
+                (task_id,),
+            ).fetchall()
+            return [_artifact(r) for r in rows]
+
+    # ── Progress Engine & Telemetry Persistence ────────────────────────
+
+    def save_progress_snapshot(self, snapshot_dict: dict[str, Any]) -> None:
+        run_id = snapshot_dict["run_id"]
+        status = snapshot_dict.get("status", "running")
+        current_op = snapshot_dict.get("active_operation_id")
+        current_label = snapshot_dict.get("current_label")
+        current_detail = snapshot_dict.get("current_detail")
+        started_at = snapshot_dict.get("started_at", "")
+        last_activity = snapshot_dict.get("last_activity_at", "")
+        last_output = snapshot_dict.get("last_output_at")
+        last_progress = snapshot_dict.get("last_progress_at")
+        version = int(snapshot_dict.get("version", 1))
+        snapshot_json = json.dumps(snapshot_dict)
+        now_str = datetime.now(UTC).isoformat()
+
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO run_progress(
+                    run_id, status, current_operation_id, current_label, current_detail,
+                    started_at, last_activity_at, last_output_at, last_progress_at,
+                    snapshot_json, version, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status=excluded.status,
+                    current_operation_id=excluded.current_operation_id,
+                    current_label=excluded.current_label,
+                    current_detail=excluded.current_detail,
+                    last_activity_at=excluded.last_activity_at,
+                    last_output_at=excluded.last_output_at,
+                    last_progress_at=excluded.last_progress_at,
+                    snapshot_json=excluded.snapshot_json,
+                    version=excluded.version,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    run_id, status, current_op, current_label, current_detail,
+                    started_at, last_activity, last_output, last_progress,
+                    snapshot_json, version, now_str,
+                ),
+            )
+
+    def get_progress_snapshot(self, run_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json FROM run_progress WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["snapshot_json"])
+
+    def append_telemetry_event(
+        self,
+        *,
+        run_id: str,
+        event_id: str,
+        event_type: str,
+        source: str,
+        operation_id: str | None = None,
+        parent_operation_id: str | None = None,
+        sequence: int = 0,
+        tool: str | None = None,
+        data: dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> int:
+        now_str = created_at or datetime.now(UTC).isoformat()
+        data_json = json.dumps(data or {})
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO run_telemetry_events(
+                    run_id, event_id, operation_id, parent_operation_id, sequence,
+                    event_type, source, tool, created_at, data_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, event_id, operation_id, parent_operation_id, sequence,
+                    event_type, source, tool, now_str, data_json,
+                ),
+            )
+            return cursor.lastrowid
+
+    def list_telemetry_events(
+        self, run_id: str, since_sequence: int = 0, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM run_telemetry_events
+                   WHERE run_id=? AND sequence > ?
+                   ORDER BY sequence ASC LIMIT ?""",
+                (run_id, since_sequence, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "run_id": r["run_id"],
+                "event_id": r["event_id"],
+                "operation_id": r["operation_id"],
+                "parent_operation_id": r["parent_operation_id"],
+                "sequence": r["sequence"],
+                "type": r["event_type"],
+                "source": r["source"],
+                "tool": r["tool"],
+                "timestamp": r["created_at"],
+                "data": json.loads(r["data_json"]),
+            }
+            for r in rows
+        ]
 
 
 def _conversation(row: sqlite3.Row) -> Conversation:
@@ -3386,6 +4423,84 @@ def _learning_event(row: sqlite3.Row) -> "LearningEvent":
         summary=str(row["summary"]),
         reviewer_model=str(row["reviewer_model"]),
         created_at=str(row["created_at"]),
+    )
+
+
+def _task_flow(row: sqlite3.Row) -> TaskFlowRecord:
+    return TaskFlowRecord(
+        id=str(row["id"]),
+        title=str(row["title"]),
+        objective=str(row["objective"]),
+        status=str(row["status"]),
+        workspace_id=str(row["workspace_id"]),
+        context_profile=str(row["context_profile"]),
+        state_json=json.loads(row["state_json"]) if row["state_json"] else {},
+        version=int(row["version"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _flow_task(
+    row: sqlite3.Row,
+    parent_ids: list[str] | None = None,
+    child_ids: list[str] | None = None,
+) -> FlowTaskRecord:
+    acc = json.loads(row["acceptance_json"]) if row["acceptance_json"] else []
+    return FlowTaskRecord(
+        id=str(row["id"]),
+        flow_id=str(row["flow_id"]),
+        title=str(row["title"]),
+        body=str(row["body"]),
+        acceptance_json=acc,
+        status=str(row["status"]),
+        assignee_profile=str(row["assignee_profile"]),
+        priority=str(row["priority"]),
+        workspace_id=str(row["workspace_id"]),
+        idempotency_key=row["idempotency_key"],
+        max_attempts=int(row["max_attempts"]),
+        block_reason=row["block_reason"],
+        block_detail=row["block_detail"],
+        block_recurrence_count=int(row["block_recurrence_count"] or 0),
+        version=int(row["version"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        parent_ids=parent_ids or [],
+        child_ids=child_ids or [],
+    )
+
+
+def _task_attempt(row: sqlite3.Row) -> TaskAttemptRecord:
+    return TaskAttemptRecord(
+        id=str(row["id"]),
+        task_id=str(row["task_id"]),
+        run_id=str(row["run_id"]),
+        attempt_no=int(row["attempt_no"]),
+        started_at=str(row["started_at"]),
+        finished_at=row["finished_at"],
+        outcome=row["outcome"],
+        summary=row["summary"],
+    )
+
+
+def _task_comment(row: sqlite3.Row) -> TaskCommentRecord:
+    return TaskCommentRecord(
+        id=str(row["id"]),
+        task_id=str(row["task_id"]),
+        author_type=str(row["author_type"]),
+        author_id=str(row["author_id"]),
+        body=str(row["body"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _task_claim(row: sqlite3.Row) -> TaskClaimRecord:
+    return TaskClaimRecord(
+        task_id=str(row["task_id"]),
+        owner=str(row["owner"]),
+        lease_until=str(row["lease_until"]),
+        heartbeat_at=str(row["heartbeat_at"]),
+        heartbeat_message=row["heartbeat_message"],
     )
 
 
@@ -3567,6 +4682,24 @@ CREATE TRIGGER IF NOT EXISTS memories_after_update AFTER UPDATE ON memories BEGI
     INSERT INTO memories_fts(rowid, content, source)
     VALUES (new.rowid, new.content, new.source);
 END;
+
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 1,
+    previous_content TEXT NOT NULL,
+    new_content TEXT NOT NULL,
+    superseded_at TEXT NOT NULL,
+    source_run_id TEXT,
+    source_conversation_id TEXT,
+    reason TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS memory_curator_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 _CHANNEL_SCHEMA = """
@@ -4069,4 +5202,122 @@ CREATE INDEX IF NOT EXISTS attachments_conversation
     ON attachments(conversation_id);
 CREATE INDEX IF NOT EXISTS attachments_workspace
     ON attachments(workspace_id);
+"""
+
+
+_TASKFLOW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_flows (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('QUEUED', 'RUNNING', 'WAITING', 'BLOCKED', 'SUCCEEDED', 'FAILED', 'CANCELLED')),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    context_profile TEXT NOT NULL DEFAULT 'TASKFLOW_WORKER',
+    state_json TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_flows_status ON task_flows(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS task_flows_workspace ON task_flows(workspace_id);
+
+CREATE TABLE IF NOT EXISTS flow_tasks (
+    id TEXT PRIMARY KEY,
+    flow_id TEXT NOT NULL REFERENCES task_flows(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    acceptance_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL CHECK(status IN ('TRIAGE', 'TODO', 'READY', 'RUNNING', 'BLOCKED', 'DONE', 'FAILED', 'CANCELLED', 'ARCHIVED')),
+    assignee_profile TEXT NOT NULL DEFAULT 'default',
+    priority TEXT NOT NULL DEFAULT 'MEDIUM' CHECK(priority IN ('LOW', 'MEDIUM', 'HIGH', 'URGENT')),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    idempotency_key TEXT,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    block_reason TEXT CHECK(block_reason IS NULL OR block_reason IN ('dependency', 'needs_user_input', 'missing_capability', 'transient_failure', 'external_service', 'review_required')),
+    block_detail TEXT,
+    block_recurrence_count INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS flow_tasks_flow_status ON flow_tasks(flow_id, status);
+CREATE INDEX IF NOT EXISTS flow_tasks_status ON flow_tasks(status);
+CREATE UNIQUE INDEX IF NOT EXISTS flow_tasks_flow_idempotency ON flow_tasks(flow_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    parent_task_id TEXT NOT NULL REFERENCES flow_tasks(id) ON DELETE CASCADE,
+    child_task_id TEXT NOT NULL REFERENCES flow_tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (parent_task_id, child_task_id)
+);
+CREATE INDEX IF NOT EXISTS task_dependencies_child ON task_dependencies(child_task_id);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES flow_tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    attempt_no INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT CHECK(outcome IS NULL OR outcome IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'BLOCKED')),
+    summary TEXT
+);
+CREATE INDEX IF NOT EXISTS task_attempts_task ON task_attempts(task_id, attempt_no);
+CREATE INDEX IF NOT EXISTS task_attempts_run ON task_attempts(run_id);
+
+CREATE TABLE IF NOT EXISTS task_comments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES flow_tasks(id) ON DELETE CASCADE,
+    author_type TEXT NOT NULL CHECK(author_type IN ('user', 'agent', 'system')),
+    author_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_comments_task ON task_comments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS task_claims (
+    task_id TEXT PRIMARY KEY REFERENCES flow_tasks(id) ON DELETE CASCADE,
+    owner TEXT NOT NULL,
+    lease_until TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    heartbeat_message TEXT
+);
+CREATE INDEX IF NOT EXISTS task_claims_lease ON task_claims(lease_until);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    task_id TEXT NOT NULL REFERENCES flow_tasks(id) ON DELETE CASCADE,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, artifact_id)
+);
+"""
+
+_TELEMETRY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_telemetry_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    operation_id TEXT,
+    parent_operation_id TEXT,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    tool TEXT,
+    created_at TEXT NOT NULL,
+    data_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_telemetry_run_seq ON run_telemetry_events (run_id, sequence);
+
+CREATE TABLE IF NOT EXISTS run_progress (
+    run_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    current_operation_id TEXT,
+    current_label TEXT,
+    current_detail TEXT,
+    started_at TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL,
+    last_output_at TEXT,
+    last_progress_at TEXT,
+    snapshot_json TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """

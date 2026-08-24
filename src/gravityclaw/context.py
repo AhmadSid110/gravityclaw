@@ -50,10 +50,14 @@ class ContextProfile:
 
 
 PROFILES: Mapping[str, ContextProfile] = {
-    "chat": ContextProfile("chat", 128_000, 768_000, 16_000, 64_000, 96_000, 16_000, 16_000),
-    "coding": ContextProfile("coding", 128_000, 768_000, 16_000, 64_000, 96_000, 16_000, 16_000),
-    "heartbeat": ContextProfile("heartbeat", 128_000, 384_000, 8_000, 64_000, 60_000, 12_000, 12_000),
-    "scheduled": ContextProfile("scheduled", 128_000, 768_000, 12_000, 64_000, 60_000, 12_000, 12_000),
+    "chat": ContextProfile("chat", 1_000_000, 6_000_000, 32_000, 256_000, 768_000, 64_000, 32_000),
+    "coding": ContextProfile("coding", 1_000_000, 6_000_000, 32_000, 256_000, 768_000, 64_000, 32_000),
+    "heartbeat": ContextProfile("heartbeat", 500_000, 3_000_000, 16_000, 128_000, 384_000, 32_000, 16_000),
+    "scheduled": ContextProfile("scheduled", 1_000_000, 6_000_000, 24_000, 256_000, 768_000, 48_000, 24_000),
+    "taskflow_worker": ContextProfile("taskflow_worker", 1_000_000, 6_000_000, 16_000, 256_000, 768_000, 32_000, 16_000),
+    "taskflow": ContextProfile("taskflow", 1_000_000, 6_000_000, 16_000, 256_000, 768_000, 32_000, 16_000),
+    "TASKFLOW_WORKER": ContextProfile("TASKFLOW_WORKER", 1_000_000, 6_000_000, 16_000, 256_000, 768_000, 32_000, 16_000),
+    "TASKFLOW": ContextProfile("TASKFLOW", 1_000_000, 6_000_000, 16_000, 256_000, 768_000, 32_000, 16_000),
 }
 
 

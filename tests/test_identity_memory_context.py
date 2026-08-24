@@ -198,7 +198,7 @@ class SchemaMigrationTests(unittest.TestCase):
                     row["name"]
                     for row in reopened.execute("PRAGMA table_info(messages)").fetchall()
                 }
-            self.assertEqual(version, "17")
+            self.assertEqual(version, "18")
             self.assertIn("source_run_id", columns)
             self.assertEqual(store.recent_messages("c")[0].content, "preserved")
 
