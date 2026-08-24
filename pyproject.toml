@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
 ]
 
 [project.scripts]
@@ -34,3 +35,4 @@ packages = ["src/gravityclaw"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

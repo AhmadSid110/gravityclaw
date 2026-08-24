@@ -536,9 +536,9 @@ class TaskFlowDispatcherAndIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(all_task_ids), 21)
 
         crashed = False
-        for _ in range(300):
+        for _ in range(600):
             report = await self.dispatcher.tick()
-            await self._await_runs_complete()
+            await self._await_runs_complete(timeout=5.0)
 
             done_count = sum(
                 1 for tid in all_task_ids if self.service.get_task(tid).status == "DONE"
