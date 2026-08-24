@@ -47,9 +47,9 @@ You authenticate AGY once on your machine using Google's official OAuth flow. Gr
 
 ---
 
-## Terms of Service Notice
+## Antigravity Usage Notice
 
-Google's [Antigravity Additional Terms of Service](https://antigravity.google/terms) restrict accessing the service through third-party software. GravityClaw runs the official binary directly and does not proxy, relay, or intercept API traffic — but users should review Google's terms and make their own assessment of compliance. This project is provided as-is under MIT license; the authors make no legal guarantees regarding third-party service terms.
+GravityClaw invokes Google's official, unmodified Antigravity CLI as a local subprocess. Authentication remains entirely within `agy`; GravityClaw does not extract or reuse Antigravity OAuth credentials, call private Antigravity backend APIs, proxy model requests, or circumvent quotas. A [Google AI Developers Forum discussion](https://ai.google.dev/forum) addressing this exact integration pattern has indicated that invoking the official CLI this way is acceptable. However, Google's published [Antigravity Terms](https://antigravity.google/terms) broadly restrict third-party access, and forum guidance is not a contractual guarantee. Users should review the current Terms for themselves.
 
 ---
 
