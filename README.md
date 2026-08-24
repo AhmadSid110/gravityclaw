@@ -11,7 +11,44 @@
 
 GravityClaw is a self-hosted orchestration platform that gives AI agents persistent identity, long-term memory, durable task execution, and real-world integrations — all under your control, on your hardware.
 
-It wraps Google's [Antigravity CLI](https://antigravity.dev) with everything a personal agent actually needs to be *useful* over time: context that survives sessions, scheduling that runs without you, and channels that meet you where you are.
+It runs Google's official [Antigravity CLI](https://antigravity.dev) locally as the reasoning engine, adding everything a personal agent actually needs to be *useful* over time: context that survives sessions, scheduling that runs without you, and channels that meet you where you are.
+
+---
+
+## Not a Proxy. Not an API Wrapper.
+
+Let's be clear about what GravityClaw **is** and **isn't**:
+
+| | GravityClaw | Proxy/Wrapper Services |
+|---|---|---|
+| **Your credentials** | Stay on your machine. Never transmitted anywhere. | Often stored on third-party servers |
+| **Model access** | Runs the official AGY binary directly — same as typing `agy` in your terminal | Intercepts API calls through their infrastructure |
+| **Data path** | You ↔ Google. Direct. No middleman. | You ↔ Their servers ↔ Google |
+| **Multi-user** | Single-user, single-machine, personal use | Built to serve many users through one API key |
+| **What it adds** | Memory, scheduling, channels *around* AGY — never *between* you and Google | Adds a billing/routing layer *between* you and the model |
+
+GravityClaw is an orchestration layer that wraps the **official, unmodified AGY binary** the same way a terminal multiplexer wraps your shell, or a cron job wraps a CLI tool. It doesn't intercept, modify, or relay your authentication. It doesn't expose Google's API to third parties. It doesn't pool tokens or resell access.
+
+**Your AGY subscription (Pro or Ultra) works exactly as Google intended** — GravityClaw just makes the agent persistent, scheduled, and reachable.
+
+---
+
+## Works With Your Google AI Plan
+
+GravityClaw is designed for users with their own Google AI subscription:
+
+- **Google AI Pro** ($20/month) — full Antigravity CLI access with generous quotas
+- **Google AI Ultra** ($100–200/month) — 20× higher usage limits, priority access
+
+You authenticate AGY once on your machine using Google's official OAuth flow. GravityClaw bind-mounts those credentials read-only into isolated containers — it never copies, exports, or transmits them. Your usage counts against your personal quota just like running AGY directly.
+
+> **No subscription required to try GravityClaw itself** — the platform is free and open source. You only need a Google AI plan for the AGY reasoning engine.
+
+---
+
+## Terms of Service Notice
+
+Google's [Antigravity Additional Terms of Service](https://antigravity.google/terms) restrict accessing the service through third-party software. GravityClaw runs the official binary directly and does not proxy, relay, or intercept API traffic — but users should review Google's terms and make their own assessment of compliance. This project is provided as-is under MIT license; the authors make no legal guarantees regarding third-party service terms.
 
 ---
 
@@ -43,6 +80,7 @@ Most agent frameworks give you a stateless loop: prompt in, response out, amnesi
 - **Channel integrations** — Telegram today, extensible to any messaging platform
 - **Token auth** — bearer-token control plane with cookie-based web sessions (tokens never hit browser storage)
 - **One-command deploy** — install script, Docker Compose, or manual setup — your choice
+- **No vendor lock-in** — your data, your machine, your rules. Migrate anytime.
 
 ---
 
@@ -166,6 +204,20 @@ openssl rand -base64 36 > ~/.config/gravityclaw/secrets/control-token
 
 ---
 
+## Privacy & Data Sovereignty
+
+GravityClaw keeps everything local. Nothing phones home.
+
+- **No telemetry** — we don't collect usage data, crash reports, or analytics
+- **No cloud dependencies** — runs entirely on your hardware (or your VPS)
+- **No account required** — no sign-up, no SaaS backend, no "free tier" upsell
+- **Memory stays on-disk** — SQLite database under your control, your backups, your encryption
+- **Credentials never leave your machine** — AGY auth is bind-mounted read-only, never copied or transmitted
+
+Your conversations, memories, tasks, and identity files belong to you. Full stop.
+
+---
+
 ## Security
 
 Self-hosted means you own your data. GravityClaw takes that seriously:
@@ -176,6 +228,7 @@ Self-hosted means you own your data. GravityClaw takes that seriously:
 - All secrets stored as files with `0600` permissions
 - Port 8787 should **never** be exposed directly — use the included Caddy profile or your own reverse proxy
 - Identity and memory files are protected from model-execution overwrites
+- No network egress from the orchestration layer — only the AGY binary talks to Google
 
 ---
 
@@ -187,6 +240,17 @@ Self-hosted means you own your data. GravityClaw takes that seriously:
 | Node.js | ≥ 18 (web console build) |
 | Podman | Rootless (container mode) |
 | AGY | Authenticated on host |
+| Google AI Plan | Pro ($20/mo) or Ultra ($100–200/mo) for AGY access |
+
+---
+
+## Who Is This For?
+
+- **Developers** who want a personal AI that remembers their codebase, preferences, and ongoing projects
+- **Power users** on Google AI Pro/Ultra who want more from their subscription than a chat window
+- **Self-hosters** who refuse to send their data to yet another SaaS platform
+- **Tinkerers** who want to build custom agent workflows without a PhD in prompt engineering
+- **Privacy-conscious users** who want AI capabilities without the surveillance trade-off
 
 ---
 
