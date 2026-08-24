@@ -134,4 +134,4 @@ jobs:
 
       - name: Verify image runs
         run: |
-          docker run --rm gravityclaw-server:ci python -c "import gravityclaw; print(gravityclaw.__name__)"
+          docker run --rm --entrypoint python gravityclaw-server:ci -c "import gravityclaw; print(gravityclaw.__name__)"

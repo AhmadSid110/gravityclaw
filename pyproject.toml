@@ -15,6 +15,11 @@ dependencies = [
     "uvicorn[standard]>=0.35,<1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
 [project.scripts]
 gravityclaw-agy-probe = "gravityclaw.probe:main"
 gravityclaw-server = "gravityclaw.server:main"
