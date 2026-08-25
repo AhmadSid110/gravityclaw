@@ -89,7 +89,7 @@ jobs:
           wheel2json dist/*.whl | python -c "
           import json, sys
           data = json.load(sys.stdin)
-          files = data.get('record', [])
+          files = data.get('dist_info', {}).get('record', [])
           web_files = [f for f in files if 'web_dist' in str(f)]
           print(f'Total files in wheel: {len(files)}')
           print(f'web_dist files: {len(web_files)}')
